@@ -617,13 +617,6 @@ typedef struct {
 } ScriptOneWire;
 #endif // USE_SCRIPT_ONEWIRE
 
-typedef struct {
-    char shelly_name[26];
-    char shelly_gen[2];
-    char shelly_fw_id[32];
-    char type[16];
-} SCRIPT_MDNS;
-
 #define SFS_MAX 4
 // global memory
 typedef struct {
@@ -679,10 +672,6 @@ typedef struct {
     char *packet_buffer;
     uint16_t pb_size = SCRIPT_UDP_BUFFER_SIZE;
 #endif // USE_SCRIPT_GLOBVARS
-
-#ifdef USE_SCRIPT_MDNS
-    SCRIPT_MDNS mdns = {"","2","20241011-114455/1.4.4-g6d2a586",""};
-#endif // USE_SCRIPT_MDNS
 
     char web_mode;
     char *glob_script = 0;
@@ -817,6 +806,7 @@ typedef struct {
 #ifdef USE_PLAY_WAVE
 #ifdef ESP32
   i2s_chan_handle_t tx_handle;
+  i2s_chan_handle_t rx_handle;
 #endif
 #endif
 
@@ -908,87 +898,75 @@ char *exfile(char *lp, TS_FLOAT *error);
 #ifdef USE_SCRIPT_MDNS
 int32_t script_mdns(char *name, char *mac, char *xtype) {
 
-  strcpy(glob_script_mem.mdns.type, xtype);
-  char shelly_mac[13];
-  if (*name == '-'){
-    strcpy(glob_script_mem.mdns.shelly_name, TasmotaGlobal.hostname);
+  char mdns_type[16];
+  strcpy(mdns_type, xtype);
+
+  char mdns_mac[13];
+  if (*mac == '-') {
+    //MAC from tasmota
+    String strMac = NetworkMacAddress();  // "AA:BB:CC:DD:EE:FF" WiFi or Ethernet
+    strMac.toLowerCase();
+    strMac.replace(":", "");              // "aabbccddeeff"
+    strcpy(mdns_mac, strMac.c_str());
   } else {
-    strcpy(glob_script_mem.mdns.shelly_name, name);
-    if (*mac == '-') {
-      uint8_t mac[6];
-      WiFi.macAddress(mac);
-      sprintf(shelly_mac, "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-      strcat(glob_script_mem.mdns.shelly_name, shelly_mac);
-    } else {
-      strcat(glob_script_mem.mdns.shelly_name, mac);
-    }
-  }
-  
-  uint8_t emu_choice;
-  if (!strcmp(xtype, "everhome")) {
-    emu_choice = 1;
-  } else {
-    emu_choice = 0; //default = shelly  
+    //MAC from script
+    strcpy(mdns_mac, mac);
   }
 
-  if (!MDNS.begin(glob_script_mem.mdns.shelly_name)) {
+  char mdns_name[26];
+  if (*name == '-') {
+    //mdns name from hostname (e.g. tasmota-MAC)
+    strcpy(mdns_name, NetworkHostname());
+  } else {
+    //mdns name from script and add MAC (e.g. shellypro3em-MAC)
+    strcpy(mdns_name, name);
+    strcat(mdns_name, mdns_mac);
+  }
+  
+  uint8_t emu_choice = 0;
+  if (!strcmp(mdns_type, "everhome")) {
+    emu_choice = 1; // ecotracker
+  } else if (!strcmp(mdns_type, "shelly")) {
+    emu_choice = 2; // shelly
+  }
+
+  if (!MDNS.begin(mdns_name)) {
     AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPNP "SCR: Error setting up MDNS responder!"));
   }
 
-#ifdef ESP32
-    MDNS.addService("http", "tcp", 80);
-    MDNS.addService((const char*)glob_script_mem.mdns.type, "tcp", 80);
+    if (emu_choice == 1) { // ecotracker
+      MDNS.addService("everhome", "tcp", 80);
+      // everhome TXT
+      MDNS.addServiceTxt("everhome", "tcp", "ip", NetworkAddress().toString().c_str());
+      MDNS.addServiceTxt("everhome", "tcp", "serial", (const char*)mdns_mac);
+      MDNS.addServiceTxt("everhome", "tcp", "productid", "1137");
+    } else if (emu_choice == 2) { //shelly
+      #define SCRIPT_MDNS_SHELLY_FW_ID "20241011-114455/1.4.4-g6d2a586"
+      #define SCRIPT_MDNS_SHELLY_ARCH  "esp8266"
+      #define SCRIPT_MDNS_SHELLY_GEN   "2"
+      #define SCRIPT_MDNS_SHELLY_ID    ""
 
-    if (emu_choice == 1) {
-      mdns_txt_item_t serviceTxtData[2] = {
-        { "name", glob_script_mem.mdns.shelly_name },
-        { "id", glob_script_mem.mdns.shelly_name }
-      };
-      mdns_service_instance_name_set("_http", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_http", "_tcp", serviceTxtData, 2);
-      mdns_service_instance_name_set("_shelly", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_everhome", "_tcp", serviceTxtData, 2);
-    } else {
-      mdns_txt_item_t serviceTxtData[4] = {
-        { "fw_id", glob_script_mem.mdns.shelly_fw_id },
-        { "arch", "esp8266" },
-        { "id", glob_script_mem.mdns.shelly_name },
-        { "gen", glob_script_mem.mdns.shelly_gen }
-      };
-      mdns_service_instance_name_set("_http", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_http", "_tcp", serviceTxtData, 4);
-      mdns_service_instance_name_set("_shelly", "_tcp", glob_script_mem.mdns.shelly_name);
-      mdns_service_txt_set("_shelly", "_tcp", serviceTxtData, 4);
+      // _http._tcp
+      MDNS.addService("http", "tcp", 80);
+      // _shelly._tcp
+      MDNS.addService("shelly", "tcp", 80);
+      // http TXT
+      MDNS.addServiceTxt("http",   "tcp", "fw_id", SCRIPT_MDNS_SHELLY_FW_ID);
+      MDNS.addServiceTxt("http",   "tcp", "arch",  SCRIPT_MDNS_SHELLY_ARCH);
+      MDNS.addServiceTxt("http",   "tcp", "id",    SCRIPT_MDNS_SHELLY_ID);
+      MDNS.addServiceTxt("http",   "tcp", "gen",   SCRIPT_MDNS_SHELLY_GEN);
+      // shelly TXT
+      MDNS.addServiceTxt("shelly", "tcp", "fw_id", SCRIPT_MDNS_SHELLY_FW_ID);
+      MDNS.addServiceTxt("shelly", "tcp", "arch",  SCRIPT_MDNS_SHELLY_ARCH);
+      MDNS.addServiceTxt("shelly", "tcp", "id",    SCRIPT_MDNS_SHELLY_ID);
+      MDNS.addServiceTxt("shelly", "tcp", "gen",   SCRIPT_MDNS_SHELLY_GEN);
+    } else { //unknown service from Script (not shelly or everhome)
+      MDNS.addService((const char*)mdns_type, "tcp", 80);
+      MDNS.addServiceTxt(mdns_type, "tcp", "ip", NetworkAddress().toString().c_str());
+      MDNS.addServiceTxt(mdns_type, "tcp", "serial", (const char*)mdns_mac);
     }
-#else
-    hMDNSService = MDNS.addService(0, "http", "tcp", 80);
-    hMDNSService2 = MDNS.addService(0, glob_script_mem.mdns.type, "tcp", 80);
-    if (hMDNSService) {
-      MDNS.setServiceName(hMDNSService, glob_script_mem.mdns.shelly_name);
-      if (emu_choice == 1) {
-        MDNS.addServiceTxt(hMDNSService, "name", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService, "id", glob_script_mem.mdns.shelly_name);
-      } else {
-        MDNS.addServiceTxt(hMDNSService, "fw_id", glob_script_mem.mdns.shelly_fw_id);
-        MDNS.addServiceTxt(hMDNSService, "arch", "esp8266");
-        MDNS.addServiceTxt(hMDNSService, "id", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService, "gen", glob_script_mem.mdns.shelly_gen);
-      }
-    }
-    if (hMDNSService2) {
-      MDNS.setServiceName(hMDNSService2, glob_script_mem.mdns.shelly_name);
-      if (emu_choice == 1) {
-        MDNS.addServiceTxt(hMDNSService2, "name", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService2, "id", glob_script_mem.mdns.shelly_name);
-      } else {
-        MDNS.addServiceTxt(hMDNSService2, "fw_id", glob_script_mem.mdns.shelly_fw_id);
-        MDNS.addServiceTxt(hMDNSService2, "arch", "esp8266");
-        MDNS.addServiceTxt(hMDNSService2, "id", glob_script_mem.mdns.shelly_name);
-        MDNS.addServiceTxt(hMDNSService2, "gen", glob_script_mem.mdns.shelly_gen);
-      }
-    }
-#endif
-  AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPNP "SCR: mDNS started with service tcp and %s. Hostname: %s"), glob_script_mem.mdns.type, glob_script_mem.mdns.shelly_name);
+
+  AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPNP "SCR: mDNS started with service tcp and %s. Hostname: %s"), mdns_type, mdns_name);
   return 0;
 }
 #endif // USE_SCRIPT_MDNS
@@ -1723,7 +1701,22 @@ void Script_Stop_UDP(void) {
 
 }
 
+// Ensure UDP socket is active — called by TinyC when it needs UDP
+void Script_udp_ensure(void) {
+  if (!glob_script_mem.udp_flags.udp_used) {
+    glob_script_mem.udp_flags.udp_used = 1;
+    glob_script_mem.udp_flags.udp_binary_payload = 1;  // TinyC uses binary mode
+  }
+  if (!glob_script_mem.udp_flags.udp_connected) {
+    Script_Init_UDP();
+  }
+}
+
 void Script_Init_UDP() {
+#ifdef USE_TINYC
+  // TinyC manages its own multicast socket on the same port — don't open a competing one
+  //return;
+#endif
   if (TasmotaGlobal.global_state.network_down) return;
   if (!glob_script_mem.udp_flags.udp_used) return;
   if (glob_script_mem.udp_flags.udp_connected) return;
@@ -1748,6 +1741,10 @@ void Script_Init_UDP() {
     glob_script_mem.udp_flags.udp_connected  = 0;
   }
 }
+
+#ifdef USE_TINYC
+  extern void tc_udp_on_receive(const char *name, char umode, const char *data, int datalen);
+#endif
 
 void Script_PollUdp(void) {
   if (TasmotaGlobal.global_state.network_down) return;
@@ -1794,6 +1791,11 @@ void Script_PollUdp(void) {
           *cp = 0;
           strcpy(vnam, lp);
           lp = cp + 1;
+#ifdef USE_TINYC
+          // Save raw data pointer before Scripter modifies lp during array parsing
+          const char *tc_raw_data = lp;
+          int tc_raw_datalen = len - (lp - packet_buffer);
+#endif
           TS_FLOAT *fp;
           char *sp;
           uint32_t index;
@@ -1851,6 +1853,10 @@ void Script_PollUdp(void) {
               Run_Scripter1(glob_script_mem.glob_script, 0, 0);
             }
           }
+#ifdef USE_TINYC
+          // Forward UDP variable to TinyC VM (saved raw data pointer, before Scripter modified lp)
+          tc_udp_on_receive(vnam, umode, tc_raw_data, tc_raw_datalen);
+#endif
         }
       }
       optimistic_yield(100);
@@ -2645,6 +2651,30 @@ uint32_t res = 0;
   return res;
 }
 
+#ifdef USE_CW_CALC
+uint32_t calc_cw(void) {
+			TS_FLOAT a = floor((14 - RtcTime.month) / 12);
+			TS_FLOAT y = RtcTime.year + 4800 - a;
+			TS_FLOAT m = RtcTime.month + (12 * a) - 3;
+			TS_FLOAT jd = RtcTime.day_of_month + floor(((153 * m) + 2) / 5) +
+				(365 * y) + floor(y / 4) - floor(y / 100) +
+				floor(y / 400) - 32045;
+			TS_FLOAT d4 = (uint32_t)(jd + 31741 - ((uint32_t)jd % 7)) % 146097 % 36524 %
+				1461;
+			TS_FLOAT L = floor(d4 / 1460);
+			TS_FLOAT d1 = ((uint32_t)(d4 - L) % 365) + L;
+			// Kalenderwoche ermitteln
+			int calendarWeek = (int) floor(d1 / 7) + 1;
+			// Das Jahr der Kalenderwoche ermitteln
+			int year = RtcTime.year;
+			if (calendarWeek == 1 && RtcTime.month == 12)
+				year++;
+			if (calendarWeek >= 52 && RtcTime.month == 1)
+				year--;
+			// Die ermittelte Kalenderwoche zurückgeben
+			return calendarWeek;
+}
+#endif
 
 uint8_t script_hexnibble(char chr) {
   uint8_t rVal = 0;
@@ -2770,7 +2800,7 @@ int32_t fetch_jpg(uint32_t sel, char *url, uint32_t xp, uint32_t yp, uint32_t sc
         String boundary = glob_script_mem.jpg_task.http.header(headerKeys[0]);
         char *cp = strchr(boundary.c_str(), '=');
         if (cp) {
-          strlcpy(glob_script_mem.jpg_task.boundary, cp + 1, sizeof(glob_script_mem.jpg_task.boundary));
+          strcpy(glob_script_mem.jpg_task.boundary,cp + 1);
         }
       } else {
         AddLog(LOG_LEVEL_INFO,PSTR("SCR: HTTP error %d = %s"), httpCode, glob_script_mem.jpg_task.http.errorToString(httpCode).c_str());
@@ -2806,7 +2836,7 @@ int32_t fetch_jpg(uint32_t sel, char *url, uint32_t xp, uint32_t yp, uint32_t sc
           glob_script_mem.jpg_task.stream.readBytesUntil('\n', inbuff, sizeof(inbuff));
           //AddLog(LOG_LEVEL_INFO, PSTR("size = %s"), inbuff);
           char *cp = strchr(inbuff, ':');
-          uint32_t size = 0;
+          uint16_t size = 0;
           if (cp) {
             size = atoi(cp + 1);
           }
@@ -2837,6 +2867,9 @@ int32_t fetch_jpg(uint32_t sel, char *url, uint32_t xp, uint32_t yp, uint32_t sc
       // resume drawing
       glob_script_mem.jpg_task.draw = true;
       break;
+    case 5:
+      return glob_script_mem.jpg_task.http.connected();
+
   }
   return 0;
 }
@@ -3788,6 +3821,12 @@ extern void W8960_SetGain(uint8_t sel, uint16_t value);
           fvar = TasmotaGlobal.tele_period;
           goto exit;
         }
+#ifdef USE_CW_CALC
+        if (!strncmp_XP(vname, XPSTR("cw"), 2)) {
+          fvar = calc_cw();
+          goto exit;
+        }
+#endif
         break;
       case 'd':
         if (!strncmp_XP(vname, XPSTR("day"), 3)) {
@@ -4769,7 +4808,11 @@ _Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
         }
 #endif //SCRIPT_GET_HTTPS_JP
 
-#if defined(ESP32) && defined(TESLA_POWERWALL)
+// gpwl() requires SCRIPT_GET_HTTPS_JP because that's the gate the
+// `call2pwl` definition (line ~14392) uses too — the bare
+// TESLA_POWERWALL gate here causes a link error when one is defined
+// but not the other.
+#if defined(ESP32) && defined(TESLA_POWERWALL) && defined(SCRIPT_GET_HTTPS_JP)
         if (!strncmp_XP(lp, XPSTR("gpwl("), 5)) {
           char *path;
           //lp = GetStringArgument(lp + 5, OPER_EQU, path, 0);
@@ -5168,7 +5211,7 @@ _Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
                 fvar = fetch_jpg(0, url, xp, yp, scale);
               }
               break;
-            case 1:
+            case 6:
               {
                 char file[SCRIPT_MAX_SBSIZE];
                 lp = GetStringArgument(lp, OPER_EQU, file, 0);
@@ -5468,7 +5511,7 @@ _Pragma("GCC warning \"'EXT 1 wakeup' not supported using gpio mode\"")
           fvar = script_mdns(name, mac, type);
           goto nfuncexit;
         }
-  #endif // USE_SCRIPT_MDNS
+#endif // USE_SCRIPT_MDNS
         break;
 
       case 'n':
@@ -5674,13 +5717,8 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
         if (!strncmp_XP(lp, XPSTR("rr("), 3)) {
           lp += 4;
           len = 0;
-          const char *cp = GetResetReason().c_str();
           if (sp) {
-              if (cp) {
-                strlcpy(sp, cp, glob_script_mem.max_ssize);
-              } else {
-                strlcpy(sp, "-", glob_script_mem.max_ssize);
-              }
+            strlcpy(sp, GetResetReason().c_str(), glob_script_mem.max_ssize);
           }
           goto strexit;
         }
@@ -5700,7 +5738,7 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
         }
         if (!strncmp_XP(lp, XPSTR("round("), 6)) {
           lp = GetNumericArgument(lp + 6, OPER_EQU, &fvar, gv);
-          fvar = floorf(fvar);
+          fvar = roundf(fvar);
           goto nfuncexit;
         }
 #endif
@@ -6607,7 +6645,18 @@ int32_t I2SPlayFile(const char *path, uint32_t decoder_type);
           goto strexit;
         }
 #endif // USE_FEXTRACT
-
+        if (!strncmp_XP(vname, XPSTR("sota("), 5)) {
+          char *ota;
+          SCRIPT_SKIP_SPACES
+          lp = GetLongIString(lp + 5, &ota);
+          if (*ota == 0) {
+            fvar = SettingsUpdateText(SET_OTAURL, PSTR(OTA_URL));
+          } else {
+            fvar = SettingsUpdateText(SET_OTAURL, ota);
+          }
+          free(ota);
+          goto nfuncexit;
+        }
         break;
 
       case 't':
@@ -6878,7 +6927,9 @@ void tmod_directModeOutput(uint32_t pin);
             glob_script_mem.Script_PortUdp_1->beginPacket(glob_script_mem.Script_PortUdp_1->remoteIP(), glob_script_mem.Script_PortUdp_1->remotePort());
             glob_script_mem.Script_PortUdp_1->write((unsigned char*)payload, strlen(payload));
             glob_script_mem.Script_PortUdp_1->endPacket();
+#ifdef ESP32
             glob_script_mem.Script_PortUdp_1->flush();
+#endif
           }
           if (sel == 3 && glob_script_mem.Script_PortUdp_1) {
             char url[SCRIPT_MAX_SBSIZE];
@@ -6928,33 +6979,6 @@ void tmod_directModeOutput(uint32_t pin);
               fvar = udp_call(url, port, payload, alend);
               free(payload);
             }
-          }
-          if (sel == 8) {
-            // generic send to url and port
-            char url[SCRIPT_MAX_SBSIZE];
-            lp = GetStringArgument(lp, OPER_EQU, url, 0);
-            TS_FLOAT port;
-            lp = GetNumericArgument(lp, OPER_EQU, &port, gv);
-
-            // send to recive port up to 3 text buffers
-            char payload[SCRIPT_MAX_SBSIZE * 3];
-            char part1[SCRIPT_MAX_SBSIZE];
-            lp = GetStringArgument(lp, OPER_EQU, part1, 0);
-            SCRIPT_SKIP_SPACES
-            strcpy(payload, part1);
-            if (*lp != ')') {
-              // get next part
-              lp = GetStringArgument(lp, OPER_EQU, part1, 0);
-              SCRIPT_SKIP_SPACES
-              strcat(payload, part1);
-              if (*lp != ')') {
-                // get next part
-                lp = GetStringArgument(lp, OPER_EQU, part1, 0);
-                SCRIPT_SKIP_SPACES
-                strcat(payload, part1);
-              }
-            }
-            fvar = udp_call(url, port, (uint8_t*)payload, strlen(payload));
           }
           goto nfuncexit;
         }
@@ -7571,7 +7595,7 @@ int32_t play_wave(char *path) {
     uint8_t mode = strtol(cp, &cp, 10);
 
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    i2s_new_channel(&chan_cfg, &glob_script_mem.tx_handle, NULL);
+    i2s_new_channel(&chan_cfg, &glob_script_mem.tx_handle, nullptr);
 
     i2s_std_slot_config_t slot_cfg;
     switch (mode) {
@@ -7594,7 +7618,7 @@ int32_t play_wave(char *path) {
           .bclk = (gpio_num_t)bck,
           .ws = (gpio_num_t)ws,
           .dout = (gpio_num_t)dout,
-          .din = I2S_GPIO_UNUSED,
+          .din = (gpio_num_t)18, //I2S_GPIO_UNUSED,
           .invert_flags = {
             .mclk_inv = false,
             .bclk_inv = false,
@@ -7650,6 +7674,7 @@ int32_t play_wave(char *path) {
 
 #ifdef ESP32
   i2s_channel_enable(glob_script_mem.tx_handle);
+  i2s_channel_enable(glob_script_mem.rx_handle);
   while (wf.position() < fsize) {
     int numBytes = _min(sizeof(buffer), fsize - wf.position() - 1);
     int bytesread = wf.readBytes((char*)buffer, numBytes);
@@ -7687,8 +7712,10 @@ char *exfile(char *lp, TS_FLOAT *error) {
       if (script) {
         memset(script, 0, fsiz + 16);
         ef.read((uint8_t*)script, fsiz);
+        char *svbu = glob_script_mem.scriptptr_bu;
         glob_script_mem.scriptptr_bu = script;
         execute_script(script);
+        glob_script_mem.scriptptr_bu = svbu;
         free(script);
       }
     }
@@ -10060,7 +10087,7 @@ void Scripter_save_pvars(void) {
     "if(data && data.script && data.script.length){" \
     "while(selScript.options.length>1){selScript.options.remove(1);}" \
     "for(let n=0;n<data.script.length;n++){" \
-    "let o=document.createElement('option');o.value=data.script[n].filename;o.text=data.script[n].label;selScript.options.add(o);" \
+    "let o=document.createElement('option');o.value=data.script[n].filename;o.text=data.script[n].label;if(data.script[n].filename==''){o.disabled=true;};selScript.options.add(o);" \
     "}}});"
 #else
   #define SCRIPT_LIST_SELECT
@@ -10070,6 +10097,9 @@ void Scripter_save_pvars(void) {
 
 
 #define WEB_HANDLE_SCRIPT "s10"
+
+const char HTTP_BTN_MENU_RULES[] PROGMEM =
+  "<p></p><form action='" WEB_HANDLE_SCRIPT "' method='get'><button>" D_CONFIGURE_SCRIPT "</button></form>";
 
 const char HTTP_FORM_SCRIPT[] PROGMEM =
     "<form method='post' action='" WEB_HANDLE_SCRIPT "'>";
@@ -10157,10 +10187,27 @@ const char HTTP_FORM_SCRIPT1b[] PROGMEM =
 
     "</script>";
 
+// Save posts the textarea as a multipart *file part* (Blob) so the
+// ESP8266 WebServer streams it to HandleScriptUpload() chunk-by-chunk
+// instead of buffering the whole body + a second arg() copy. `save`/`c1`
+// ride along as tiny normal fields. The response (Management page) is
+// written back into the document to mimic the old form-submit navigation.
 const char HTTP_SCRIPT_FORM_END[] PROGMEM =
       "<br/>"
-      "<button name='save' type='submit' formmethod='post' formenctype='multipart/form-data' formaction='/ta' class='button bgrn'>" D_SAVE "</button>"
-      "</form></fieldset>";
+      "<button type='button' onclick='scrsav()' class='button bgrn'>" D_SAVE "</button>"
+      "</form></fieldset>"
+      "<script>"
+      "function scrsav(){"
+      "var t=eb('t1');if(!t)return;"
+      "var f=new FormData();"
+      "f.append('save','1');"
+      "var c=eb('c1');if(c&&c.checked)f.append('c1','1');"
+      "f.append('t1',new Blob([t.value],{type:'text/plain'}),'t1');"
+      "fetch('/ta',{method:'POST',body:f}).then(function(r){return r.text();})"
+      ".then(function(h){document.open();document.write(h);document.close();})"
+      ".catch(function(){alert('save failed');});"
+      "}"
+      "</script>";
 
 #ifdef USE_SCRIPT_FATFS
 const char HTTP_FORM_SCRIPT1c[] PROGMEM =
@@ -10324,6 +10371,71 @@ uint16_t section_seek_end(char *lp) {
   return ((uint32_t)lp - (uint32_t)op) + 2;
 }
 
+// ── Streaming script save (ESP8266 RAM workaround) ─────────────────────────
+// The legacy save path did `String str = Webserver->arg("t1")` — on ESP8266
+// the WebServer first buffers the whole multipart body to parse the `t1`
+// field, then arg() makes a *second* full copy, so saving an N-byte script
+// transiently needed ~2-3×N heap on top of the permanent script_ram buffer.
+// That transient spike (not the steady state) is what capped editable size
+// far below script_size on ESP8266.
+//
+// Fix: the browser posts `t1` as a multipart *file part* (Blob, see the
+// save-button JS in HTTP_SCRIPT_FORM_END). File parts bypass arg-buffering
+// entirely — the WebServer streams them to this upload callback in chunks,
+// which we write straight into glob_script_mem.script_ram. No String, no
+// duplicate arg copy: peak extra heap during save drops from ~2-3×N to ~0.
+// Capable browsers (all modern) take this path; anything else falls back to
+// the legacy buffered branch in ScriptSaveSettings() so behaviour is
+// unchanged where the fast path can't run.
+static bool     script_ta_streamed = false;   // set true once a stream completed
+static uint32_t script_ta_widx = 0;            // write cursor into script_ram
+
+// In-place CR/CRLF → LF (matches the old String.replace() pair, no 2nd buffer)
+static void script_normalize_eol(char *p) {
+  char *w = p;
+  for (char *r = p; *r; r++) {
+    if (*r == '\r') {
+      if (*(r + 1) == '\n') { continue; }      // \r\n → \n (drop \r, keep \n)
+      *w++ = '\n';                              // lone \r → \n
+    } else {
+      *w++ = *r;
+    }
+  }
+  *w = 0;
+}
+
+void HandleScriptUpload(void) {
+  HTTPUpload& upload = Webserver->upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    if (!HttpCheckPriviledgedAccess()) { Web.upload_error = 1; return; }
+    script_ta_streamed = false;
+    script_ta_widx = 0;
+    if (glob_script_mem.script_ram && glob_script_mem.script_size > 0) {
+      glob_script_mem.script_ram[0] = 0;
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Web.upload_error || !glob_script_mem.script_ram) { return; }
+    uint32_t cap = (glob_script_mem.script_size > 0)
+                   ? (uint32_t)glob_script_mem.script_size - 1 : 0;
+    uint32_t n = upload.currentSize;
+    if (script_ta_widx + n > cap) {
+      n = (script_ta_widx < cap) ? (cap - script_ta_widx) : 0;  // truncate to fit
+      AddLog(LOG_LEVEL_INFO, PSTR("SCR: script truncated at %u B (script_size %u)"),
+             (unsigned)cap, (unsigned)glob_script_mem.script_size);
+    }
+    if (n) {
+      memcpy(glob_script_mem.script_ram + script_ta_widx, upload.buf, n);
+      script_ta_widx += n;
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END) {
+    if (Web.upload_error || !glob_script_mem.script_ram) { return; }
+    glob_script_mem.script_ram[script_ta_widx] = 0;
+    script_ta_streamed = true;
+  }
+}
+
 void HandleScriptTextareaConfiguration(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
@@ -10419,9 +10531,9 @@ void HandleScriptTextareaConfiguration(void) {
             ep[0] = '>';
             ep[slen - 1] = '#';
             file.write((const uint8_t*)ep, slen);
+            file.close();
             // restore to enable >F find
             ep[slen - 1] = '>';
-            file.close();
           } else {
             ufsp->remove(fname);
           }
@@ -10430,7 +10542,6 @@ void HandleScriptTextareaConfiguration(void) {
           if (ep) {
             // has >F section
             slen = section_seek_end(ep + 2);
-            strcpy_P(fname, PSTR("/sml_stask.tas"));
             file = ufsp->open(fname, FS_FILE_WRITE);
             ep++;
             ep[0] = '>';
@@ -10561,6 +10672,26 @@ void ScriptSaveSettings(void) {
     bitWrite(Settings->rule_enabled, 0, 0);
   }
 
+  if (script_ta_streamed) {
+    // Fast path: HandleScriptUpload() already streamed the script straight
+    // into script_ram (no String, no duplicate arg buffer).
+    script_ta_streamed = false;
+    if (glob_script_mem.script_ram && glob_script_mem.script_ram[0]) {
+      script_normalize_eol(glob_script_mem.script_ram);   // CR/CRLF → LF, in place
+      if (glob_script_mem.script_ram[0]!='>' && glob_script_mem.script_ram[1]!='D') {
+        AddLog(LOG_LEVEL_INFO, PSTR("SCR: error, must start with >D"));
+        bitWrite(Settings->rule_enabled, 0, 0);
+      }
+      SaveScript();
+    } else {
+      AddLog(LOG_LEVEL_INFO, PSTR("SCR: empty script"));
+    }
+    SaveScriptEnd();
+    return;
+  }
+
+  // Legacy buffered fallback — browsers without fetch/Blob, or callers that
+  // still POST `t1` as a normal form field. Same behaviour as before.
   String str = Webserver->arg("t1");
 
   if (*str.c_str()) {
@@ -11906,7 +12037,8 @@ void WebServer82Init(void) {
 
 const char HTTP_SCRIPT_MIMES[] PROGMEM =
   "HTTP/1.1 200 OK\r\n"
-  "Content-disposition: inline; "
+  "Content-disposition: inline\r\n"
+  "Content-Length: %d\r\n"
   "Content-type: %s\r\n\r\n";
 
 void ScriptServeFile(void) {
@@ -12045,16 +12177,26 @@ uint32_t fsize;
 
   if (!buff[0]) return -2;
 
+#define fileHeaderSize 14
+#define infoHeaderSize 40
+
   if (!sflg) {
     if (!ufsp->exists(path)) {
       return -1;
     }
     file = ufsp->open(path, FS_FILE_READ);
     fsize = file.size();
+  } else {
+#ifdef USE_DISPLAY_DUMP
+    if (renderer && (renderer->framebuffer || renderer->rgb_fb)) {
+      fsize = Settings->display_width * Settings->display_height * 3;
+      fsize += fileHeaderSize + infoHeaderSize;
+    }
+#endif
   }
 
   if (0 == stype) {
-    WSContentSend_P(HTTP_SCRIPT_MIMES, buff);
+    WSContentSend_P(HTTP_SCRIPT_MIMES, fsize, buff);
     WSContentFlush();
     client = Webserver->client();
   } else {
@@ -12078,13 +12220,7 @@ uint32_t fsize;
 
   if (sflg) {
 #ifdef USE_DISPLAY_DUMP
-//#include <renderer.h>
-//extern Renderer *renderer;
-
     // screen copy
-    #define fileHeaderSize 14
-    #define infoHeaderSize 40
-
      if (renderer && (renderer->framebuffer || renderer->rgb_fb)) {
       uint8_t *bp = renderer->framebuffer;
       uint16_t *dwp = renderer->rgb_fb;
@@ -12092,10 +12228,14 @@ uint32_t fsize;
       memset(lbuf, 0, Settings->display_width * 3);
       if (!lbuf) return -3;
       uint8_t dmflg = 0;
-      if (renderer->disp_bpp & 0x40) {
-        dmflg = 1;
+      int8_t bpp = renderer->disp_bpp;
+      if (bpp > 0) {
+        if (bpp & 0x40) {
+          dmflg = 1;
+        }
+        bpp &= 0xbf;
       }
-      int8_t bpp = renderer->disp_bpp & 0xbf;;
+
       uint8_t *lbp;
       uint8_t fileHeader[fileHeaderSize];
       createBitmapFileHeader(Settings->display_height , Settings->display_width , fileHeader);
@@ -12103,8 +12243,10 @@ uint32_t fsize;
       uint8_t infoHeader[infoHeaderSize];
       createBitmapInfoHeader(Settings->display_height, Settings->display_width, infoHeader );
       client.write((uint8_t *)infoHeader, infoHeaderSize);
+
       if (bpp < 0) {
-        for (uint32_t lins = Settings->display_height - 1; lins >= 0 ; lins--) {
+        // standard bw like sh1106, ,must set pixels to -1
+        for (int32_t lins = Settings->display_height - 1; lins >= 0 ; lins--) {
           lbp = lbuf;
           for (uint32_t cols = 0; cols < Settings->display_width; cols ++) {
             uint8_t pixel = 0;
@@ -12116,9 +12258,11 @@ uint32_t fsize;
             *lbp++ = pixel;
           }
           client.write((const char*)lbuf, Settings->display_width * 3);
+          client.flush();
         }
       } else {
         for (uint32_t lins = 0; lins < Settings->display_height; lins++) {
+          //AddLog(LOG_LEVEL_INFO, PSTR(">>> %d"), lins);
           lbp = lbuf + (Settings->display_width * 3);
           if (bpp == 4) {
             // 16 gray scales
@@ -12200,6 +12344,7 @@ uint32_t fsize;
           }
           client.write((const char*)lbuf, Settings->display_width * 3);
           client.flush();
+          yield();
         }
       }
       if (lbuf) free(lbuf);
@@ -12263,6 +12408,7 @@ uint32_t fsize;
       if (len > fsize) len = fsize;
       file.read((uint8_t *)buff, len);
       client.write((const char*)buff, len);
+      client.flush();
       fsize -= len;
     }
     file.close();
@@ -12395,6 +12541,12 @@ void ScriptFullWebpage(uint8_t page) {
 void Script_Check_HTML_Setvars(void) {
 
   if (!HttpCheckPriviledgedAccess()) { return; }
+
+  // Skip when no Scripter program is loaded — Scripter's variable resolver
+  // null-derefs (Run_script_sub: `*dfvar = ...`) for any unknown variable
+  // name. Without this guard a `?sv=N_V` URL from another driver (e.g.
+  // TinyC's webButton/webSlider) reboots the device with LoadProhibited.
+  if (!bitRead(Settings->rule_enabled, 0) || !glob_script_mem.script_ram) return;
 
   //if (Webserver->hasArg("gv")) {
     // get variable
@@ -12532,12 +12684,12 @@ const char SML_SCRIPT_TEXT[] PROGMEM =
   "if(data && data.smartmeter && data.smartmeter.length){"
   "while(selSM.options.length>1){selSM.options.remove(1);}"
   "for(let n=0;n<data.smartmeter.length;n++){"
-  "let o=document.createElement('option');o.value=data.smartmeter[n].filename;o.text=data.smartmeter[n].label;selSM.options.add(o);"
+  "let o=document.createElement('option');o.value=data.smartmeter[n].filename;o.text=data.smartmeter[n].label;if(data.smartmeter[n].filename==''){o.disabled=true;};selSM.options.add(o);"
   "if (n==%d) {o.setAttribute('selected', true);}"
   "}}});"
   "function smlp(txt,index){"
   "x=new XMLHttpRequest();"
-  "x.open('POST', '/ta?smlsav=%s');"
+  "x.open('POST', '/smld?smlsav=%s');"
   "x.setRequestHeader('Accept','application/text');"
   "x.setRequestHeader('Content-Type','application/text');"
   "x.send(txt);"
@@ -12989,7 +13141,7 @@ const char *gc_str;
       lp = GetStringArgument(lp, OPER_EQU, right, 0);
       SCRIPT_SKIP_SPACES
 
-      WSContentSend_P(SCRIPT_MSG_SLIDER, left, mid, right, (uint32_t)min, (uint32_t)max, (uint32_t)val, vname);
+      WSContentSend_P(SCRIPT_MSG_SLIDER, left, mid, right, (int32_t)min, (int32_t)max, (int32_t)val, vname);
       lp++;
 
     } else if (!strncmp_P(lin, PSTR("ck("), 3)) {
@@ -13059,8 +13211,10 @@ const char *gc_str;
           uint8_t from;
           uint8_t to;
           if (pulabel[1] == 'g') {
-            cp++;
             flg = 1;
+            if (pulabel[2] == 'r') {
+              flg = 2;
+            }
             from = 0;
             to = MAX_USER_PINS + MIN_FLASH_PINS - 1;
           } else {
@@ -13078,8 +13232,12 @@ const char *gc_str;
             if (val == index) {
               strcpy_P(option, PSTR("selected"));
             }
-
-            uint8_t disabled = FlashPin(cnt) || RedPin(cnt) || TasmotaGlobal.gpio_pin[cnt];
+            uint8_t disabled;
+            if (flg == 2) {
+              disabled = FlashPin(cnt) || RedPin(cnt) || TasmotaGlobal.gpio_pin[cnt];
+            } else {
+              disabled = FlashPin(cnt) || TasmotaGlobal.gpio_pin[cnt];
+            }
             if (flg && disabled) {
               strcpy_P(option, PSTR("disabled"));
             }
@@ -13871,6 +14029,10 @@ exgc:
 #if defined(USE_SENDMAIL) || defined(USE_ESP32MAIL)
 
 void script_send_email_body(void(*func)(char *)) {
+#ifdef USE_TINYC
+  extern bool tinyc_email_body(void(*)(char*));
+  if (tinyc_email_body(func)) return;
+#endif
 uint8_t msect = Run_Scripter1(">m", -2, 0);
   if (msect == 99) {
     //char tmp[256];
@@ -14488,12 +14650,13 @@ uint32_t script_i2c(uint8_t sel, uint16_t val, uint32_t val1) {
 #ifdef ESP32
       if (val1 == 0) glob_script_mem.script_i2c_wire = &Wire;
       else {
-#if MAX_I2C > 1
+#if defined(USE_I2C_BUS2)
         glob_script_mem.script_i2c_wire = &Wire1;
 #else
         glob_script_mem.script_i2c_wire = &Wire;
-#endif  // MAX_I2C
+#endif
       }
+
 #else
       glob_script_mem.script_i2c_wire = &Wire;
 #endif
@@ -14540,8 +14703,7 @@ uint32_t script_i2c(uint8_t sel, uint16_t val, uint32_t val1) {
       glob_script_mem.script_i2c_wire->endTransmission();
       break;
     case 14:
-#ifdef ESP32
-#if MAX_I2C > 1
+#if defined(ESP32) && defined(USE_I2C_BUS2)
       Wire1.end();
       Wire1.begin(val & 0x7f, val1);
       glob_script_mem.script_i2c_wire = &Wire1;
@@ -14549,8 +14711,7 @@ uint32_t script_i2c(uint8_t sel, uint16_t val, uint32_t val1) {
       if (val & 128) {
         XsnsCall(FUNC_INIT);
       }
-#endif  // MAX_I2C
-#endif  // ESP32
+#endif
       break;
   }
   return rval;
@@ -14897,7 +15058,7 @@ bool Xdrv10(uint32_t function) {
       if (XdrvMailbox.index) {
         XdrvMailbox.index++;
       } else {
-        WSContentSend_P(HTTP_FORM_BUTTON, PSTR(WEB_HANDLE_SCRIPT), PSTR(D_CONFIGURE_SCRIPT));
+        WSContentSend_P(HTTP_BTN_MENU_RULES);
       }
       break;
 #ifdef USE_SCRIPT_WEB_DISPLAY
@@ -14923,7 +15084,17 @@ bool Xdrv10(uint32_t function) {
 #endif // USE_SCRIPT_WEB_DISPLAY
     case FUNC_WEB_ADD_HANDLER:
       Webserver->on("/" WEB_HANDLE_SCRIPT, HandleScriptConfiguration);
-      Webserver->on("/ta",HTTP_POST, HandleScriptTextareaConfiguration);
+      Webserver->on("/ta",HTTP_POST, HandleScriptTextareaConfiguration, HandleScriptUpload);
+#ifdef USE_SML_SCRIPT_CMD
+      // SML-descriptor save (smlpd dropdown) POSTs the descriptor as a RAW
+      // application/text body, read via Webserver->arg("plain"). The upload handler
+      // on /ta (HandleScriptUpload, for streamed script saves) makes the WebServer
+      // parse every /ta POST body as a multipart upload, so a raw body never lands
+      // in arg("plain") and the descriptor is silently not saved. Give the
+      // descriptor save its own handler-only route (no upload handler) — behaves
+      // exactly like /ta did before the streaming change. (Hans regression 2026-06-13.)
+      Webserver->on("/smld",HTTP_POST, HandleScriptTextareaConfiguration);
+#endif
       Webserver->on("/exs", HTTP_POST,[]() { Webserver->sendHeader("Location","/exs");Webserver->send(303);}, script_upload_start);
       Webserver->on("/exs", HTTP_GET, ScriptExecuteUploadSuccess);
 #if defined(USE_UFILESYS) && defined(USE_SCRIPT_WEB_DISPLAY)

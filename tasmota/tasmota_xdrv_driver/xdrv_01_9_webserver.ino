@@ -424,7 +424,11 @@ const char HTTP_COUNTER[] PROGMEM =
   "<br><div id='t' style='text-align:center;'></div>";
 
 const char HTTP_END[] PROGMEM =
-  "<p></p><div style='text-align:right;font-size:11px;'><hr><a href='https://github.com/arendst/Tasmota' target='_blank' style='color:#aaa;'>Tasmota %s %s " D_BY " Theo Arends</a></div>"
+  "<p></p><div style='text-align:center;font-size:11px;'><hr>"
+  "<span style='color:#aaa;'>Build by HaWe &nbsp;|&nbsp; Version %s %s</span><br>"
+  "<a href='https://ottelo.jimdofree.com' target='_blank' style='color:#aaa;'>Ottelo SML &amp; Tasmota Informationen</a><br>"
+  "<a href='https://github.com/arendst/Tasmota' target='_blank' style='color:#aaa;'>Original Tasmota by Theo Arends</a>"
+  "</div>"
   "</div>"
   "</body>"
   "</html>";
@@ -782,7 +786,7 @@ bool HttpCheckPriviledgedAccess(bool autorequestauth = true) {
     return false;
   }
 
-  if (!Settings->flag5.disable_referer_chk && !WifiIsInManagerMode()) {  // SetOption128 - DISABLE_REFERER_CHK - (Web) Allow access without referer check
+  if (!Settings->flag5.disable_referer_chk && !WifiIsInManagerMode()) {
     String referer = Webserver->header(F("Referer"));  // http://demo/? or http://192.168.2.153/?
     if (referer.length()) {
       referer.toUpperCase();
@@ -805,6 +809,9 @@ bool HttpCheckPriviledgedAccess(bool autorequestauth = true) {
     AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_HTTP "Referer '%s' denied. Use 'SO128 1' for HTTP API commands. 'Webpassword' is recommended."), referer.c_str());
     return false;
   } else {
+#if defined(USE_MI_ESP32) && !defined(USE_BLE_ESP32)
+    MI32suspendScanTask();
+#endif // defined(USE_MI_ESP32) && !defined(USE_BLE_ESP32)
     return true;
   }
 }
@@ -1209,6 +1216,9 @@ void WSContentEnd(void) {
   }
 
   Webserver->client().stop();
+#if defined(USE_MI_ESP32) && !defined(USE_BLE_ESP32)
+  MI32resumeScanTask();
+#endif // defined(USE_MI_ESP32) && !defined(USE_BLE_ESP32)
 }
 
 /*-------------------------------------------------------------------------------------------*/
@@ -1506,12 +1516,11 @@ void HandleRoot(void) {
         uint32_t button_ptr = 0;
         for (uint32_t button_idx = 1; button_idx <= TasmotaGlobal.devices_present; button_idx++) {
           if (bitRead(Web.light_shutter_button_mask, button_idx -1)) { continue; }  // Skip non-sequential light and/or shutter button
-          const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
-          bool has_web_button = (web_button[0] != '\0');
+          bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
           snprintf_P(stemp, sizeof(stemp), PSTR(" %d"), button_idx);
           WSContentSend_P(HTTP_DEVICE_CONTROL, 100 / cols, button_idx, button_idx,
-            (has_web_button) ? HtmlEscape(web_button).c_str() : (cols < 5) ? PSTR(D_BUTTON_TOGGLE) : "",
-            (has_web_button) ? "" : (TasmotaGlobal.devices_present > 1) ? stemp : "");
+            (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : (cols < 5) ? PSTR(D_BUTTON_TOGGLE) : "",
+            (set_button) ? "" : (TasmotaGlobal.devices_present > 1) ? stemp : "");
           button_ptr++;
           if (0 == button_ptr % cols) { WSContentSend_P(PSTR("</tr><tr>")); }
         }
@@ -1542,13 +1551,12 @@ void HandleRoot(void) {
           if (1 == j) { break; }           // Both buttons shown
 
           shutter_button_idx--;            // Right button is previous button (up)
-          const char* web_button = (shutter_button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(shutter_button_idx -1) : "";
-          bool has_web_button = (web_button[0] != '\0');
+          bool set_button = ((shutter_button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(shutter_button_idx -1)));
           snprintf_P(stemp, sizeof(stemp), PSTR("Shutter %d"), shutter_idx +1);
           uint32_t shutter_real_to_percent_position = ShutterRealToPercentPosition(-9999, shutter_idx);
           Web.shutter_slider[shutter_idx] = (shutter_options & 1) ? (100 - shutter_real_to_percent_position) : shutter_real_to_percent_position;
           WSContentSend_P(HTTP_MSG_SLIDER_SHUTTER, 
-            (has_web_button) ? HtmlEscape(web_button).c_str() : stemp,
+            (set_button) ? HtmlEscape(GetWebButton(shutter_button_idx -1)).c_str() : stemp,
             shutter_idx +1,
             Web.shutter_slider[shutter_idx],
             shutter_idx +1);
@@ -1610,18 +1618,18 @@ void HandleRoot(void) {
             Web.slider[2],
             'n', 0);         // n0 - Value id
           WSContentSend_P(PSTR("</tr>"));
-        } 
+        }
 
-        const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
-        bool has_web_button = (web_button[0] != '\0');
-        // web_button non-empty: truncate to max 4 chars or "visual width" of 4 (e.g. "Ligh", "💡💡", "台灯"). Latin char = 1 width, CJK/emoji char = 2 width
-        // web_button empty: take first char of D_BUTTON_TOGGLE + button index (e.g. "T1", "П1", "开1")
-        String butt_text = (has_web_button) ? HtmlEscape(Utf8Truncate(web_button, 4, 4)) : Utf8Truncate(D_BUTTON_TOGGLE, 1);
+        bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
+        char first[2];
+        snprintf_P(first, sizeof(first), PSTR("%s"), PSTR(D_BUTTON_TOGGLE));
+        char butt_txt[4];
+        snprintf_P(butt_txt, sizeof(butt_txt), PSTR("%s"), (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : first);
         char number[8];
         WSContentSend_P(PSTR("<tr>"));
         WSContentSend_P(HTTP_DEVICE_CONTROL, 15, button_idx, button_idx,
-          butt_text.c_str(),
-          (has_web_button) ? "" : itoa(button_idx, number, 10));
+          butt_txt,
+          (set_button) ? "" : itoa(button_idx, number, 10));
         button_idx++;
 
         Web.slider[3] = Settings->light_dimmer;
@@ -1644,15 +1652,15 @@ void HandleRoot(void) {
           WSContentSend_P(PSTR("<tr>"));
 
           if (button_idx < (light_device + light_devices)) {
-            const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
-            bool has_web_button = (web_button[0] != '\0');
-            // web_button non-empty: truncate to max 4 chars or max "visual width" of 4 (e.g. "Ligh", "💡💡", "台灯"). Latin char = 1 width, CJK/emoji char = 2 width
-            // web_button empty: take first char of D_BUTTON_TOGGLE + button index (e.g. "T1", "П1", "开1")
-            String butt_text = (has_web_button) ? HtmlEscape(Utf8Truncate(web_button, 4, 4)) : Utf8Truncate(D_BUTTON_TOGGLE, 1);
+            bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
+            char first[2];
+            snprintf_P(first, sizeof(first), PSTR("%s"), PSTR(D_BUTTON_TOGGLE));
+            char butt_txt[4];
+            snprintf_P(butt_txt, sizeof(butt_txt), PSTR("%s"), (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : first);
             char number[8];
             WSContentSend_P(HTTP_DEVICE_CONTROL, 15, button_idx, button_idx,
-              butt_text.c_str(),
-              (has_web_button) ? "" : itoa(button_idx, number, 10));
+              butt_txt,
+              (set_button) ? "" : itoa(button_idx, number, 10));
             button_idx++;
             width = 85;
           }
@@ -1671,16 +1679,17 @@ void HandleRoot(void) {
       } else {  // Settings->flag3.pwm_multi_channels - SetOption68 1 - Enable multi-channels PWM instead of Color PWM
         stemp[0] = 'e'; stemp[1] = '0'; stemp[2] = '\0';  // e0
         for (uint32_t i = 0; i < light_devices; i++) {
-          const char* web_button = (button_idx <= MAX_BUTTON_TEXT) ? GetWebButton(button_idx -1) : "";
-          bool has_web_button = (web_button[0] != '\0');
-          // web_button non-empty: truncate to max 4 chars or "visual width" of 4 (e.g. "Ligh", "💡💡", "台灯"). Latin char = 1 width, CJK/emoji char = 2 width
-          // web_button empty: take first char of D_BUTTON_TOGGLE + button index (e.g. "T1", "П1", "开1")
-          String butt_text = (has_web_button) ? HtmlEscape(Utf8Truncate(web_button, 4, 4)) : Utf8Truncate(D_BUTTON_TOGGLE, 1);
+          bool set_button = ((button_idx <= MAX_BUTTON_TEXT) && strlen(GetWebButton(button_idx -1)));
+          char first[2];
+          snprintf_P(first, sizeof(first), PSTR("%s"), PSTR(D_BUTTON_TOGGLE));
+          char butt_txt[4];
+          snprintf_P(butt_txt, sizeof(butt_txt), PSTR("%s"),
+            (set_button) ? HtmlEscape(GetWebButton(button_idx -1)).c_str() : first);
           char number[8];
           WSContentSend_P(PSTR("<tr>"));
           WSContentSend_P(HTTP_DEVICE_CONTROL, 15, button_idx, button_idx,
-            butt_text.c_str(),
-            (has_web_button) ? "" : itoa(button_idx, number, 10));
+            butt_txt,
+            (set_button) ? "" : itoa(button_idx, number, 10));
           button_idx++;
 
           stemp[1]++;        // e1 to e5 - Make unique ids
@@ -3451,11 +3460,8 @@ void HandleUpgradeFirmwareStart(void) {
 void HandleUploadDone(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
-  uint32_t upload_file_type = Web.upload_file_type;
-  Web.upload_file_type = UPL_NONE;
-
 #if defined(USE_ZIGBEE_EZSP)
-  if ((UPL_EFR32 == upload_file_type) && !Web.upload_error && BUpload.ready) {
+  if ((UPL_EFR32 == Web.upload_file_type) && !Web.upload_error && BUpload.ready) {
     BUpload.ready = false;  //  Make sure not to follow thru again
     // GUI xmodem
     ZigbeeUploadStep1Done(FlashWriteStartSector(), BUpload.spi_hex_size);
@@ -3472,7 +3478,7 @@ void HandleUploadDone(void) {
   WSContentStart_P(PSTR(D_INFORMATION));
   if (!Web.upload_error) {
     WSContentSend_P(HTTP_SCRIPT_RELOAD_TIME, 
-      (UPL_TASMOTA == upload_file_type) ? HTTP_OTA_RESTART_RECONNECT_TIME : HTTP_RESTART_RECONNECT_TIME);  // Refesh main web ui after OTA upgrade
+      (UPL_TASMOTA == Web.upload_file_type) ? HTTP_OTA_RESTART_RECONNECT_TIME : HTTP_RESTART_RECONNECT_TIME);  // Refesh main web ui after OTA upgrade
   }
   WSContentSendStyle();
   WSContentSend_P(PSTR("<div style='text-align:center;'><b>" D_UPLOAD " <font color='#"));
@@ -3533,8 +3539,7 @@ void HandleUploadLoop(void) {
   static uint32_t upload_size;
   static bool upload_error_signalled;
 
-  if (!HttpCheckPriviledgedAccess(false)) { return; }
-  if (UPL_NONE == Web.upload_file_type) { return; }  // Invalid or no file type so bail out
+  if (HTTP_USER == Web.state) { return; }
 
   if (Web.upload_error) {
     if (!upload_error_signalled) {
