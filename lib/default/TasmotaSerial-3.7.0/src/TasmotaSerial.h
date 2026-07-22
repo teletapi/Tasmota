@@ -73,6 +73,9 @@ class TasmotaSerial : public Stream {
     uint32_t getUart(void) const { return m_uart; }
     HardwareSerial *getesp32hws(void) { return TSerial; }
     int32_t setConfig(uint32_t config);
+
+    // Override des UART-RX-FIFO-Schwellwertes
+    bool setRxFifoFull(uint8_t threshold);
 #endif
     bool isValid(void) { return m_valid; }
     bool overflow(void);

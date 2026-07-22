@@ -183,6 +183,9 @@
 
 #define USE_TLS
 #define USE_WEBSERVER
+#define USE_PARTEDIT                                 // xdrv_125: in-place dual-OTA->safeboot partition converter (rides in safeboot, stays resident)
+#undef  USE_TLS                                      // partedit-safeboot uses plain local OTA; and this fork's safeboot TLS path
+                                                     // (tasmota_ca.ino br_x509_trust_anchor) does not currently compile — revisit if HTTPS recovery is wanted
 
 #undef USE_ESP32_WDT                                  // disable watchdog on SAFEBOOT until more testing is done
 
@@ -833,6 +836,17 @@
   #define USE_BERRY_CRYPTO_SPAKE2P_MATTER
 
 #endif // USE_MATTER_DEVICE
+
+#ifdef USE_MATTER_C
+// matter_c (the C/TinyC Matter stack) needs mDNS for commissioning + operational
+// discovery: the glue calls StartMdns(), whose definition is #ifdef USE_DISCOVERY.
+// USE_DISCOVERY is OFF by default, so a slim custom env (USE_MATTER_C without
+// FIRMWARE_TASMOTA32) fails to link with "undefined reference to StartMdns()".
+// Auto-enable it here, same as the USE_MATTER_DEVICE block above. (matter_c brings
+// its own C crypto, so the USE_BERRY_CRYPTO_* defines are intentionally NOT set.)
+  #undef  USE_DISCOVERY
+  #define USE_DISCOVERY
+#endif // USE_MATTER_C
 
 /*********************************************************************************************\
  * Post-process for switched off Ethernet support in Arduino static libs

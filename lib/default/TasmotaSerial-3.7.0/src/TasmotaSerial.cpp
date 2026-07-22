@@ -330,10 +330,22 @@ bool TasmotaSerial::hardwareSerial(void) {
 #ifdef ESP8266
   return m_hardserial;
 #endif  // ESP8266
+
 #ifdef ESP32
   return (0 == m_uart);  // We prefer UART1 and UART2 and keep UART0 for debugging
 #endif  // ESP32
 }
+
+#ifdef ESP32
+bool TasmotaSerial::setRxFifoFull(uint8_t threshold) {
+  // Nur bei Hardware-UART verfügbar
+  if (!m_hardserial || !TSerial) {
+    return false;
+  }
+
+  return uart_set_rx_full_threshold(m_uart, threshold) == ESP_OK;
+}
+#endif
 
 bool TasmotaSerial::overflow(void) {
   if (m_hardserial) {
