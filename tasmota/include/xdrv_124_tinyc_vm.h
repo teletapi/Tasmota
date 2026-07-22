@@ -5590,9 +5590,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           // idle long enough for rx_timeout to fire, by which point
           // any silence-based framer in script-land has already
           // misframed. See TasmotaSerial::setRxFifoFull doc comment.
-          tc_serial_ports[slot]->setRxFifoFull(10);
+          //tc_serial_ports[slot]->setRxFifoFull(10);
 #endif
-          AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial[%d] opened rx=%d tx=%d baud=%d cfg=%d buf=%d hw=%d rxfifo=10"),
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: serial[%d] opened rx=%d tx=%d baud=%d cfg=%d buf=%d hw=%d"),
                  slot, rxpin, txpin, baud, config, bufsize, tc_serial_ports[slot]->hardwareSerial());
           TC_PUSH(vm, slot);
         } else {

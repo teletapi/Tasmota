@@ -1,0 +1,6090 @@
+/*
+  xdrv_124_tinyc.ino - TinyC Bytecode VM for Tasmota
+
+  Copyright (C) 2024  Gerhard Mutz
+
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
+*/
+
+#ifdef USE_TINYC
+
+/*********************************************************************************************\
+ * TinyC - Lightweight C-subset bytecode VM for ESP32/ESP8266
+ *
+ * Multi-VM slot support: up to TC_MAX_VMS simultaneous programs (4 on ESP32, 1 on ESP8266)
+ *
+ * Commands:
+ *   TinyC              - Show VM status (all slots)
+ *   TinyCRun [s] [/f]  - Run slot s (default 0), optionally load /f first
+ *   TinyCStop [s]      - Stop slot s (default 0)
+ *   TinyCReset [s]     - Reset slot s (default 0)
+ *   TinyCExec <n>      - Set instructions per tick (default 1000)
+ *   TinyCInfo 0|1      - Show/hide VM status rows on main page
+ *
+ * Web:
+ *   /tc            - TinyC console page with upload form (shows all slots)
+ *   /tc_upload     - POST endpoint for .tcb binary upload
+ *   /tc_api        - GET JSON API (cmd=run|stop|status|autoexec) with CORS, slot= parameter
+\*********************************************************************************************/
+
+#define XDRV_124  124
+
+// Default TinyC bytecode repository (used when /tinyc_repo.cfg is not present)
+#define TINYC_DEFAULT_REPO "https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc/bytecode"
+
+// Default URL for the TinyC IDE itself (one level up from the bytecode repo).
+// Used by `TinyCIde` to self-update the served /tinyc_ide.html.gz from the repo.
+#define TINYC_DEFAULT_IDE_URL "https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc/tinyc_ide.html.gz"
+
+// Global pause flag — set by filesystem upload handler (xdrv_50) to pause VM during uploads
+bool tc_global_pause = false;
+
+// Forward declarations for custom web handlers (called from SYS_WEB_ON in vm.h)
+static void HandleTinyCWebOn1(void);
+static void HandleTinyCWebOn2(void);
+static void HandleTinyCWebOn3(void);
+static void HandleTinyCWebOn4(void);
+static void HandleTinyCWebOn5(void);
+static void HandleTinyCWebOn6(void);
+static void HandleTinyCWebOn7(void);
+static void (*const TinyCWebOnHandlers[])(void) = {
+  HandleTinyCWebOn1, HandleTinyCWebOn2, HandleTinyCWebOn3, HandleTinyCWebOn4,
+  HandleTinyCWebOn5, HandleTinyCWebOn6, HandleTinyCWebOn7
+};
+
+// mDNS support (for SYS_MDNS syscall)
+#ifdef ESP32
+  #include <ESPmDNS.h>
+#else
+  #include <ESP8266mDNS.h>
+#endif
+
+// UriGlob for port 82 download server wildcard routes
+#include <uri/UriGlob.h>
+
+// Raw socket API for SO_LINGER setsockopt() in HandleTinyCDisplayRaw —
+// pulls in struct linger, SOL_SOCKET, SO_LINGER on ESP32's lwIP.
+#ifdef ESP32
+  #include <lwip/sockets.h>
+#endif
+
+// Matter data-model API must be visible INSIDE the VM header (its SYS_MTR_*
+// handlers call matter_*). Included here, ahead of the VM header, so the real
+// prototypes/types are in scope; the include guard makes the later include in
+// the USE_MATTER_C block (with the port wiring) a harmless no-op.
+#ifdef USE_MATTER_C
+  #include "matter_c.h"
+  // Lazy start: Matter is compiled in but stays completely off (no mDNS, no UDP
+  // socket, no fabric load, no advertising) until a TinyC script first uses an
+  // mtr* syscall — same "off until enabled" model as HomeKit's hkStart(). These
+  // are defined further down (with the port wiring); forward-declared here so
+  // the VM header's mtr* syscall handlers can call them.
+  static bool mtrc_ensure_inited(void);   // init the core once (data model live)
+  static int  mtrc_request_start(void);   // matterStart(): advertise + commission
+
+  // C-linkage shim so pure-C matter_c.c can call Tasmota's PSRAM-aware
+  // special_malloc helper (the helper itself lives in a .ino, so its symbol
+  // is C++-mangled; a plain `extern void *special_malloc(...)` in a .c TU
+  // wouldn't resolve at link time). matter_init() uses this for the ~22 KB
+  // context so it lives in PSRAM on boards that have PSRAM, freeing
+  // internal DRAM where it matters most.
+  extern "C" void *matter_special_malloc(size_t n) { return special_malloc(n); }
+#endif
+
+// VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
+#include "include/xdrv_124_tinyc_vm.h"
+
+/*********************************************************************************************\
+ * Email body callback — called from script_send_email_body() when TinyC initiated the send
+ * Sends pre-registered body text and file attachments via send_message_txt() callback
+\*********************************************************************************************/
+
+#if defined(USE_SENDMAIL) || defined(USE_ESP32MAIL)
+// Called from script_send_email_body() — returns true if TinyC handled it
+bool tinyc_email_body(void(*func)(char *)) {
+  if (!Tinyc || !Tinyc->email_active) return false;
+
+  // Send body text
+  if (Tinyc->email_body && Tinyc->email_body[0]) {
+    func(Tinyc->email_body);
+    AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: email body sent (%d chars)"), strlen(Tinyc->email_body));
+  }
+
+  // Send attachments: '@/path' for files, '$N' for webcam picture buffers
+  for (uint8_t i = 0; i < Tinyc->email_attach_count; i++) {
+    if (Tinyc->email_attach[i]) {
+      if (Tinyc->email_attach[i][0] == '$') {
+        // Picture buffer — send as-is (email library handles $N)
+        func(Tinyc->email_attach[i]);
+      } else {
+        // File path — prefix with '@' for attach_File mechanism
+        char tmp[40];
+        snprintf(tmp, sizeof(tmp), "@%s", Tinyc->email_attach[i]);
+        func(tmp);
+      }
+      AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: email attach: %s"), Tinyc->email_attach[i]);
+    }
+  }
+
+  return true;  // handled by TinyC
+}
+#endif  // USE_SENDMAIL
+
+/*********************************************************************************************\
+ * HomeKit integration — provides C-linkage functions called from homekit.c
+\*********************************************************************************************/
+#ifdef USE_HOMEKIT
+extern "C" {
+  // Return pointer to VM globals of slot 0 (or NULL if not loaded)
+  int32_t *tc_hk_get_globals(void) {
+    if (!Tinyc || !Tinyc->slots[0] || !Tinyc->slots[0]->loaded) return nullptr;
+    return Tinyc->slots[0]->vm.globals;
+  }
+
+  // Return Tasmota hostname for HomeKit bridge name
+  char *tc_hk_get_hostname(void) {
+    return NetworkHostname();
+  }
+
+  // Called from homekit.c when Apple Home writes a variable
+  // Sets dirty flag for hkReady() polling (called from HAP thread)
+  void tc_hk_set_dirty(int16_t global_idx) {
+    for (uint8_t i = 0; i < hk_var_count; i++) {
+      if (hk_var_gidx[i] == global_idx) {
+        hk_var_dirty[i] = 1;
+        return;
+      }
+    }
+  }
+
+  // Called from HomeKit HAP thread when Apple Home writes a value
+  // Invokes "HomeKitWrite" callback on slot 0 with (dev_index, var_index, value) args
+  void tc_hk_write_callback(uint8_t dev_index, uint8_t var_index, int32_t value) {
+    if (!Tinyc) return;
+    TcSlot *s = Tinyc->slots[0];
+    if (!s || !s->loaded) return;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+    if (!s->vm.halted || s->vm.error != TC_OK) {
+#ifdef ESP32
+      if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+      return;
+    }
+    tc_current_slot = s;
+    TcVM *vm = &s->vm;
+    if (vm->sp + 3 <= vm->stack_size) {
+      // Pin pre-push SP: tc_vm_call_callback_idx's saved_sp/restore would
+      // otherwise re-materialise the 3 args the callback consumed.
+      uint16_t pre_push_sp = vm->sp;
+      vm->stack[vm->sp++] = (int32_t)dev_index;
+      vm->stack[vm->sp++] = (int32_t)var_index;
+      vm->stack[vm->sp++] = value;
+      tc_vm_call_callback(vm, "HomeKitWrite");
+      vm->sp = pre_push_sp;   // balance the 3 pushes
+    }
+    tc_current_slot = nullptr;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+  }
+}
+#endif  // USE_HOMEKIT
+
+/*********************************************************************************************\
+ * Helpers: slot-aware callback dispatch
+\*********************************************************************************************/
+
+// tc_slot_callback() is in vm.h (Arduino auto-prototype workaround)
+
+// Call a named callback on ALL active (loaded + halted + no-error) slots
+static void tc_all_callbacks(const char *name) {
+  if (!Tinyc) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (s) tc_slot_callback(s, name);
+  }
+}
+
+// ID-based variant for hot-path well-known callbacks (EverySecond, Every50ms, ...).
+// Zero strcmp per call — dispatch is a direct array index. If no slot defines
+// the callback, each slot fast-exits without even taking the mutex.
+// tc_all_callbacks_id() body is in vm.h (Arduino auto-prototype workaround).
+
+// Call a named callback with a string argument on all active slots
+static void tc_all_callbacks_str(const char *name, const char *str) {
+  if (!Tinyc) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+    if (!s->vm.halted || s->vm.error != TC_OK) {
+#ifdef ESP32
+      if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+      continue;
+    }
+    tc_current_slot = s;
+    tc_vm_call_callback_str(&s->vm, name, str);
+    tc_current_slot = nullptr;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+  }
+}
+
+// Touch button callback — called from xdrv_55_touch.ino on button/slider events
+// Pushes (btn, val) args onto VM stack and calls TouchButton callback on all active slots
+void tinyc_touch_button(uint8_t btn, int16_t val) {
+  if (!Tinyc) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+    if (!s->vm.halted || s->vm.error != TC_OK) {
+#ifdef ESP32
+      if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+      continue;
+    }
+    tc_current_slot = s;
+    // Push args left-to-right: btn first, then val (callee pops in reverse).
+    // tc_vm_call_callback_idx captures saved_sp AFTER the push and restores
+    // it on exit — which would re-materialise both args that the callback
+    // already consumed via STORE_LOCAL. Pin pre-push SP and reassert it on
+    // return so Every TouchButton invocation is net-zero on the operand stack.
+    TcVM *vm = &s->vm;
+    if (vm->sp + 2 <= vm->stack_size) {
+      uint16_t pre_push_sp = vm->sp;
+      vm->stack[vm->sp++] = (int32_t)btn;
+      vm->stack[vm->sp++] = (int32_t)val;
+      tc_vm_call_callback(vm, "TouchButton");
+      vm->sp = pre_push_sp;   // balance the 2 pushes
+    }
+    tc_current_slot = nullptr;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+  }
+}
+
+/*********************************************************************************************\
+ * Settings file: /tinyc.cfg — persists slot→file mapping + autoexec flags
+ *
+ * Format: TC_MAX_VMS lines, each line:  filename,autoexec,show_info
+ *   /slot0_test.tcb,1
+ *   /bresser.tcb,0
+ *   ,0
+ *   ,0
+ *   Last line (optional): _info,<0|1>   (show_info flag)
+\*********************************************************************************************/
+
+#define TC_CFG_FILE "/tinyc.cfg"
+
+// Filesystem boot-loop marker. Created right before autoexec slots
+// start; deleted after `TC_BOOT_STABLE_S` seconds of uptime. If the
+// marker is still present at the start of the next boot, the previous
+// boot crashed before reaching steady state — autoexec is wiped.
+//
+// More robust than relying on `RtcReboot.fast_reboot_count`, which
+// Tasmota itself resets at uptime==BOOT_LOOP_TIME (10 s) via
+// RtcRebootReset() in support_tasmota.ino:1134. That makes the RTC
+// counter useless for any crash that happens >10 s into boot — the
+// counter is gone before the crash, so it never accumulates across
+// reboots and Tasmota's no_autoexec never fires.
+#define TC_BOOT_MARKER "/tinyc.boot.lock"
+#ifndef TC_BOOT_STABLE_S
+#define TC_BOOT_STABLE_S 30   // uptime at which boot is considered "succeeded"
+#endif
+#ifndef TC_BOOT_MAIN_WAIT_MS
+#define TC_BOOT_MAIN_WAIT_MS 2000  // serial autoexec: max ms to wait for a slot's main() to
+#endif                             //   finish before starting the next (main() is usually <300 ms)
+static bool tc_boot_marker_cleared = false;
+// Set when a slot's durable command prefix (slot_config[].cmd_prefix) changed —
+// TinyCPrefixReheal() flushes /tinyc.cfg once on the main task (never from the VM task).
+static bool tc_cfg_prefix_dirty = false;
+// Per-slot "already warned" bits for the dual-claim guard in TinyCPrefixReheal()'s
+// LEARN step — keeps the per-second loop from spamming the log while a stray
+// cross-slot prefix write persists. (TC_MAX_VMS is small, fits a uint32 bitmask.)
+static uint32_t tc_prefix_dupwarn = 0;
+
+#ifdef USE_UFILESYS
+// Save current slot configuration to /tinyc.cfg
+static void TinyCSaveSettings(void) {
+  if (!Tinyc) return;
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return;
+  File f = fs->open(TC_CFG_FILE, "w");
+  if (!f) { AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Cannot write " TC_CFG_FILE)); return; }
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    // filename,autoexec[,cmd_prefix] — the 3rd field is the durable command prefix
+    // (back-compat: old 2-field lines load with an empty prefix).
+    f.printf("%s,%d,%s\n", Tinyc->slot_config[i].filename,
+             Tinyc->slot_config[i].autoexec ? 1 : 0, Tinyc->slot_config[i].cmd_prefix);
+  }
+  // Extra line for show_info
+  f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
+  f.close();
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Settings saved"));
+}
+
+// Drop a slot's DURABLE command prefix on a program-replace / reset, so the
+// per-second self-heal can't resurrect the old program's prefix for a new
+// program. Marks /tinyc.cfg dirty; flushed by TinyCPrefixReheal (main task).
+// NB: NOT called on a plain stop or a same-file reload (incl. boot autoexec) —
+// the durable prefix must survive those so the heal can use it.
+static void TinyCClearDurablePrefix(uint8_t slot) {
+  if (!Tinyc || slot >= TC_MAX_VMS) return;
+  if (Tinyc->slot_config[slot].cmd_prefix[0]) {
+    Tinyc->slot_config[slot].cmd_prefix[0] = '\0';
+    tc_cfg_prefix_dirty = true;
+  }
+}
+
+// Boot-loop detector — primary signal is filesystem-only.
+//
+// Three independent signals OR'd together:
+//
+//   1. **Marker file** (`TC_BOOT_MARKER`) — primary mechanism.
+//      Written right before autoexec slots start; deleted after
+//      `TC_BOOT_STABLE_S` seconds of stable uptime. Marker present
+//      at next boot ⇒ previous boot crashed before reaching steady
+//      state ⇒ disable autoexec. Independent of RtcReboot, SetOption36,
+//      and Tasmota's no_autoexec — works for crashes at ANY time
+//      within the protection window, including delayed callbacks
+//      (WebCall, EverySecond) that fire well after Tasmota's own
+//      RtcRebootReset() at uptime==BOOT_LOOP_TIME (10 s) zeroes the
+//      RTC counter.
+//
+//   2. **Tasmota's `no_autoexec`** — fallback for legacy boot-loop
+//      detection. Only fires when SetOption36 ≠ 0 AND fast_reboot_count
+//      exceeds the threshold (offset+2). Useful only for
+//      crashes-within-10-s-of-boot.
+//
+//   3. **Direct `RtcReboot.fast_reboot_count >= TC_BOOTLOOP_THRESHOLD`**
+//      (default 4) — bypasses SetOption36. Same crashes-within-10-s
+//      limitation as #2, but works even with SetOption36=0.
+//
+// All three return TRUE-on-trip; #1 is the only one that catches the
+// common case of "crash during WebCall / EverySecond several seconds
+// into the run".
+#ifndef TC_BOOTLOOP_THRESHOLD
+#define TC_BOOTLOOP_THRESHOLD 4
+#endif
+static bool tc_bootloop_marker_present(void) {
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return false;
+  return fs->exists(TC_BOOT_MARKER);
+}
+
+// QPC (Quick Power Cycle) counter — orthogonal to RtcReboot.
+// QPC is persisted in flash (not RTC) so it survives true power
+// cycles, including those that fully drain the RTC capacitor.
+// Tasmota itself increments this counter on each boot before
+// uptime==POWER_CYCLE_TIME (8 s); at counter==7 it does
+// SettingsErase(3) — which wipes Tasmota Settings but NOT the
+// LittleFS filesystem, so /tinyc.cfg with autoexec=1 stays put
+// even after Tasmota's "reset everything" trigger fires.
+//
+// We piggy-back on the same counter: at TC_BOOTLOOP_QPC_THRESHOLD
+// power cycles (default 4, well before Tasmota's wipe at 7),
+// rewrite /tinyc.cfg with autoexec=0 so the user has a clean,
+// recoverable device while keeping their WiFi/module config intact.
+//
+// ESP32-only — ESP8266 uses a different storage mechanism for QPC
+// (sector-level flashRead/Write, see UpdateQuickPowerCycle).
+#ifndef TC_BOOTLOOP_QPC_THRESHOLD
+#define TC_BOOTLOOP_QPC_THRESHOLD 4
+#endif
+static uint8_t tc_qpc_counter(void) {
+#ifdef ESP32
+  uint32_t pc_register = 0;
+  QPCRead(&pc_register, sizeof(pc_register));
+  // Format per UpdateQuickPowerCycle: 0xFFA55AF0 | (counter & 0xF).
+  // 0xFFFFFFFF = uninitialised flash → counter 0xF, treated as "no
+  // power-cycle activity yet". Anything else with the right top bits
+  // gives a valid counter.
+  if ((pc_register & 0xFFFFFFF0) != 0xFFA55AF0) return 0;
+  uint8_t counter = pc_register & 0xF;
+  if (counter == 0xF) return 0;  // uninitialised counter slot
+  return counter;
+#else
+  return 0;
+#endif
+}
+
+static void tc_bootloop_marker_delete(void);           // fwd (defined below)
+
+static bool tc_bootloop_detected(void) {
+#ifdef ESP32
+  // Fix B (belt+suspenders to Fix A): a clean software reset
+  // (esp_restart from a `Restart` command / OTA / commanded reboot)
+  // is by definition NOT a crash-loop. Don't trip on it, and proactively
+  // clear any stale marker so a sequential `Restart 1` (esp. right
+  // after an OTA flash, when Tasmota also reports "settings reset")
+  // can never disable autoexec. Crash resets (PANIC/WDT/BROWNOUT) and
+  // power-on (handled by the QPC counter) still go through detection.
+  if (esp_reset_reason() == ESP_RST_SW) {
+    tc_bootloop_marker_delete();
+    return false;
+  }
+#endif
+  if (tc_bootloop_marker_present()) return true;       // primary: filesystem marker
+  if (tc_qpc_counter() >= TC_BOOTLOOP_QPC_THRESHOLD) return true; // QPC: power-cycle storm
+  if (TasmotaGlobal.no_autoexec) return true;          // fallback: Tasmota's gate
+  if (RtcReboot.fast_reboot_count >= TC_BOOTLOOP_THRESHOLD) return true;
+  return false;
+}
+static void tc_bootloop_marker_write(void) {
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return;
+  File f = fs->open(TC_BOOT_MARKER, "w");
+  if (f) {
+    // 0-byte sentinel is enough; we only check for existence
+    f.close();
+  }
+}
+static void tc_bootloop_marker_delete(void) {
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return;
+  if (fs->exists(TC_BOOT_MARKER)) {
+    fs->remove(TC_BOOT_MARKER);
+  }
+}
+
+// Load slot configuration from /tinyc.cfg, load files, auto-run marked slots
+static void TinyCLoadSettings(void) {
+  if (!Tinyc) return;
+  FS *fs = ufsp ? ufsp : ffsp;
+  if (!fs) return;
+
+  // EARLY boot-loop guard: if we've already crashed several times in a
+  // row, force-clear /tinyc.cfg's autoexec flags BEFORE we even parse
+  // them into slot_config[]. The fix used to live in TinyCStartAutoexec
+  // (FUNC_LOOP path) but if Tasmota's own boot-loop wipe never fires
+  // (e.g. SetOption36=0), or the crash happens before FUNC_LOOP gets
+  // a chance to call us, autoexec=1 stays in /tinyc.cfg forever and
+  // the loop is permanent.
+  //
+  // Walk the file once, write a sanitised copy (autoexec=0 on every
+  // line that had it), then continue with normal parsing of the
+  // sanitised file. User regains control via /tc_api?cmd=autoexec
+  // or the IDE.
+  if (tc_bootloop_detected()) {
+    File rf = fs->open(TC_CFG_FILE, "r");
+    if (rf) {
+      String content = rf.readString();
+      rf.close();
+      if (content.indexOf(",1") >= 0) {  // any line with autoexec=1?
+        // Replace ",1\n" with ",0\n" and ",1$" (last line) with ",0".
+        // Conservative — only touches the trailing flag, leaves
+        // filename and any other commas alone.
+        String cleaned;
+        cleaned.reserve(content.length());
+        int from = 0;
+        while (from < (int)content.length()) {
+          int eol = content.indexOf('\n', from);
+          if (eol < 0) eol = content.length();
+          String line = content.substring(from, eol);
+          int comma = line.indexOf(',');
+          if (comma >= 0) {
+            String fname = line.substring(0, comma);
+            // Force the autoexec flag to 0 regardless of original value.
+            cleaned += fname;
+            cleaned += ",0";
+          } else {
+            cleaned += line;  // empty / malformed — keep as-is
+          }
+          if (eol < (int)content.length()) cleaned += '\n';
+          from = eol + 1;
+        }
+        File wf = fs->open(TC_CFG_FILE, "w");
+        if (wf) {
+          wf.print(cleaned);
+          wf.close();
+        }
+        AddLog(LOG_LEVEL_ERROR,
+               PSTR("TCC: Boot loop (count=%d) — %s rewritten with autoexec=0 for all slots"),
+               RtcReboot.fast_reboot_count, TC_CFG_FILE);
+      }
+    }
+  }
+
+  File f = fs->open(TC_CFG_FILE, "r");
+  if (!f) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: No " TC_CFG_FILE " found"));
+    return;
+  }
+  uint8_t slot = 0;
+  while (f.available() && slot <= TC_MAX_VMS) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) { slot++; continue; }
+
+    // Parse: filename,autoexec[,cmd_prefix]
+    int comma = line.indexOf(',');
+    String fname = (comma >= 0) ? line.substring(0, comma) : line;
+    int autoexec = (comma >= 0 && comma + 1 < (int)line.length()) ? line.substring(comma + 1).toInt() : 0;
+    int comma2 = (comma >= 0) ? line.indexOf(',', comma + 1) : -1;
+    String pfx = (comma2 >= 0) ? line.substring(comma2 + 1) : String();
+    pfx.trim();
+
+    // Special _info line
+    if (fname == "_info") {
+      Tinyc->show_info = (autoexec != 0);
+      continue;
+    }
+
+    if (slot >= TC_MAX_VMS) break;
+
+    fname.trim();
+    if (fname.length() > 0) {
+      // Store config (lightweight — no RAM allocation for the VM)
+      strlcpy(Tinyc->slot_config[slot].filename, fname.c_str(), sizeof(Tinyc->slot_config[slot].filename));
+      Tinyc->slot_config[slot].autoexec = (autoexec != 0);
+      strlcpy(Tinyc->slot_config[slot].cmd_prefix, pfx.c_str(), sizeof(Tinyc->slot_config[slot].cmd_prefix));
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d: %s (autoexec=%d prefix=%s)"), slot, fname.c_str(), autoexec, pfx.c_str());
+    }
+    slot++;
+  }
+  f.close();
+  // NOTE: autoexec slots are NOT started here. They're started later
+  // from the first FUNC_LOOP via TinyCStartAutoexec() — see comment
+  // in the FUNC_LOOP handler. Doing it here (during FUNC_INIT) caused
+  // a race against the rest of Tasmota's driver-init chain: main()
+  // runs in its own FreeRTOS task, gets scheduled when loopTask
+  // yields, and ends up executing serialBegin (etc.) concurrently
+  // with other drivers' FUNC_INIT and the Wi-Fi/RF coex init. UART
+  // claim "succeeds" but the GPIO matrix routing gets clobbered →
+  // no bytes ever arrive. By deferring to first FUNC_LOOP, all
+  // FUNC_INITs are done before tc_vm_task even spawns.
+}
+#endif  // USE_UFILESYS
+
+// ── Deferred autoexec starter ──────────────────────────────────
+// Called once on the first non-paused FUNC_LOOP. By this point
+// every other driver's FUNC_INIT has run and hardware is settled,
+// so user `serialBegin`/`i2cBegin`/`spiBegin` calls inside the
+// script's main() can't race Tasmota's own peripheral setup.
+//
+// Keeps the original 100 ms stagger between successive slot starts
+// (prevents heap/stack exhaustion from spawning multiple VM tasks
+// back-to-back). Honors TasmotaGlobal.no_autoexec for boot-loop
+// recovery, same as before.
+static void TinyCStartAutoexec(void) {
+  if (!Tinyc) return;
+#ifdef USE_UFILESYS
+  // Belt-and-braces: TinyCLoadSettings() already rewrote /tinyc.cfg
+  // with autoexec=0 if a boot-loop was detected, so slot_config[i]
+  // .autoexec is already false. But re-check here so any signal that
+  // becomes true between FUNC_INIT and FUNC_LOOP (notably the marker
+  // file written by US a moment ago — but the early-rewrite already
+  // consumed it) still produces a clear log line.
+  if (tc_bootloop_detected()) {
+    AddLog(LOG_LEVEL_ERROR,
+           PSTR("TCC: Boot loop (qpc=%d rtc=%d no_autoexec=%d marker=%d) — autoexec skipped"),
+           tc_qpc_counter(), RtcReboot.fast_reboot_count,
+           TasmotaGlobal.no_autoexec ? 1 : 0,
+           tc_bootloop_marker_present() ? 1 : 0);
+    return;
+  }
+
+  // Has any slot got autoexec to run? If so, drop the boot-marker file
+  // BEFORE starting any VM. Marker is deleted later in FUNC_LOOP once
+  // uptime crosses TC_BOOT_STABLE_S without a crash. If we crash before
+  // that — even at uptime=60s during the first WebCall — the marker
+  // stays and the next boot's tc_bootloop_detected() trips on it.
+  bool any_autoexec = false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slot_config[i].autoexec && Tinyc->slot_config[i].filename[0]) {
+      any_autoexec = true;
+      break;
+    }
+  }
+  if (any_autoexec) {
+    tc_bootloop_marker_write();
+  }
+
+  // TWO-PHASE BOOT (Andreas .107, ESP32-S3+PSRAM, heap-tight).
+  //   Phase 1: start each slot and wait for its main() to reach addCommand/halt
+  //            (main_done) before starting the next — so only ONE main() runs at
+  //            a time. EACH slot's TaskLoop is held (hold_taskloop) the moment it
+  //            finishes main(), so it does NOT spin while later slots are still
+  //            initialising. Without this, slot-0's TaskLoop ran while slot-3's
+  //            main() tried to register, starved it of VM time/heap → BAT*/EM*
+  //            Unknown and a durable-prefix column that never got written.
+  //   Phase 2: once EVERY slot's main() has run, release all TaskLoops together.
+  // delay()/vTaskDelay feed the WDT. ESP32 only — the non-ESP32 path runs the VM
+  // cooperatively from the main loop (no task concurrency to serialise).
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slot_config[i].autoexec && Tinyc->slot_config[i].filename[0]) {
+      if (TinyCLoadFile(Tinyc->slot_config[i].filename, i)) {
+#ifdef ESP32
+        Tinyc->slots[i]->hold_taskloop = true;   // park its TaskLoop until all mains have run
+#endif
+        TinyCStartVM(Tinyc->slots[i]);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: Auto-started slot %d (deferred from FUNC_INIT)"), i);
+#ifdef ESP32
+        uint32_t t0 = millis();
+        TcSlot *as = Tinyc->slots[i];
+        while (as && !as->main_done && (millis() - t0) < TC_BOOT_MAIN_WAIT_MS) {
+          delay(20);
+        }
+#endif
+      }
+    }
+  }
+#ifdef ESP32
+  // Phase 2: every autoexec main() has run (or timed out) — release the held
+  // TaskLoops together so none competed with a still-initialising slot's main().
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slots[i]) { Tinyc->slots[i]->hold_taskloop = false; }
+  }
+#endif
+#endif
+}
+
+// Periodic check: once the device has been up for TC_BOOT_STABLE_S
+// seconds, we declare this boot "succeeded" and remove the marker
+// file. From this point on, any future crash starts a fresh count.
+//
+// Called from FUNC_EVERY_SECOND. tc_boot_marker_cleared is the
+// one-shot guard — file deletion is idempotent, but skipping the
+// existence check after the first successful clear saves a flash op
+// every second.
+static void TinyCCheckBootStable(void) {
+#ifdef USE_UFILESYS
+  if (tc_boot_marker_cleared) return;
+  if (TasmotaGlobal.uptime < TC_BOOT_STABLE_S) return;
+  tc_bootloop_marker_delete();
+  tc_boot_marker_cleared = true;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Boot marker cleared (uptime=%lu s)"), TasmotaGlobal.uptime);
+#endif
+}
+
+/*********************************************************************************************\
+ * Tasmota: Init
+\*********************************************************************************************/
+
+static void TinyCInit(void) {
+  uint32_t freeHeap = ESP_getFreeHeap();
+  uint32_t needed = sizeof(struct TINYC);
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: Need %d bytes, free heap %d"), needed, freeHeap);
+
+  if (freeHeap < needed + 4096) {  // keep 4KB reserve
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Not enough heap (%d free, need %d+4K)"), freeHeap, needed);
+    return;
+  }
+
+  Tinyc = (struct TINYC *)calloc(1, sizeof(struct TINYC));
+  if (!Tinyc) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Memory allocation failed (%d bytes)"), needed);
+    return;
+  }
+  // calloc() zeroes memory but doesn't call C++ constructors for embedded objects.
+  // WiFiUDP (NetworkUDP) needs proper construction or begin() crashes (NULL deref).
+  new (&Tinyc->udp) WiFiUDP();
+  new (&Tinyc->udp_port) WiFiUDP();
+  // TCP client slots — placement-new each (calloc zeroes but doesn't construct C++ objects)
+  for (uint8_t s = 0; s < TC_TCP_CLI_SLOTS; s++) {
+    new (&Tinyc->tcp_cli_clients[s]) WiFiClient();
+  }
+  // Single tcp_client used for accept() in server-mode tcpServer/tcpAvailable
+  // — same calloc-zero trap as the array above. Without this placement-new,
+  // calling tcp_client.connected() (which TC_TCP_ACTIVE_CLIENT does on every
+  // tcpAvailable poll) crashes at NetworkClient::connected vtable+offset 0x54
+  // because the C++ vtable pointer is NULL. Took a 5-line minimal repro
+  // ([tcpServer + EverySecond polling tcpAvailable]) on a fresh-booted .143
+  // ESP32-C3 to find — see MEMORY.md "tcpAvailable() crashes when polled
+  // from a periodic callback" entry for the diagnostic walk.
+  new (&Tinyc->tcp_client) WiFiClient();
+  Tinyc->tcp_cli_slot = 0;
+  Tinyc->instr_per_tick = TC_INSTR_PER_TICK;
+  // Init SPI CS pins to -1 (unused)
+  for (int i = 0; i < TC_SPI_MAX_CS; i++) { Tinyc->spi.cs[i] = -1; }
+  Tinyc->spi.sclk = 0;  // 0 = not initialized (valid pins are >0 or <0)
+
+  // Slots allocated on demand (upload, load, run API)
+
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: TinyC v" TC_RELEASE " initialized (%d bytes, %d free)"), needed, ESP_getFreeHeap());
+
+  // Load slot config from /tinyc.cfg (loads files + auto-runs marked slots)
+#ifdef USE_UFILESYS
+  TinyCLoadSettings();
+#endif
+}
+
+// TinyCSetPersistFile(), TinyCStopVM(), TinyCStartVM() are in vm.h
+// (Arduino auto-prototype workaround for TcSlot* parameters)
+
+/*********************************************************************************************\
+ * Tasmota: Periodic execution (every 50ms)
+\*********************************************************************************************/
+
+static void TinyCEvery50ms(void) {
+  if (!Tinyc) return;
+
+#ifdef ESP32
+  // ESP32: VM runs in its own FreeRTOS task -- monitor all slots for completion
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s) continue;
+    if (s->running && !s->task_running) {
+      // Task finished -- update state
+      s->running = false;
+      tc_current_slot = s;
+      tc_output_flush();
+      tc_current_slot = nullptr;
+    }
+  }
+#else
+  // ESP8266: slice-based execution in 50ms tick (no FreeRTOS task support)
+  // Only slot 0 on ESP8266
+  TcSlot *s = Tinyc->slots[0];
+  if (s && s->loaded && s->running) {
+    if (s->vm.halted || s->vm.error != TC_OK) {
+      tc_free_all_frames(&s->vm);
+      if (s->vm.halted && s->vm.error == TC_OK) {
+        // Normal halt: globals + heap persist for callbacks
+        tc_current_slot = s;
+        tc_output_flush();
+        tc_current_slot = nullptr;
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: Program halted after %u instructions, %d callbacks"),
+          s->vm.instruction_count, s->vm.callback_count);
+        s->running = false;
+      }
+      if (s->vm.error != TC_OK) {
+        tc_heap_free_all(&s->vm);
+        tc_current_slot = s;
+        tc_output_flush();
+        tc_current_slot = nullptr;
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Error: %s (PC=%d)"),
+          tc_error_str(s->vm.error), s->vm.pc - s->vm.code_offset);
+        s->running = false;
+      }
+    } else {
+      yield();  // Feed WDT before VM execution
+      tc_current_slot = s;
+      int err = tc_vm_run_slice(&s->vm, Tinyc->instr_per_tick);
+      tc_current_slot = nullptr;
+      yield();  // Feed WDT after VM execution
+
+      if (err != TC_OK && err != TC_ERR_PAUSED) {
+        tc_free_all_frames(&s->vm);
+        tc_heap_free_all(&s->vm);
+        tc_current_slot = s;
+        tc_output_flush();
+        tc_current_slot = nullptr;
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Runtime error: %s (PC=%d, instr=%u)"),
+          tc_error_str(err), s->vm.pc - s->vm.code_offset, s->vm.instruction_count);
+        s->running = false;
+      }
+    }
+  }
+#endif  // ESP32 vs ESP8266
+
+  // Execute deferred commands (audio etc.) only when VM is halted and idle
+  // Must not run while VM task is active -- concurrent SD access causes crashes
+  // Check slot 0 for deferred exec (shared infrastructure)
+  {
+    TcSlot *s0 = Tinyc->slots[0];
+    if (s0 && s0->loaded && s0->vm.halted && s0->vm.error == TC_OK) {
+      tc_deferred_exec();
+    }
+  }
+
+  // Every50ms callback on all active slots
+  tc_all_callbacks_id(TC_CB_EVERY_50_MSECOND);
+}
+
+/*********************************************************************************************\
+ * Tasmota: Commands
+\*********************************************************************************************/
+
+static const char TC_NOT_INIT[] PROGMEM = "Not initialized";
+
+#define D_PRFX_TINYC "TinyC"
+
+void CmndCheckPartition(void);
+void CmndTinyCIde(void);
+#ifdef ESP32
+void CmndTinyCStack(void);
+#endif
+#ifdef USE_MATTER_C
+void CmndMatterReset(void);
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+void CmndMatterCryptoTest(void);
+#endif
+#endif
+
+const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
+  "|Run|Stop|Reset|Exec|Info|Ide"
+#ifdef ESP32
+  "|Chkpt|Stack"
+#endif
+#ifdef USE_MATTER_C
+  "|MtrReset"
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+  "|MtrCrypto"
+#endif
+#endif
+  ;
+
+void (* const TinyCCommand[])(void) PROGMEM = {
+  &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
+  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde
+#ifdef ESP32
+  , &CmndCheckPartition, &CmndTinyCStack
+#endif
+#ifdef USE_MATTER_C
+  , &CmndMatterReset
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+  , &CmndMatterCryptoTest
+#endif
+#endif
+};
+
+#ifdef USE_MATTER_C
+// TinyCMtrReset — factory-reset Matter: wipe all commissioned fabrics (RAM +
+// persisted UFS blob) and restart so the node re-advertises commissionable for
+// a fresh pairing. Use between commissioning attempts / to leave a controller.
+void CmndMatterReset(void) {
+  mtrc_ensure_inited();    // alloc context + load any persisted fabric so it can be wiped
+  matter_factory_reset();
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: factory reset — fabrics wiped, restarting"));
+  ResponseCmndDone();
+  TasmotaGlobal.restart_flag = 2;
+}
+
+#ifdef TINYC_MTRC_CRYPTO_SELFTEST
+// ── TinyCMtrCrypto — Fork-B Stage-2 crypto-seam de-risk (task #125) ──────────
+// Off by default: this dev scaffold #includes a matter-BinPlugin-internal header
+// (mtrc_crypto_selftest.h) and needs the matter BLIB loaded, so it must NOT compile in
+// normal user builds. Enable with -DTINYC_MTRC_CRYPTO_SELFTEST for matter-plugin dev;
+// the *-plugin envs additionally supply the -Itasmota/Plugins/matter/include +
+// -Ilib/lib_ssl/bearssl-esp8266/src that the header chain (mtrc_crypto_ops.h →
+// t_bearssl.h/_ec.h) pulls in.  NB the include below uses "./Plugins/..." (NOT
+// "../Plugins/..."): Tasmota concatenates every .ino into .pio/build/<env>/src/
+// tasmota.ino.cpp, so a "../" path would resolve against the build dir, not tasmota/.
+// "./Plugins/..." matches the working xdrv_123_plugins.ino:37 include (Hans, 2026-06-07).
+// ⚠ TEMPORARY SCAFFOLD — remove this command (+ the KAT vectors + the plugin's
+// matter_crypto_selftest export + mtrc_crypto_selftest.h) once the real matter_c
+// amalgamation + the firmware-fills-ops / mtrc_crypto_bind path lands. Proven
+// green on .156 2026-06-03 ({"ran":90,"mask":"0x3f","pass":true}).
+// Hands the LOADED matter BinPlugin the firmware's BearSSL primitives BY POINTER
+// (mtrc_crypto_ops — incl. the two base-.rodata vtables br_ec_p256_m15 +
+// br_sha256_vtable), has it run SHA-256/HMAC/HKDF/EC/ECDSA/AES-CCM through the
+// by-pointer seam (its mtrc_crypto.c), and checks each result here against a
+// known-answer vector. A 0x3F mask proves the seam + both vtables work on a
+// mmap'd plugin with NO EXEC_OFFSET on the method pointers — the gate before the
+// full matter_c amalgamation. Requires the matter BLIB (xblib_02) loaded + iniz'd.
+#include "./Plugins/matter/include/mtrc_crypto_selftest.h"  // io struct + ops (pulls t_bearssl)
+
+// Known-answer vectors (firmware .rodata — no plugin relocation question).
+static const uint8_t MTRC_KAT_SHA[32] = {   // SHA-256("abc")
+  0xba,0x78,0x16,0xbf,0x8f,0x01,0xcf,0xea,0x41,0x41,0x40,0xde,0x5d,0xae,0x22,0x23,
+  0xb0,0x03,0x61,0xa3,0x96,0x17,0x7a,0x9c,0xb4,0x10,0xff,0x61,0xf2,0x00,0x15,0xad };
+static const uint8_t MTRC_KAT_HMAC[32] = {  // RFC4231 TC2: HMAC-SHA256("Jefe", "what do ya want for nothing?")
+  0x5b,0xdc,0xc1,0x46,0xbf,0x60,0x75,0x4e,0x6a,0x04,0x24,0x26,0x08,0x95,0x75,0xc7,
+  0x5a,0x00,0x3f,0x08,0x9d,0x27,0x39,0x83,0x9d,0xec,0x58,0xb9,0x64,0xec,0x38,0x43 };
+static const uint8_t MTRC_KAT_HKDF[42] = {  // RFC5869 TC1 OKM
+  0x3c,0xb2,0x5f,0x25,0xfa,0xac,0xd5,0x7a,0x90,0x43,0x4f,0x64,0xd0,0x36,0x2f,0x2a,
+  0x2d,0x2d,0x0a,0x90,0xcf,0x1a,0x5a,0x4c,0x5d,0xb0,0x2d,0x56,0xec,0xc4,0xc5,0xbf,
+  0x34,0x00,0x72,0x08,0xd5,0xb8,0x87,0x18,0x58,0x65 };
+static const uint8_t MTRC_HKDF_SALT[13] = { 0,1,2,3,4,5,6,7,8,9,10,11,12 };
+static const uint8_t MTRC_HKDF_IKM[22]  = { 0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,
+                                            0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b,0x0b };
+static const uint8_t MTRC_HKDF_INFO[10] = { 0xf0,0xf1,0xf2,0xf3,0xf4,0xf5,0xf6,0xf7,0xf8,0xf9 };
+static const uint8_t MTRC_EC_PRIV[32] = {   // NIST P-256 ECDH test scalar d
+  0xc9,0xaf,0xa9,0xd8,0x45,0xba,0x75,0x16,0x6b,0x5c,0x21,0x57,0x67,0xb1,0xd6,0x93,
+  0x4e,0x50,0xc3,0xdb,0x36,0xe8,0x9b,0x12,0x7b,0x8a,0x62,0x2b,0x12,0x0f,0x67,0x21 };
+static const uint8_t MTRC_KAT_ECPUB[65] = { // 0x04 || Qx || Qy  (Q = d*G)
+  0x04,
+  0x60,0xfe,0xd4,0xba,0x25,0x5a,0x9d,0x31,0xc9,0x61,0xeb,0x74,0xc6,0x35,0x6d,0x68,
+  0xc0,0x49,0xb8,0x92,0x3b,0x61,0xfa,0x6c,0xe6,0x69,0x62,0x2e,0x60,0xf2,0x9f,0xb6,
+  0x79,0x03,0xfe,0x10,0x08,0xb8,0xbc,0x99,0xa4,0x1a,0xe9,0xe9,0x56,0x28,0xbc,0x64,
+  0xf2,0xf1,0xb2,0x0c,0x2d,0x7e,0x9f,0x51,0x77,0xa3,0xc2,0x94,0xd4,0x46,0x22,0x99 };
+static const uint8_t MTRC_CCM_KEY[16]   = { 0x40,0x41,0x42,0x43,0x44,0x45,0x46,0x47,
+                                            0x48,0x49,0x4a,0x4b,0x4c,0x4d,0x4e,0x4f };
+static const uint8_t MTRC_CCM_NONCE[13] = { 0x10,0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c };
+static const uint8_t MTRC_CCM_AAD[8]    = { 0,1,2,3,4,5,6,7 };
+static const uint8_t MTRC_CCM_PT[16]    = { 0x20,0x21,0x22,0x23,0x24,0x25,0x26,0x27,
+                                            0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f };
+
+void CmndMatterCryptoTest(void) {
+  // 1) Fill the ops struct with the base's linked BearSSL primitives. The
+  //    __typeof__ fields make each assignment compiler-checked against the real
+  //    br_* prototype; the two vtables are passed as base-.rodata addresses as-is.
+  static mtrc_crypto_ops ops;
+  ops.sha256_init   = br_sha256_init;     ops.sha256_update = br_sha256_update;
+  ops.sha256_out    = br_sha256_out;
+  ops.hmac_key_init = br_hmac_key_init;   ops.hmac_init     = br_hmac_init;
+  ops.hmac_update   = br_hmac_update;     ops.hmac_out      = br_hmac_out;
+  ops.hkdf_init     = br_hkdf_init;       ops.hkdf_inject   = br_hkdf_inject;
+  ops.hkdf_flip     = br_hkdf_flip;       ops.hkdf_produce  = br_hkdf_produce;
+  ops.ecdsa_sign_raw= br_ecdsa_i15_sign_raw; ops.ecdsa_vrfy_raw= br_ecdsa_i15_vrfy_raw;
+  ops.aes_ct_ctrcbc_init = br_aes_ct_ctrcbc_init;
+  ops.ccm_init      = br_ccm_init;        ops.ccm_reset     = br_ccm_reset;
+  ops.ccm_aad_inject= br_ccm_aad_inject;  ops.ccm_flip      = br_ccm_flip;
+  ops.ccm_run       = br_ccm_run;         ops.ccm_get_tag   = br_ccm_get_tag;
+  ops.ccm_check_tag = br_ccm_check_tag;
+  ops.ec_p256_m15   = &br_ec_p256_m15;    ops.sha256_vtable = &br_sha256_vtable;
+
+  // 2) Fill the io struct: ops + firmware-owned input vectors.
+  static mtrc_crypto_selftest_io io;
+  memset(&io, 0, sizeof(io));
+  io.ops = &ops;
+  io.sha_in  = (const uint8_t *)"abc";                          io.sha_in_len  = 3;
+  io.hmac_key= (const uint8_t *)"Jefe";                         io.hmac_key_len= 4;
+  io.hmac_in = (const uint8_t *)"what do ya want for nothing?"; io.hmac_in_len = 28;
+  io.hkdf_salt = MTRC_HKDF_SALT; io.hkdf_salt_len = 13;
+  io.hkdf_ikm  = MTRC_HKDF_IKM;  io.hkdf_ikm_len  = 22;
+  io.hkdf_info = MTRC_HKDF_INFO; io.hkdf_info_len = 10; io.hkdf_out_len = 42;
+  io.ec_priv   = MTRC_EC_PRIV;
+  io.ccm_key   = MTRC_CCM_KEY;
+  io.ccm_nonce = MTRC_CCM_NONCE; io.ccm_nonce_len = 13;
+  io.ccm_aad   = MTRC_CCM_AAD;   io.ccm_aad_len   = 8;
+  io.ccm_pt    = MTRC_CCM_PT;    io.ccm_pt_len    = 16;
+
+  // 3) Resolve the plugin export (xdrv_123 registry, same TU) + call it through
+  //    the (buf,int)->int ABI, passing &io as the buf arg.
+  TC_BLIB_REG_ENTRY *r = tc_blib_lookup("matter_crypto_selftest");
+  if (!r) { ResponseCmndChar_P(PSTR("matter BLIB not loaded/iniz'd (no matter_crypto_selftest)")); return; }
+  int32_t ran = ((int32_t (*)(uint8_t *, int))r->fn)((uint8_t *)&io, (int)sizeof(io));
+
+  // 4) Compare the plugin's outputs against the KATs -> per-primitive pass bits.
+  uint32_t m = 0;
+  if (ran == 0x5A) {
+    if (memcmp(io.sha_out,  MTRC_KAT_SHA,   32) == 0) m |= 0x01;
+    if (memcmp(io.hmac_out, MTRC_KAT_HMAC,  32) == 0) m |= 0x02;
+    if (memcmp(io.hkdf_out, MTRC_KAT_HKDF,  42) == 0) m |= 0x04;
+    if (memcmp(io.ec_pub,   MTRC_KAT_ECPUB, 65) == 0) m |= 0x08;   // mulgen vtable
+    if (io.ecdsa_verify == 1)                         m |= 0x10;
+    if (io.ccm_dec_ok == 1 && memcmp(io.ccm_dec, MTRC_CCM_PT, 16) == 0) m |= 0x20;
+  }
+  AddLog(LOG_LEVEL_INFO,
+         PSTR("MTR crypto seam: ran=%d mask=0x%02x  sha=%d hmac=%d hkdf=%d ec=%d ecdsa=%d ccm=%d  %s"),
+         ran, m, !!(m&1), !!(m&2), !!(m&4), !!(m&8), !!(m&16), !!(m&32),
+         (m == 0x3F) ? "ALL PASS" : "FAIL");
+  Response_P(PSTR("{\"MtrCrypto\":{\"ran\":%d,\"mask\":\"0x%02x\",\"pass\":%s}}"),
+             ran, m, (m == 0x3F) ? "true" : "false");
+}
+#endif // TINYC_MTRC_CRYPTO_SELFTEST (Fork-B crypto-seam scaffold — off by default)
+#endif // USE_MATTER_C
+
+// --- TinyCChkpt: partition table manager (no USE_BINPLUGINS needed) ---
+#ifdef ESP32
+#include <MD5Builder.h>
+
+static bool chkpt_scan_ptable(uint8_t *mp, uint32_t num) {
+  int num_partitions = num;
+  esp_partition_info_t *peptr = (esp_partition_info_t*)mp;
+  for (uint32_t cnt = 0; cnt < num_partitions; cnt++) {
+    AddLog(LOG_LEVEL_INFO, PSTR("partition addr: 0x%06x; size: 0x%06x (%d KB); label: %s"),
+           peptr->pos.offset, peptr->pos.size, peptr->pos.size / 1024, peptr->label);
+    peptr++;
+  }
+  esp_err_t ret = esp_partition_table_verify((const esp_partition_info_t *)mp, false, &num_partitions);
+  AddLog(LOG_LEVEL_INFO, "partition table status: err: %d - entries: %d", ret, num_partitions);
+  return ret;
+}
+
+// TinyCChkpt       — show partition table
+// TinyCChkpt p      — pack: shrink app0 to fit firmware, expand spiffs
+// TinyCChkpt p 2880 — pack with explicit app0 size in KB
+void CmndCheckPartition(void) {
+  uint32_t new_app_size = 0;
+  uint8_t pack = 0;
+
+  if (XdrvMailbox.data_len) {
+    char *cp = XdrvMailbox.data;
+    while (*cp == ' ') cp++;
+    if (*cp == 'p') {
+      pack = 1;
+      cp++;
+      while (*cp == ' ') cp++;
+      if (*cp) {
+        uint32_t req_kb = strtol(cp, &cp, 10);
+        if (req_kb >= 1024 && req_kb <= 3904) {
+          new_app_size = req_kb * 1024;
+          new_app_size = (new_app_size + 0xFFFF) & ~0xFFFF;
+        }
+      }
+    }
+  }
+
+  if (pack) {
+    uint32_t sketch_size = ESP.getSketchSize();
+    if (!new_app_size) {
+      new_app_size = ((sketch_size + 0xFFFF) & ~0xFFFF) + 0x30000;
+      new_app_size = (new_app_size + 0xFFFF) & ~0xFFFF;
+      AddLog(LOG_LEVEL_INFO, PSTR("pack: firmware %d KB, auto app %d KB (overhead %d KB)"),
+        sketch_size / 1024, new_app_size / 1024, (new_app_size - sketch_size) / 1024);
+    } else {
+      AddLog(LOG_LEVEL_INFO, PSTR("pack: firmware %d KB, requested app %d KB"),
+        sketch_size / 1024, new_app_size / 1024);
+      if (new_app_size < sketch_size) {
+        AddLog(LOG_LEVEL_INFO, PSTR("pack: requested size too small for current firmware!"));
+        ResponseCmndDone();
+        return;
+      }
+    }
+    LittleFS.format();
+  }
+
+  #define PART_OFFSET 0x8000
+
+  int num_partitions;
+  uint8_t *mp = (uint8_t*)calloc(SPI_FLASH_SEC_SIZE >> 2, 4);
+  esp_err_t ret = esp_flash_read(NULL, mp, PART_OFFSET, SPI_FLASH_SEC_SIZE);
+  if (ret) {
+    AddLog(LOG_LEVEL_INFO, "partition read error: %d", ret);
+  } else {
+    if (mp[0] != 0xAA || mp[1] != 0x50) {
+      AddLog(LOG_LEVEL_INFO, "partition table not valid");
+    } else {
+      ret = esp_partition_table_verify((const esp_partition_info_t *)mp, false, &num_partitions);
+      if (!ret) {
+        AddLog(LOG_LEVEL_INFO, "partition table is valid: %d entries", num_partitions);
+        int8_t hasspiffs = -1;
+        esp_partition_info_t *peptr = (esp_partition_info_t*)mp;
+        for (uint32_t cnt = 0; cnt < num_partitions; cnt++) {
+          AddLog(LOG_LEVEL_INFO, PSTR("partition addr: 0x%06x; size: 0x%06x (%d KB); label: %s"),
+                 peptr->pos.offset, peptr->pos.size, peptr->pos.size / 1024, peptr->label);
+          if (!strcmp((char*)peptr->label, "spiffs")) hasspiffs = cnt;
+          peptr++;
+          if (peptr->magic != ESP_PARTITION_MAGIC) break;
+        }
+
+        if (pack) {
+          int8_t hasapp0 = -1, hascustom = -1, hassafeboot = -1;
+          peptr = (esp_partition_info_t*)mp;
+          for (uint32_t cnt = 0; cnt < num_partitions; cnt++) {
+            if (!strcmp((char*)peptr[cnt].label, "app0")) hasapp0 = cnt;
+            if (!strcmp((char*)peptr[cnt].label, "custom")) hascustom = cnt;
+            if (!strcmp((char*)peptr[cnt].label, "safeboot")) hassafeboot = cnt;
+          }
+          if (hassafeboot < 0) {
+            AddLog(LOG_LEVEL_INFO, PSTR("pack: no safeboot partition — resize refused (no recovery possible)"));
+            pack = 0;
+          } else if (hasapp0 < 0 || hasspiffs < 0) {
+            AddLog(LOG_LEVEL_INFO, PSTR("pack: app0 or spiffs not found"));
+          } else if (peptr[hasapp0].pos.size == new_app_size) {
+            AddLog(LOG_LEVEL_INFO, PSTR("pack: app0 already %d KB, nothing to do"), new_app_size / 1024);
+            pack = 0;
+          } else {
+            uint32_t new_spiffs_offset = peptr[hasapp0].pos.offset + new_app_size;
+            uint32_t spiffs_end;
+            if (hascustom >= 0) {
+              spiffs_end = peptr[hascustom].pos.offset;
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: preserving custom at 0x%06x"), spiffs_end);
+            } else {
+              spiffs_end = ESP.getFlashChipSize();
+            }
+            if (new_spiffs_offset >= spiffs_end) {
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: no room for spiffs, aborting"));
+              pack = 0;
+            } else {
+              uint32_t new_spiffs_size = spiffs_end - new_spiffs_offset;
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: app0 %d KB -> %d KB"),
+                peptr[hasapp0].pos.size / 1024, new_app_size / 1024);
+              AddLog(LOG_LEVEL_INFO, PSTR("pack: spiffs %d KB @ 0x%06x -> %d KB @ 0x%06x"),
+                peptr[hasspiffs].pos.size / 1024, peptr[hasspiffs].pos.offset,
+                new_spiffs_size / 1024, new_spiffs_offset);
+              peptr[hasapp0].pos.size = new_app_size;
+              peptr[hasspiffs].pos.offset = new_spiffs_offset;
+              peptr[hasspiffs].pos.size = new_spiffs_size;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (pack) {
+    MD5Builder md5;
+    md5.begin();
+    md5.add(mp, num_partitions * sizeof(esp_partition_info_t));
+    md5.calculate();
+    uint8_t result[16];
+    md5.getBytes(result);
+    uint8_t *end_offset = mp + (num_partitions * sizeof(esp_partition_info_t));
+    end_offset[0] = 0xeb;
+    end_offset[1] = 0xeb;
+    memmove(end_offset + 16, result, 16);
+
+    chkpt_scan_ptable(mp, num_partitions);
+    ret = esp_flash_erase_region(NULL, PART_OFFSET, SPI_FLASH_SEC_SIZE);
+    ret = esp_flash_write(NULL, mp, PART_OFFSET, SPI_FLASH_SEC_SIZE);
+    free(mp);
+    ESP_Restart();
+    return;
+  }
+
+  free(mp);
+  ResponseCmndDone();
+}
+#endif // ESP32
+
+// Query variables by name — scans global name table in binary (zero RAM cost)
+// Usage: http://device/cm?cmnd=TinyC ?var1;var2     (slot 0)
+//        http://device/cm?cmnd=TinyC ?1 var1;var2   (slot 1)
+// Returns: {"TinyC":{"temp":23.5,"count":42,"name":"hello"}}
+// Query global variables by index — used with _Q() compile-time macro
+// Format: TinyC ?<idx><type>[<size>];<idx><type>[<size>];...
+// Types: i=int, f=float, s<n>=char[n], I<n>=int[n], F<n>=float[n]
+// Optional slot prefix: TinyC ?2 0f;1i  (query slot 2)
+// Response: {"TinyC":[23.5,42,...]}
+static void CmndTinyCQuery(char *data, uint16_t len) {
+  uint8_t slot = 0;
+  char *p = data;
+  while (len > 0 && *p == ' ') { p++; len--; }
+  if (len >= 2 && p[0] >= '0' && p[0] < ('0' + TC_MAX_VMS) && p[1] == ' ') {
+    slot = p[0] - '0';
+    p += 2; len -= 2;
+  }
+  TcSlot *s = (slot < TC_MAX_VMS) ? Tinyc->slots[slot] : nullptr;
+  if (!s || !s->loaded) {
+    Response_P(PSTR("{\"TinyC\":\"slot %d not loaded\"}"), slot);
+    return;
+  }
+  Response_P(PSTR("{\"TinyC\":["));
+  bool first = true;
+  while (len > 0) {
+    while (len > 0 && *p == ' ') { p++; len--; }
+    if (len == 0) break;
+    // Parse index
+    uint16_t idx = 0;
+    while (len > 0 && *p >= '0' && *p <= '9') {
+      idx = idx * 10 + (*p - '0');
+      p++; len--;
+    }
+    if (len == 0) break;
+    char type = *p; p++; len--;  // i, f, s, I, F
+    // Parse optional size for arrays/strings
+    uint16_t size = 0;
+    while (len > 0 && *p >= '0' && *p <= '9') {
+      size = size * 10 + (*p - '0');
+      p++; len--;
+    }
+    if (!first) ResponseAppend_P(PSTR(","));
+    first = false;
+    if (type == 's' && size > 0) {
+      // char[] → JSON string
+      char tmp[size + 1];
+      uint16_t i = 0;
+      while (i < size && idx + i < TC_MAX_GLOBALS && s->vm.globals[idx + i]) {
+        tmp[i] = (char)s->vm.globals[idx + i]; i++;
+      }
+      tmp[i] = 0;
+      ResponseAppend_P(PSTR("\"%s\""), tmp);
+    } else if ((type == 'I' || type == 'F') && size > 0) {
+      // int[]/float[] → JSON array
+      ResponseAppend_P(PSTR("["));
+      for (uint16_t i = 0; i < size && idx + i < TC_MAX_GLOBALS; i++) {
+        if (i) ResponseAppend_P(PSTR(","));
+        int32_t v = s->vm.globals[idx + i];
+        if (type == 'F') { float f = *(float*)&v; ResponseAppend_P(PSTR("%*_f"), -4, &f); }
+        else ResponseAppend_P(PSTR("%d"), v);
+      }
+      ResponseAppend_P(PSTR("]"));
+    } else if (type == 'f') {
+      int32_t v = (idx < TC_MAX_GLOBALS) ? s->vm.globals[idx] : 0;
+      float f = *(float*)&v;
+      ResponseAppend_P(PSTR("%*_f"), -4, &f);
+    } else {
+      int32_t v = (idx < TC_MAX_GLOBALS) ? s->vm.globals[idx] : 0;
+      ResponseAppend_P(PSTR("%d"), v);
+    }
+    // Skip semicolon separator
+    if (len > 0 && *p == ';') { p++; len--; }
+  }
+  ResponseAppend_P(PSTR("]}"));
+}
+
+void CmndTinyC(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+
+  // Handle variable query: "TinyC ?var1;var2"
+  if (XdrvMailbox.data_len > 0 && XdrvMailbox.data[0] == '?') {
+    CmndTinyCQuery(XdrvMailbox.data + 1, XdrvMailbox.data_len - 1);
+    return;
+  }
+
+  // Show status for all slots
+  Response_P(PSTR("{\"TinyC\":{\"Heap\":%d,\"Slots\":["), ESP_getFreeHeap());
+  bool first = true;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s) continue;
+    if (!first) ResponseAppend_P(PSTR(","));
+    first = false;
+    ResponseAppend_P(PSTR("{\"Slot\":%d,\"Loaded\":%d,\"Running\":%d,\"Size\":%d,"
+      "\"PC\":%d,\"SP\":%d,\"Instr\":%u,\"Error\":\"%s\",\"File\":\"%s\"}"),
+      i,
+      s->loaded ? 1 : 0,
+      s->running ? 1 : 0,
+      s->program_size,
+      s->vm.pc - s->vm.code_offset,
+      s->vm.sp,
+      s->vm.instruction_count,
+      tc_error_str(s->vm.error),
+      s->filename[0] ? s->filename : "");
+  }
+  ResponseAppend_P(PSTR("]}}"));
+}
+
+// Parse optional slot number from command payload: "TinyCRun [slot] [/file]"
+// Returns slot number (0-based), advances *pp past the slot digit + space
+static uint8_t tc_parse_cmd_slot(char **pp, uint16_t *plen) {
+  uint8_t slot = 0;
+  char *p = *pp;
+  uint16_t len = *plen;
+  if (len > 0 && p[0] >= '0' && p[0] < ('0' + TC_MAX_VMS)) {
+    slot = p[0] - '0';
+    p++; len--;
+    if (len > 0 && p[0] == ' ') { p++; len--; }
+    *pp = p;
+    *plen = len;
+  }
+  return slot;
+}
+
+void CmndTinyCRun(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  // Parse: TinyCRun [slot] [/file.tcb]
+  char *p = XdrvMailbox.data;
+  uint16_t len = XdrvMailbox.data_len;
+  uint8_t slot_num = tc_parse_cmd_slot(&p, &len);
+  TcSlot *s = Tinyc->slots[slot_num];
+  if (!s) {
+    // Auto-allocate slot if needed
+    Tinyc->slots[slot_num] = tc_slot_alloc();
+    s = Tinyc->slots[slot_num];
+  }
+  if (!s) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+#ifdef USE_UFILESYS
+  // If a filename follows (e.g., "TinyCRun /bresser.tcb" or "TinyCRun 2 /bresser.tcb")
+  if (len > 0 && p[0] == '/') {
+    TinyCStopVM(s);
+    if (!TinyCLoadFile(p, slot_num)) {
+      ResponseCmndChar_P(PSTR("Load failed"));
+      return;
+    }
+    TinyCSaveSettings();
+  }
+#endif
+  // Lazy-load from config if not yet loaded
+  if (!s->loaded && Tinyc->slot_config[slot_num].filename[0]) {
+    TinyCLoadFile(Tinyc->slot_config[slot_num].filename, slot_num);
+    s = Tinyc->slots[slot_num];
+  }
+  if (!s || !s->loaded) { ResponseCmndChar_P(PSTR("No program loaded")); return; }
+  if (!TinyCStartVM(s)) {
+    ResponseCmndChar_P(PSTR("Start failed"));
+    return;
+  }
+  ResponseCmndDone();
+}
+
+void CmndTinyCStop(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  char *p = XdrvMailbox.data;
+  uint16_t len = XdrvMailbox.data_len;
+  uint8_t slot_num = tc_parse_cmd_slot(&p, &len);
+  TcSlot *s = Tinyc->slots[slot_num];
+  if (!s) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  TinyCStopVM(s);
+  s->cmd_prefix_saved[0] = '\0';   // deliberate stop — don't let the per-second
+                                   // self-heal resurrect this slot's command prefix.
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d stopped"), slot_num);
+  ResponseCmndDone();
+}
+
+void CmndTinyCReset(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  char *p = XdrvMailbox.data;
+  uint16_t len = XdrvMailbox.data_len;
+  uint8_t slot_num = tc_parse_cmd_slot(&p, &len);
+  TcSlot *s = Tinyc->slots[slot_num];
+  if (!s) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  TinyCStopVM(s);  // frees frame locals and heap
+  // Free remaining dynamic VM allocations before zeroing struct
+  if (s->vm.stack) { free(s->vm.stack); }
+  if (s->vm.globals) { free(s->vm.globals); }
+  if (s->vm.constants) { free(s->vm.constants); }
+  if (s->vm.const_data) { free(s->vm.const_data); }
+  memset(&s->vm, 0, sizeof(TcVM));  // zero all fields and pointers
+  s->cmd_prefix_saved[0] = '\0';   // deliberate reset — drop the sticky prefix too
+                                   // (it lives in TcSlot, not TcVM, so the memset
+                                   // above doesn't clear it).
+  TinyCClearDurablePrefix(slot_num);  // and the persisted copy (slot is being wiped)
+  s->output_len = 0;
+  s->output[0] = '\0';
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d reset"), slot_num);
+  ResponseCmndDone();
+}
+
+void CmndTinyCExec(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  if (XdrvMailbox.payload > 0) {
+    Tinyc->instr_per_tick = XdrvMailbox.payload;
+  }
+  ResponseCmndNumber(Tinyc->instr_per_tick);
+}
+
+void CmndTinyCInfo(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+  if (XdrvMailbox.data_len > 0) {
+    Tinyc->show_info = (XdrvMailbox.payload != 0);
+#ifdef USE_UFILESYS
+    TinyCSaveSettings();
+#endif
+  }
+  ResponseCmndNumber(Tinyc->show_info ? 1 : 0);
+}
+
+/*********************************************************************************************\
+ * Tasmota: Web interface
+\*********************************************************************************************/
+
+#ifdef USE_WEBSERVER
+
+// Helper: send response with PROGMEM body string (saves RAM on ESP8266)
+static void WSSend_P(int code, PGM_P content_type, PGM_P body) {
+  char ct[32], buf[96];
+  strncpy_P(ct, content_type, sizeof(ct) - 1); ct[sizeof(ct) - 1] = '\0';
+  strncpy_P(buf, body, sizeof(buf) - 1); buf[sizeof(buf) - 1] = '\0';
+  Webserver->send(code, (const char*)ct, (const char*)buf);
+}
+// Shared PROGMEM strings for web responses
+static const char TC_CT_JSON[] PROGMEM = "application/json";
+static const char TC_CORS_ORIGIN[] PROGMEM = "Access-Control-Allow-Origin";
+static const char TC_CORS_METHODS[] PROGMEM = "Access-Control-Allow-Methods";
+static const char TC_CORS_HEADERS[] PROGMEM = "Access-Control-Allow-Headers";
+
+// Send CORS headers from PROGMEM (saves ~180 bytes RAM on ESP8266).
+// Non-static so the lazy WSContentBegin path in xdrv_124_tinyc_vm.h's
+// SYS_WEB_SEND* dispatchers can reuse it from inside the VM TU.
+void TCSendCORS(const char *methods_ram) {
+  char hdr[40], val[16];
+  strncpy_P(hdr, TC_CORS_ORIGIN, sizeof(hdr)); Webserver->sendHeader(hdr, "*");
+  strncpy_P(hdr, TC_CORS_METHODS, sizeof(hdr)); Webserver->sendHeader(hdr, methods_ram);
+  strncpy_P(hdr, TC_CORS_HEADERS, sizeof(hdr));
+  strcpy_P(val, PSTR("Content-Type"));
+  Webserver->sendHeader(hdr, val);
+}
+// Shorthand for JSON responses
+#define WSSendJSON_P(code, body) WSSend_P(code, TC_CT_JSON, body)
+// Send JSON with pre-filled RAM buffer
+static void WSSendJSON(int code, const char *json_buf) {
+  char ct[20];
+  strncpy_P(ct, TC_CT_JSON, sizeof(ct) - 1); ct[sizeof(ct) - 1] = '\0';
+  Webserver->send(code, (const char*)ct, json_buf);
+}
+
+// Helper: load a .tcb file from filesystem into a specified slot
+#ifdef USE_UFILESYS
+static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
+  if (!Tinyc) return false;
+  if (slot_num >= TC_MAX_VMS) return false;
+
+  // Allocate slot if needed
+  if (!Tinyc->slots[slot_num]) {
+    Tinyc->slots[slot_num] = tc_slot_alloc();
+    if (!Tinyc->slots[slot_num]) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Slot %d alloc failed"), slot_num);
+      return false;
+    }
+  }
+  TcSlot *s = Tinyc->slots[slot_num];
+
+  File file;
+  if (ufsp) file = ufsp->open(path, "r");
+  if (!file && ffsp && ffsp != ufsp) file = ffsp->open(path, "r");
+  if (!file) return false;
+  uint32_t fsize = file.size();
+  if (fsize == 0 || fsize > TC_MAX_PROGRAM) { file.close(); return false; }
+  TinyCStopVM(s);
+  s->cmd_prefix_saved[0] = '\0';   // replacing the program — drop the old program's
+                                   // sticky command prefix so the self-heal can't
+                                   // resurrect it before the new main() registers.
+  // Only drop the DURABLE prefix when this is a genuinely DIFFERENT program
+  // (s->filename still holds the old name here). A same-file reload or the boot
+  // autoexec load must keep it — that durable copy is what heals a heap-tight boot.
+  if (s->filename[0] && strcmp(s->filename, path) != 0) {
+    TinyCClearDurablePrefix(slot_num);
+  }
+  if (s->program) { free(s->program); s->program = nullptr; }
+  // Internal DRAM first — small programs (the common case) stay in fast RAM.
+  // Only when the internal heap can't satisfy (very large .tcb, or DRAM
+  // already crowded by canvas/camera/HomeKit) do we spill into PSRAM. The
+  // VM step loop reads code byte-by-byte via TC_READ_BYTE; PSRAM's ~10x
+  // latency is acceptable at TinyC's tick rates (50 ms / 1 s callbacks)
+  // but we prefer to avoid it when possible.
+  s->program = (uint8_t *)malloc(fsize);
+#ifdef ESP32
+  if (!s->program) {
+    s->program = (uint8_t *)heap_caps_malloc(fsize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s->program) {
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: %s (%u B) allocated in PSRAM (DRAM full)"),
+        path, (unsigned)fsize);
+    }
+  }
+#endif
+  if (!s->program) { file.close(); return false; }
+  file.read(s->program, fsize);
+  file.close();
+  s->program_size = fsize;
+  int err = tc_vm_load(&s->vm, s->program, fsize);
+  if (err == TC_OK) {
+    s->loaded = true;
+    strlcpy(s->filename, path, sizeof(s->filename));
+    strlcpy(Tinyc->slot_config[slot_num].filename, path, sizeof(Tinyc->slot_config[slot_num].filename));
+    TinyCSetPersistFile(s, path);
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: Loaded %s (%d bytes) into slot %d"), path, fsize, slot_num);
+    return true;
+  }
+  AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Load %s failed: %s"), path, tc_error_str(err));
+  free(s->program);
+  s->program = nullptr;
+  s->program_size = 0;
+  return false;
+}
+#endif
+
+static void HandleTinyCPage(void) {
+  if (!HttpCheckPriviledgedAccess()) { return; }
+
+  WSContentStart_P(PSTR("TinyC Console"));
+  WSContentSendStyle();
+
+  // Handle button commands first (before displaying status)
+  // Commands default to slot 0 unless otherwise specified
+  if (Tinyc && Webserver->hasArg(F("cmd"))) {
+    String cmd = Webserver->arg(F("cmd"));
+    uint8_t cmd_slot = 0;
+    if (Webserver->hasArg(F("slot"))) {
+      cmd_slot = Webserver->arg(F("slot")).toInt();
+      if (cmd_slot >= TC_MAX_VMS) cmd_slot = 0;
+    }
+    TcSlot *cs = Tinyc->slots[cmd_slot];
+
+    if (cmd == "run") {
+      // Lazy-load if needed
+      if (!cs && Tinyc->slot_config[cmd_slot].filename[0]) {
+        TinyCLoadFile(Tinyc->slot_config[cmd_slot].filename, cmd_slot);
+        cs = Tinyc->slots[cmd_slot];
+      }
+      if (cs) TinyCStartVM(cs);
+    } else if (cmd == "stop" && cs) {
+      TinyCStopVM(cs);
+      cs->cmd_prefix_saved[0] = '\0';   // deliberate (web) stop — no prefix self-heal
+    } else if (cmd == "reset" && cs) {
+      TinyCStopVM(cs);
+      // Free remaining dynamic VM allocations before zeroing struct
+      if (cs->vm.stack) { free(cs->vm.stack); }
+      if (cs->vm.globals) { free(cs->vm.globals); }
+      if (cs->vm.constants) { free(cs->vm.constants); }
+      if (cs->vm.const_data) { free(cs->vm.const_data); }
+      memset(&cs->vm, 0, sizeof(TcVM));
+      cs->cmd_prefix_saved[0] = '\0';   // deliberate (web) reset — drop sticky prefix
+      TinyCClearDurablePrefix(cmd_slot);  // and the persisted copy
+      cs->output_len = 0;
+      cs->output[0] = '\0';
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: VM slot %d reset (web)"), cmd_slot);
+    } else if (cmd == "load" && Webserver->hasArg(F("file"))) {
+#ifdef USE_UFILESYS
+      String file = Webserver->arg(F("file"));
+      if (file.length() > 0) {
+        TinyCLoadFile(file.c_str(), cmd_slot);
+        TinyCSaveSettings();
+      }
+#endif
+    } else if (cmd == "autoexec") {
+      // Set autoexec flag: value=1 enable, value=0 disable, no value = toggle
+      if (Webserver->hasArg(F("value"))) {
+        Tinyc->slot_config[cmd_slot].autoexec = (Webserver->arg(F("value")).toInt() != 0);
+      } else {
+        Tinyc->slot_config[cmd_slot].autoexec = !Tinyc->slot_config[cmd_slot].autoexec;
+      }
+      if (cs) cs->autoexec = Tinyc->slot_config[cmd_slot].autoexec;
+      TinyCSaveSettings();
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d autoexec=%d"), cmd_slot, Tinyc->slot_config[cmd_slot].autoexec ? 1 : 0);
+    } else if (cmd == "download" && Webserver->hasArg(F("rfile"))) {
+#ifdef USE_UFILESYS
+      // Download .tcb from remote repository
+      String rfile = Webserver->arg(F("rfile"));
+      if (rfile.length() > 0) {
+        // Read base URL from /tinyc_repo.cfg, fall back to default repo
+        char repo_url[200] = {};
+        File rcfg = ufsp->open("/tinyc_repo.cfg", "r");
+        if (rcfg) {
+          int rl = rcfg.readBytesUntil('\n', repo_url, sizeof(repo_url) - 1);
+          rcfg.close();
+          while (rl > 0 && (repo_url[rl-1] == '\r' || repo_url[rl-1] == ' ')) { repo_url[--rl] = 0; }
+        }
+        if (!repo_url[0]) {
+          strlcpy(repo_url, TINYC_DEFAULT_REPO, sizeof(repo_url));
+        }
+        if (repo_url[0]) {
+          // Build full URL: base_url/filename
+          String url = String(repo_url);
+          if (!url.endsWith("/")) url += "/";
+          url += rfile;
+          // Download to filesystem
+          char fpath[48];
+          snprintf(fpath, sizeof(fpath), "/%s", rfile.c_str());
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+          HTTPClientLight http;
+#else
+          WiFiClient http_client;
+          HTTPClient http;
+#endif
+          http.setTimeout(10000);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+          bool begun = http.begin(url);
+#else
+          bool begun = http.begin(http_client, url);
+#endif
+          if (begun) {
+            int httpCode = http.GET();
+            if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
+              File f = ufsp->open(fpath, "w");
+              if (f) {
+                WiFiClient *stream = http.getStreamPtr();
+                int32_t len = http.getSize();
+                if (len < 0) len = 999999;
+                uint8_t *dbuf = (uint8_t *)malloc(512);
+                if (dbuf) {
+                  while (http.connected() && (len > 0)) {
+                    size_t avail = stream->available();
+                    if (avail) {
+                      if (avail > 512) avail = 512;
+                      int rd = stream->readBytes(dbuf, avail);
+                      f.write(dbuf, rd);
+                      len -= rd;
+                    }
+                    delay(1);
+                  }
+                  free(dbuf);
+                }
+                int fsize = (int)f.size();
+                f.close();
+                AddLog(LOG_LEVEL_INFO, PSTR("TCC: Downloaded %s (%d bytes)"), fpath, fsize);
+                // Load into selected slot
+                TinyCLoadFile(fpath, cmd_slot);
+                TinyCSaveSettings();
+              }
+            } else {
+              AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Download failed HTTP %d"), httpCode);
+            }
+            http.end();
+          }
+        }
+      }
+#endif
+    } else if (cmd == "delall") {
+#ifdef USE_UFILESYS
+      // Delete all .tcb files from both filesystems
+      int total = 0;
+      FS *fss[] = { ufsp, (ffsp && ffsp != ufsp) ? ffsp : nullptr };
+      for (int fi = 0; fi < 2; fi++) {
+        if (!fss[fi]) continue;
+        File dir = fss[fi]->open("/", "r");
+        if (!dir) continue;
+        char names[16][40];
+        int count = 0;
+        dir.rewindDirectory();
+        while (count < 16) {
+          File entry = dir.openNextFile();
+          if (!entry) break;
+          if (!entry.isDirectory()) {
+            char *ep = (char *)entry.name();
+            if (*ep == '/') ep++;
+            char *lcp = strrchr(ep, '/');
+            if (lcp) ep = lcp + 1;
+            uint16_t nlen = strlen(ep);
+            if (nlen > 4 && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
+              snprintf(names[count], sizeof(names[0]), "/%s", ep);
+              count++;
+            }
+          }
+          entry.close();
+        }
+        dir.close();
+        for (int i = 0; i < count; i++) {
+          fss[fi]->remove(names[i]);
+        }
+        total += count;
+      }
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Deleted %d .tcb files"), total);
+#endif
+    }
+  }
+
+  // Custom styles for this page
+  WSContentSend_P(PSTR(
+    "<style>"
+    // Fixed page width again: Tasmota's content wrapper is display:inline-block, so
+    // it sizes to its widest child — and the Repository/Load <select>s grow to fit
+    // the LONGEST .tcb filename, which made the console width drift as the repo list
+    // changed. Pin the wrapper width and let the dropdowns shrink instead of stretch.
+    "body>div{width:480px;max-width:96vw;box-sizing:border-box}"
+    "select{min-width:0}"
+    ".tc-run{color:#0a0}.tc-load{color:#fa0}.tc-empty{color:var(--c_txt);opacity:.5}"
+    ".tc-err{color:#f44}"
+    ".tc-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #333}"
+    ".tc-row:last-child{border-bottom:none}"
+    ".tc-info{flex:1;font-size:.9em}"
+    ".tc-btns{display:flex;gap:4px}"
+    ".tc-btns button{width:auto;padding:0 8px;font-size:.85em;line-height:1.8rem}"
+    ".tc-out{background:#1a1a1a;color:#0f0;padding:6px 8px;border-radius:.3em;"
+    "max-height:120px;overflow:auto;font-family:monospace;font-size:.85em;"
+    "white-space:pre-wrap;word-break:break-all;margin:4px 0}"
+    ".tc-upload input[type=file]{margin:8px 0}"
+    ".tc-ide-url{display:flex;gap:8px;align-items:center}"
+    ".tc-ide-url input{flex:1;padding:6px 8px}"
+    ".tc-ide-url button{width:auto;padding:0 16px}"
+    "</style>"));
+
+  // --- VM Status: compact view with all slots in one fieldset ---
+  if (Tinyc) {
+    WSContentSend_P(PSTR("<fieldset><legend><b> TinyC VM Slots </b></legend>"));
+    for (uint8_t si = 0; si < TC_MAX_VMS; si++) {
+      TcSlot *s = Tinyc->slots[si];
+      // Show slot if loaded OR has a config file (lazy-load pending)
+      if (!s && !Tinyc->slot_config[si].filename[0]) continue;
+
+      // Running = task active OR halted in callback mode (loaded + halted + no error)
+      bool active = s && (s->running || (s->loaded && s->vm.halted && s->vm.error == TC_OK));
+      const char *state, *sc;
+      if (active) { state = "Run"; sc = "tc-run"; }
+      else if (s && s->loaded) { state = "Rdy"; sc = "tc-load"; }
+      else { state = "---"; sc = "tc-empty"; }
+
+      // Determine filename: from loaded slot or from config
+      const char *fname = (s && s->filename[0]) ? s->filename : Tinyc->slot_config[si].filename;
+
+      // Compact row: [dot status] filename (size) | buttons
+      WSContentSend_P(PSTR(
+        "<div class='tc-row'>"
+        "<span class='%s'>&#x25cf;</span>"
+        "<span class='tc-info'><b>%d</b> %s %s (%dB)"),
+        sc, si, state,
+        fname,
+        s ? s->program_size : 0);
+
+      if (s && s->vm.error != 0) {
+        WSContentSend_P(PSTR(" <span class='tc-err'>%s</span>"), tc_error_str(s->vm.error));
+      }
+      WSContentSend_P(PSTR("</span>"));
+
+      // Inline buttons: grey out Run when active, Stop when not active
+      WSContentSend_P(PSTR(
+        "<form action='/tc' method='get' class='tc-btns'>"
+        "<input type='hidden' name='slot' value='%d'>"
+        "<button name='cmd' value='run' class='button' style='background:%s'>&#x25B6;</button>"
+        "<button name='cmd' value='stop' class='button' style='background:%s'>&#x25A0;</button>"
+        "<button name='cmd' value='reset' class='button'>&#x21BB;</button>"
+        "<button name='cmd' value='autoexec' class='button' style='background:%s' title='Auto-execute on boot'>A</button>"
+        "</form></div>"), si,
+        active ? "#555" : "#47c266",    // Run: grey when active, green when idle
+        active ? "#d43535" : "#555",     // Stop: red when active, grey when idle
+        Tinyc->slot_config[si].autoexec ? "#47c266" : "var(--c_btn)");
+
+      // Output log (compact)
+      if (s && s->output_len > 0) {
+        WSContentSend_P(PSTR("<div class='tc-out'>%s</div>"), s->output);
+      }
+    }
+    WSContentSend_P(PSTR("</fieldset>"));
+
+    // --- File selector with slot chooser ---
+#ifdef USE_UFILESYS
+    if (ufsp || ffsp) {
+      WSContentSend_P(PSTR(
+        "<fieldset><legend><b> Load Program </b></legend>"
+        "<p><form action='/tc' method='get'>"
+        "<div style='display:flex;gap:8px;align-items:center'>"
+        "<select name='file' style='flex:1'>"));
+      // Scan up to 2 filesystems: ufsp (SD/main) and ffsp (flash) if different
+      FS *fss[] = { ufsp, (ffsp && ffsp != ufsp) ? ffsp : nullptr };
+      const char *fslabel[] = { "", " [flash]" };
+      for (int fi = 0; fi < 2; fi++) {
+        if (!fss[fi]) continue;
+        File dir = fss[fi]->open("/", "r");
+        if (!dir) continue;
+        dir.rewindDirectory();
+        while (true) {
+          File entry = dir.openNextFile();
+          if (!entry) break;
+          if (entry.isDirectory()) { entry.close(); continue; }
+          char *ep = (char *)entry.name();
+          if (*ep == '/') ep++;
+          char *lcp = strrchr(ep, '/');
+          if (lcp) ep = lcp + 1;
+          uint16_t nlen = strlen(ep);
+          if (nlen > 4 && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
+            char fpath[40];
+            snprintf(fpath, sizeof(fpath), "/%s", ep);
+            WSContentSend_P(PSTR("<option value='%s'>%s (%d B)%s</option>"),
+              fpath, ep, entry.size(), fslabel[fi]);
+          }
+          entry.close();
+        }
+        dir.close();
+      }
+      WSContentSend_P(PSTR(
+        "</select>"
+        "<select name='slot' style='width:auto'>"));
+      for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+        WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
+      }
+      WSContentSend_P(PSTR(
+        "</select></div>"
+        "<br><div style='display:flex;gap:8px'>"
+        "<button name='cmd' value='load' class='button'>Load into Slot</button>"
+        "<button name='cmd' value='delall' class='button bred'"
+        " onclick=\"return confirm('Delete all .tcb files?')\">"
+        "Delete All .tcb</button>"
+        "</div></form></p></fieldset>"));
+
+      // --- Remote repository selector ---
+      // Read repo URL from /tinyc_repo.cfg, fall back to default repo.
+      //
+      // The HTTPS GET to fetch index.txt runs synchronously on the loop
+      // task — on weak WiFi (RSSI worse than ~-75 dBm) it has been
+      // observed to take 50+ seconds, starving Tasmota's main loop and
+      // crashing the device via the RTC watchdog. Two safeguards:
+      //
+      //   1. Cache the index across visits (TC_REPO_CACHE_MS, default
+      //      60 s). Re-rendering from cache is instant; only the first
+      //      visit per minute hits the network. Force a refresh by
+      //      adding ?refresh=1 to /tc.
+      //   2. Cap any single fetch at TC_REPO_FETCH_MS (default 2000 ms).
+      //      `setTimeout()` is interpreted differently across
+      //      Arduino-ESP32 versions (sometimes seconds, sometimes ms);
+      //      `setConnectTimeout()` is the unambiguous one. We set both,
+      //      narrow, so the worst-case loop-task block is bounded.
+      //
+      // Override at build time: -DTC_REPO_CACHE_MS=N -DTC_REPO_FETCH_MS=N
+      #ifndef TC_REPO_CACHE_MS
+      #define TC_REPO_CACHE_MS  60000
+      #endif
+      #ifndef TC_REPO_FETCH_MS
+      // 2026-05-07: bumped 2000 → 5000. The 2 s cap was too tight for github's
+      // TLS handshake from devices with moderate WiFi (RSSI ~-66 dBm) — fetch
+      // silently timed out, repo section vanished from /tc. 5 s is still well
+      // under the ESP32 task watchdog (which is 5 s by default but bumpable).
+      #define TC_REPO_FETCH_MS   5000
+      #endif
+      static String   tc_repo_index;        // last successful index.txt body
+      static uint32_t tc_repo_index_ms = 0; // millis() of last successful fetch
+      {
+        char repo_url[200] = {};
+        File rcfg = ufsp->open("/tinyc_repo.cfg", "r");
+        if (rcfg) {
+          int rl = rcfg.readBytesUntil('\n', repo_url, sizeof(repo_url) - 1);
+          rcfg.close();
+          while (rl > 0 && (repo_url[rl-1] == '\r' || repo_url[rl-1] == ' ')) { repo_url[--rl] = 0; }
+        }
+        if (!repo_url[0]) {
+          strlcpy(repo_url, TINYC_DEFAULT_REPO, sizeof(repo_url));
+        }
+        if (repo_url[0]) {
+          bool cache_fresh = tc_repo_index.length() > 0 &&
+                             (millis() - tc_repo_index_ms) < TC_REPO_CACHE_MS;
+          bool force_refresh = Webserver->hasArg(F("refresh"));
+          if (!cache_fresh || force_refresh) {
+            // Fetch index.txt from repo (bounded by TC_REPO_FETCH_MS)
+            String idx_url = String(repo_url);
+            if (!idx_url.endsWith("/")) idx_url += "/";
+            idx_url += "index.txt";
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+            HTTPClientLight http;
+#else
+            WiFiClient http_client;
+            HTTPClient http;
+#endif
+#ifdef ESP32
+            // ESP32 HTTPClient + HTTPClientLight both expose setConnectTimeout
+            // (bounds the TCP connect + TLS handshake phase). ESP8266's
+            // ESP8266HTTPClient class doesn't have it, so we rely on
+            // setTimeout alone there — sufficient since ESP8266 builds
+            // generally use plain HTTP (no TLS handshake to bound).
+            http.setConnectTimeout(TC_REPO_FETCH_MS);
+#endif
+            http.setTimeout(TC_REPO_FETCH_MS);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+            bool begun = http.begin(idx_url);
+#else
+            bool begun = http.begin(http_client, idx_url);
+#endif
+            uint32_t fetch_t0 = millis();
+            int httpCode = -1;
+            int body_len = 0;
+            if (begun) {
+              httpCode = http.GET();
+              if (httpCode == HTTP_CODE_OK) {
+                String body = http.getString();
+                body_len = body.length();
+                if (body_len > 0) {
+                  tc_repo_index    = body;
+                  tc_repo_index_ms = millis();
+                }
+              }
+              http.end();
+            }
+            uint32_t fetch_dt = millis() - fetch_t0;
+            // Log whenever the fetch fails OR took longer than the cap +
+            // some slack — so silent "Repository section disappeared from
+            // /tc" cases are diagnosable from the serial log.
+            if (!begun) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch — http.begin() failed for %s"),
+                idx_url.c_str());
+            } else if (httpCode != HTTP_CODE_OK) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch — HTTP %d after %u ms (cap %u, %s)"),
+                httpCode, (unsigned)fetch_dt, (unsigned)TC_REPO_FETCH_MS,
+                (httpCode < 0) ? "timeout/conn err" : "non-200");
+            } else if (body_len == 0) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch — empty body after %u ms"),
+                (unsigned)fetch_dt);
+            } else if (fetch_dt > TC_REPO_FETCH_MS + 500) {
+              AddLog(LOG_LEVEL_INFO,
+                PSTR("TCC: repo index.txt fetch took %u ms (cap %u) — slow link?"),
+                (unsigned)fetch_dt, (unsigned)TC_REPO_FETCH_MS);
+            }
+          }
+          // Render from cache (whether just-fetched or older). If empty
+          // (first-ever visit failed), the section is silently omitted —
+          // a subsequent visit will retry and populate it.
+          if (tc_repo_index.length() > 0) {
+            WSContentSend_P(PSTR(
+              "<fieldset><legend><b> Repository </b></legend>"
+              "<p><form action='/tc' method='get'>"
+              "<div style='display:flex;gap:8px;align-items:center'>"
+              "<select name='rfile' style='flex:1'>"));
+            // Parse index.txt: one filename per line
+            int pos = 0;
+            while (pos < (int)tc_repo_index.length()) {
+              int nl = tc_repo_index.indexOf('\n', pos);
+              if (nl < 0) nl = tc_repo_index.length();
+              String line = tc_repo_index.substring(pos, nl);
+              line.trim();
+              if (line.length() > 0 && line.endsWith(".tcb")) {
+                WSContentSend_P(PSTR("<option value='%s'>%s</option>"),
+                  line.c_str(), line.c_str());
+              }
+              pos = nl + 1;
+            }
+            WSContentSend_P(PSTR(
+              "</select>"
+              "<select name='slot' style='width:auto'>"));
+            for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+              WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
+            }
+            // Include a "Refresh" button so the user can force a fresh
+            // GET when they've added a new .tcb to the repo.
+            uint32_t age_s = (millis() - tc_repo_index_ms) / 1000;
+            WSContentSend_P(PSTR(
+              "</select></div>"
+              "<br><button name='cmd' value='download' class='button bgrn'>"
+              "Download &amp; Load</button>"
+              " <a href='/tc?refresh=1' class='button' style='background:#888;padding:4px 10px'>"
+              "&#x21bb; Refresh list (cached %us)</a>"
+              "</form></p></fieldset>"), (unsigned)age_s);
+          }
+        }
+      }
+    }
+#endif
+
+  } else {
+    WSContentSend_P(PSTR("<fieldset><legend><b> TinyC VM </b></legend>"
+      "<p style='text-align:center;opacity:.6'>TinyC not initialized</p>"
+      "</fieldset>"));
+  }
+
+  // --- Upload Section (with slot selector via JS to set form action) ---
+  WSContentSend_P(PSTR(
+    "<fieldset><legend><b> Upload Program </b></legend>"
+    "<form class='tc-upload' method='POST' action='/tc_upload' enctype='multipart/form-data'"
+    " onsubmit=\"this.action='/tc_upload?slot='+this.querySelector('[name=uslot]').value\">"
+    "<div style='display:flex;gap:8px;align-items:center'>"
+    "<input type='file' name='tcb' accept='.tcb' style='flex:1'>"
+    "<select name='uslot' style='width:auto'>"));
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
+  }
+  WSContentSend_P(PSTR(
+    "</select></div>"
+    "<button type='submit' class='button bgrn'>Upload .tcb</button>"
+    "</form></fieldset>"));
+
+  // --- IDE Section ---
+  WSContentSend_P(PSTR("<fieldset><legend><b> TinyC IDE </b></legend>"));
+#if defined(USE_TINYC_IDE) && defined(USE_UFILESYS)
+  // Open the IDE via the current-port `/ide` URL and let the server
+  // decide whether to redirect to the port-82 background download
+  // task. This works in both common scenarios:
+  //
+  //   * Real ESP32 on a normal LAN — `Tinyc->dl_server` is up,
+  //     `/ide` issues a 302 to `:82/ide`, the IDE loads via the
+  //     dedicated FreeRTOS task and the main HTTP loop stays free
+  //     for other work (the original benefit of the port-82 split).
+  //   * VBox / firewalled / port-blocked setups — `/ide` falls
+  //     through to a synchronous serve from port 80 (slower under
+  //     contention, but functional everywhere).
+  //
+  // The previous version hardcoded `:82/ide` in the button JS, which
+  // produced an unreachable URL on networks where port 82 isn't
+  // exposed (Andreas's VBox setup at 192.168.56.107).
+  WSContentSend_P(PSTR(
+    "<p style='text-align:center'>"
+    "<button onclick=\"window.open('/ide','tinyc_ide')\" "
+    "class='button bgrn'>Open IDE</button> "
+    "<button id='tcide_upd' onclick=\""
+    "if(!confirm('Update the IDE from the repository? (downloads tinyc_ide.html.gz, ~190 KB, and replaces the served IDE)'))return;"
+    "var b=this;b.disabled=1;b.textContent='Updating...';"
+    "fetch('/cm?cmnd=TinyCIde').then(r=>r.json()).then(j=>{var d=j.TinyCIde||{};"
+    "if(d.updated){b.textContent='Updated '+d.updated+' B';alert('IDE updated ('+d.updated+' bytes). Re-open the IDE.');}"
+    "else{b.disabled=0;b.textContent='Update IDE';alert('IDE update failed (error '+d.error+'). The old IDE was kept.');}})"
+    ".catch(e=>{b.disabled=0;b.textContent='Update IDE';alert('IDE update request failed.');});\" "
+    "class='button'>Update IDE</button>"
+    "</p>"
+    "<p style='text-align:center;font-size:.85em;opacity:.6'>Served from device filesystem (port 82 background task on real hw, port 80 fallback otherwise). \"Update IDE\" fetches the latest from the repo &mdash; no file manager needed.</p>"));
+#else
+  WSContentSend_P(PSTR(
+    "<div class='tc-ide-url'>"
+    "<input id='ide_url' value='http://localhost:8080' placeholder='IDE URL'>"
+    "<button onclick=\"var u=document.getElementById('ide_url').value;"
+    "window.open(u+'?device='+location.hostname,'tinyc_ide')\" class='button bgrn'>Open</button>"
+    "</div>"
+    "<p style='text-align:center;font-size:.85em;opacity:.6'>IDE URL saved in browser</p>"
+    "<script>var u=localStorage.getItem('tinyc_ide_url');"
+    "if(u)document.getElementById('ide_url').value=u;"
+    "document.getElementById('ide_url').onchange=function(){"
+    "localStorage.setItem('tinyc_ide_url',this.value)};</script>"));
+#endif
+  WSContentSend_P(PSTR("</fieldset>"));
+
+  // Listen for IDE "run on device" notifications to auto-refresh
+  WSContentSend_P(PSTR(
+    "<script>if(window.BroadcastChannel){"
+    "var _tc=new BroadcastChannel('tinyc');"
+    "_tc.onmessage=function(e){if(e.data=='refresh')location.reload();}}"
+    "</script>"));
+
+#ifdef USE_DISPLAY
+  bool tc_show_mirror = renderer && (((uintptr_t)renderer->framebuffer >= 0x3C000000) || ((uintptr_t)renderer->rgb_fb >= 0x3C000000));
+#ifdef USE_TINYC_LVGL
+  if (renderer && tc_lvgl_active()) { tc_show_mirror = true; }   // LVGL mirrors via on-demand snapshot (no panel framebuffer)
+#endif
+  if (tc_show_mirror) {
+    WSContentSend_P(PSTR(
+      "<fieldset><legend><b> Display </b></legend>"
+      "<p style='text-align:center'>"
+      "<button onclick=\"window.open('/tc_display','tinyc_display')\" class='button bgrn'>Display Mirror</button>"
+      "</p></fieldset>"));
+  }
+#endif
+
+  // Auto-refresh: re-fetch the page whenever the browser tab regains
+  // visibility (typical flow: user runs/stops a slot via the IDE tab,
+  // switches back to this tab — without this, slot state stayed stale
+  // until manual reload). Doesn't poll while the tab is hidden, so no
+  // background traffic.
+  WSContentSend_P(PSTR(
+    "<script>"
+    "document.addEventListener('visibilitychange',function(){"
+      "if(!document.hidden)location.reload();"
+    "});"
+    "</script>"));
+
+  WSContentSpaceButton(BUTTON_MANAGEMENT);
+  WSContentEnd();
+}
+
+static void HandleTinyCUploadDone(void) {
+  if (!HttpCheckPriviledgedAccess()) { return; }
+
+  uint8_t slot_num = Tinyc ? Tinyc->upload_slot : 0;
+  TcSlot *s = (Tinyc && slot_num < TC_MAX_VMS) ? Tinyc->slots[slot_num] : nullptr;
+
+  // Check if this is an API call (from browser IDE) via ?api=1 query parameter
+  bool is_api = Webserver->hasArg(F("api"));
+
+  if (is_api) {
+    // JSON response with CORS headers for browser IDE.
+    // IMPORTANT: `s->loaded` can be STALE from a previous successful upload —
+    // if THIS upload failed (malloc, bad slot, oversize, load error) the slot
+    // still has the previous program loaded. Trust `Web.upload_error` as the
+    // authoritative signal for this request.
+    TCSendCORS("POST, OPTIONS");
+    if (Web.upload_error || !s || !s->loaded) {
+      WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"upload failed\"}"));
+      return;
+    }
+    char json[160];
+    snprintf_P(json, sizeof(json), PSTR("{\"ok\":true,\"size\":%d,\"file\":\"%s\",\"slot\":%d}"),
+      s->program_size,
+      s->filename[0] ? s->filename : "",
+      slot_num);
+    WSSendJSON(200, json);
+    return;
+  }
+
+  // Regular HTML response for form-based upload from /tc page.
+  // Same rule as the JSON branch: Web.upload_error is authoritative — the
+  // slot's own `loaded` flag may reflect the previously-loaded program.
+  WSContentStart_P(PSTR("TinyC Upload"));
+  WSContentSendStyle();
+
+  if (!Web.upload_error && s && s->loaded) {
+    WSContentSend_P(PSTR(
+      "<fieldset><legend><b> Upload Result </b></legend>"
+      "<p style='text-align:center;color:#0a0'><b>&#x2714; Upload successful!</b></p>"
+      "<p style='text-align:center'>%s — %d bytes (slot %d)</p>"
+      "</fieldset>"),
+      s->filename[0] ? s->filename : "program",
+      s->program_size, slot_num);
+  } else {
+    WSContentSend_P(PSTR(
+      "<fieldset><legend><b> Upload Result </b></legend>"
+      "<p style='text-align:center;color:#f44'><b>&#x2718; Upload failed</b></p>"
+      "</fieldset>"));
+  }
+  WSContentSend_P(HTTP_FORM_BUTTON, PSTR("tc"), PSTR("Back to TinyC"));
+
+  WSContentSpaceButton(BUTTON_MAIN);
+  WSContentEnd();
+}
+
+// Handle CORS preflight for browser IDE uploads
+static void HandleTinyCUploadCORS(void) {
+  TCSendCORS("POST, OPTIONS");
+  Webserver->send(204);
+}
+
+// ── Flash-FS write coordination (xdrv_50 /ufsu file-manager uploads) ──────────
+// A large internal-flash write (LittleFS) repeatedly disables the SPI flash
+// cache for each erase/program. On a dual-core node, while a TinyC VM task
+// exists the write DEADLOCKS the device (no watchdog recovery) — reproduced and
+// serial-traced by uploading the ~183 KB IDE to a Matter-bridge TaskLoop node.
+// (Suppressing main-loop callbacks via tc_global_pause alone is NOT enough —
+// tc_vm_task keeps stepping; and merely pausing / vTaskSuspend()ing it is also
+// NOT enough — the task still wedges the write. Verified the hard way.)
+//
+// TinyCFsWritePause() fully STOPS each running VM task (off the scheduler, like
+// TinyCStop) for the duration of the write — the only thing that lets it through
+// (~3 s vs a hard hang). Resume RESTARTS them: main() re-runs, which for the
+// bridge re-runs matterReset()+rebuild — identical to a normal boot, so the
+// Matter fabric (persisted on UFS) and commissioning survive.
+// Non-static so xdrv_50 can call them through a forward `extern` declaration.
+#ifndef TC_FS_BIG_WRITE
+#define TC_FS_BIG_WRITE 16384        // bytes: only /ufsu uploads >= this stop the VM.
+                                     // Small writes touch a few flash blocks and never
+                                     // deadlock, so they skip the bridge-disrupting
+                                     // stop/restart. Override with -DTC_FS_BIG_WRITE=N.
+#endif
+#ifndef TC_FS_STOP_MINBLK
+#define TC_FS_STOP_MINBLK (24 * 1024) // (D) Heap-health gate: only STOP the VM slots
+                                     // for a big write when the heap is actually at
+                                     // risk. On a device with PSRAM (big allocs/TLS go
+                                     // to PSRAM, not the internal largest block) AND an
+                                     // internal largest-free block >= this, the write
+                                     // runs fine with the slots LIVE — and stopping them
+                                     // would risk an UNRECOVERABLE restart (post-write
+                                     // fragmentation < 16 KB-contiguous stack). So skip
+                                     // the stop there; keep it for heap-tight C3/.104 +
+                                     // a tight S3 bridge. Override -DTC_FS_STOP_MINBLK=N.
+#endif
+void TinyCFsWritePause(uint32_t fsize) {
+  // Size-gate: skip the VM stop for small writes (the common case — config /
+  // small .tc / data files). fsize==0 means the client didn't declare a size
+  // (?fsz=) so assume it could be large and protect.
+  if (fsize > 0 && fsize < TC_FS_BIG_WRITE) return;
+  tc_global_pause = true;             // also gates main-loop callbacks (see Xdrv124)
+  if (!Tinyc) return;
+#ifdef ESP32
+  // STOP (delete) each running VM task for the duration of the flash write.
+  // Verified the hard way on a dual-core S3 Matter bridge: cooperatively
+  // pausing or vTaskSuspend()ing the VM task is NOT enough — a large internal-
+  // flash (LittleFS) write still wedges while the task merely exists. Only
+  // FULLY removing it from the scheduler (exactly what TinyCStop does, which
+  // let the same 183 KB upload through in ~3 s) reliably works. main() is
+  // re-run on resume; the bridge's main() starts with matterReset() and
+  // rebuilds its endpoints (identical to a normal boot — the Matter fabric
+  // persists on UFS), so no commissioning is lost.
+  // Stop EVERY loaded slot — NOT just those whose TaskLoop task is running.
+  // A main()-only slot that spawned a worker (spawnTask, e.g. an httpGet poller
+  // like ShellyPoll/StromTask) has task_running==false, yet its worker FreeRTOS
+  // task is alive and keeps allocating. On a heap already fragmented by the
+  // loaded VMs, that worker firing an httpGet/TLS alloc (~tens of KB) mid-write
+  // collapses the largest free block — Andreas's .104 trace: START maxblk=51100
+  // → after +2 KB write Heap=20 KB, LoadAvg=999, WiFi drop, hard hang (needs a
+  // power reset). TinyCStopVM() reaps the slot's spawnTask workers
+  // (tc_spawn_task_cleanup_slot) AND stops the VM task; TinyCStartVM() on resume
+  // re-runs main(), which re-spawns the workers — so none is lost.
+  //
+  // (D) HEAP-HEALTH GATE (Andreas KRITISCH 2026-06-02): on a heap-HEALTHY device
+  // this stop is both unnecessary and dangerous. Unnecessary: with PSRAM the
+  // write's + workers' big allocs draw from PSRAM, so the internal heap doesn't
+  // collapse and the write goes through with the slots live. Dangerous: after
+  // the write the internal heap is fragmented, and TinyCStartVM()'s xTaskCreate
+  // needs 16 KB CONTIGUOUS (TC_VM_TASK_STACK) — which may no longer exist, so the
+  // restart fails and the slots (display/controls) stay dead until a reboot. So
+  // only stop when the heap is actually at risk; otherwise keep every slot live.
+  uint32_t maxblk = ESP_getMaxAllocHeap();
+  bool heap_healthy = UsePSRAM() && (maxblk >= TC_FS_STOP_MINBLK);
+  if (heap_healthy) {
+    AddLog(LOG_LEVEL_DEBUG,
+           PSTR("TC: ufsu big-write — heap healthy (PSRAM, maxblk %u) — keeping slots live"),
+           (unsigned)maxblk);
+  } else {
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (s && s->loaded) {
+        s->fs_was_running = true;
+        TinyCStopVM(s);               // reaps spawn workers + stops the VM task
+      }
+    }
+  }
+#endif
+}
+
+void TinyCFsWriteResume(void) {
+  tc_global_pause = false;
+#ifdef ESP32
+  if (Tinyc) {
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (s && s->fs_was_running) {
+        s->fs_was_running = false;
+        if (!TinyCStartVM(s)) {       // re-runs main() (re-runs matterReset()+rebuild for the bridge)
+          // (B) restart FAILED — almost always post-write heap fragmentation
+          // (no 16 KB-contiguous block for the task stack). Do NOT leave the slot
+          // silently dead (the old bug): flag it for a main-loop retry that keeps
+          // trying until the heap defragments enough — deterministic recovery,
+          // no forced reboot.
+          s->fs_restart_pending = true;
+          AddLog(LOG_LEVEL_INFO,
+                 PSTR("TC: slot %d restart after write FAILED (maxblk %u) — deferring, will retry"),
+                 i, (unsigned)ESP_getMaxAllocHeap());
+        }
+      }
+    }
+  }
+#endif
+}
+
+// (B) Main-loop retry for slots whose post-write restart failed (fs_restart_pending).
+// Called once per second from FUNC_EVERY_SECOND. As the write's transient buffers
+// free and the heap defragments, TinyCStartVM() eventually finds its 16 KB-contiguous
+// stack and the slot comes back — without a forced reboot. A no-op when nothing pends.
+void TinyCFsRestartRetry(void) {
+#ifdef ESP32
+  if (!Tinyc) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (s && s->fs_restart_pending) {
+      if (TinyCStartVM(s)) {
+        s->fs_restart_pending = false;
+        AddLog(LOG_LEVEL_INFO, PSTR("TC: slot %d restarted after write (heap recovered, maxblk %u)"),
+               i, (unsigned)ESP_getMaxAllocHeap());
+      }
+      // else: keep the flag and retry next second
+    }
+  }
+#endif
+}
+
+// (Andreas .107, 2026-06-04) Keep a loaded slot's registered command prefix
+// alive even when it was lost WITHOUT a full main() re-run. cmd_prefix is set
+// only by main()'s addCommand() (vm.h SYS_ADD_COMMAND) and cleared only by
+// TinyCStopVM teardown — so any worker stop+resume whose main() doesn't reach
+// addCommand() again (heap-tight boot, or the SD->Flash-sync worker-stop), or a
+// stray write clobbering the field, leaves the slot Running:1 while every BAT*/
+// command silently falls through to {"Command":"Unknown"}, recoverable until now
+// only by a full slot-restart (a reboot does NOT fix it). cmd_prefix_saved is the
+// sticky copy, cleared only on a deliberate stop/reset/program-replace; if a
+// loaded slot has the sticky copy but an empty live prefix, restore it so the
+// command/HTML interface keeps working. A no-op in the normal case (one strlcpy
+// guard per loaded slot per second). Skipped during an FS-write quiesce.
+void TinyCPrefixReheal(void) {
+  if (!Tinyc || tc_global_pause) return;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+
+    // (1) LEARN: mirror a freshly-registered prefix into the DURABLE /tinyc.cfg
+    //     copy so the expected prefix is known even on a future heap-tight boot
+    //     where main() never re-reaches addCommand(). Flushed once below.
+    if (s->cmd_prefix_saved[0] &&
+        strcmp(Tinyc->slot_config[i].cmd_prefix, s->cmd_prefix_saved) != 0) {
+      // DUAL-CLAIM GUARD (Andreas .142, 2026-06-07): refuse to persist a prefix
+      // that ANOTHER slot already owns in /tinyc.cfg. A stray cross-slot write
+      // (seen once via the IDE upload/autoexec path) can land slot X's freshly-
+      // registered prefix in slot Y's cmd_prefix_saved; without this guard the
+      // LEARN below would mirror it into slot_config[Y] and flush, leaving TWO
+      // slots claiming one prefix — dispatch then returns {"TinyC":"UNKNOWN"}
+      // (registered but undeliverable). Keep slot i's existing durable value and
+      // log the conflict instead (once per occurrence; the upstream stray write
+      // is task #151 / the deeper tc_current_slot audit).
+      bool dup = false;
+      for (uint8_t j = 0; j < TC_MAX_VMS; j++) {
+        if (j != i && Tinyc->slot_config[j].cmd_prefix[0] &&
+            strcmp(Tinyc->slot_config[j].cmd_prefix, s->cmd_prefix_saved) == 0) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        if (!(tc_prefix_dupwarn & (1u << i))) {
+          tc_prefix_dupwarn |= (1u << i);
+          AddLog(LOG_LEVEL_INFO,
+                 PSTR("TCC: prefix \"%s\" already owned by another slot — NOT persisting for slot %d (dual-claim guard; keeping \"%s\")"),
+                 s->cmd_prefix_saved, i, Tinyc->slot_config[i].cmd_prefix);
+        }
+      } else {
+        tc_prefix_dupwarn &= ~(1u << i);
+        strlcpy(Tinyc->slot_config[i].cmd_prefix, s->cmd_prefix_saved,
+                sizeof(Tinyc->slot_config[i].cmd_prefix));
+        tc_cfg_prefix_dirty = true;
+      }
+    } else {
+      tc_prefix_dupwarn &= ~(1u << i);   // no pending mismatch → re-arm the warn
+    }
+
+    // (2) HEAL: a RUNNING slot whose live prefix went empty. Restore from the
+    //     sticky RAM copy (prefix was set then lost — path A / B(i)), OR from the
+    //     durable config when this boot's main() never reached addCommand() so
+    //     cmd_prefix_saved is empty (path B(ii) — Andreas .107 heap-tight reboot).
+    //     The `running` gate re-arms only an executing VM (state initialised) —
+    //     never a deliberately-stopped slot whose durable prefix still lingers.
+    if (s->running && !s->cmd_prefix[0]) {
+      bool from_ram = (s->cmd_prefix_saved[0] != 0);
+      const char *want = from_ram ? s->cmd_prefix_saved : Tinyc->slot_config[i].cmd_prefix;
+      if (want[0]) {
+        strlcpy(s->cmd_prefix, want, sizeof(s->cmd_prefix));
+        if (!from_ram) strlcpy(s->cmd_prefix_saved, want, sizeof(s->cmd_prefix_saved));
+        AddLog(LOG_LEVEL_INFO,
+               PSTR("TCC: re-registered command prefix \"%s\" (slot %d) — %s"),
+               s->cmd_prefix, i,
+               from_ram ? "was lost without a main() re-run"
+                        : "main() never reached addCommand() (restored from persisted config)");
+      }
+    }
+  }
+  // Flush the durable prefix change once, on the main task (never the VM task).
+  if (tc_cfg_prefix_dirty) { tc_cfg_prefix_dirty = false; TinyCSaveSettings(); }
+}
+
+#ifdef USE_UFILESYS
+// Fetch the TinyC IDE (tinyc_ide.html.gz) from `url` and replace the on-FS
+// /tinyc_ide.html.gz that the /ide handler serves — lets the IDE be self-updated
+// from the console (TinyCIde) without the Tasmota file-manager upload page.
+// Safety: stream to a .tmp first, validate the gzip magic + the persisted on-disk
+// size (not just the byte counter — an SD/FAT backend can short-write), and only
+// then rename over the live IDE (a failed/short fetch must NOT brick the served
+// IDE). The ~150-190 KB LittleFS/SD write is bracketed by TinyCFsWritePause
+// (stops VM tasks so none touch flash during the cache-disabled close) + a
+// loop-WDT hold, mirroring the /ufsu big-write path. Returns bytes (>0) or <0.
+static int tc_fetch_ide(const char *url) {
+  if (!ufsp || !url || !url[0]) return -1;
+  const char *dst = "/tinyc_ide.html.gz";
+  const char *tmp = "/tinyc_ide.html.gz.tmp";
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+  HTTPClientLight http;
+#else
+  WiFiClient http_client;
+  HTTPClient http;
+#endif
+  http.setTimeout(15000);
+#if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
+  bool begun = http.begin(url);
+#else
+  bool begun = http.begin(http_client, url);
+#endif
+  if (!begun) { AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch begin() failed")); return -2; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK && code != HTTP_CODE_MOVED_PERMANENTLY) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch HTTP %d"), code);
+    http.end(); return -3;
+  }
+  TinyCFsWritePause(0x40000);                       // big write: quiesce VM tasks
+  File f = ufsp->open(tmp, "w");
+  int written = 0; bool magic = false; bool write_err = false;
+  if (f) {
+    WiFiClient *stream = http.getStreamPtr();
+    int32_t len = http.getSize();
+    bool unknown = (len < 0);
+    if (unknown) len = 0x7fffffff;
+    uint8_t *buf = (uint8_t *)malloc(1024);
+    if (buf) {
+      uint32_t t0 = millis();
+      bool first = true;
+      while (http.connected() && len > 0 && (millis() - t0) < 30000) {
+        size_t avail = stream->available();
+        if (avail) {
+          if (avail > 1024) avail = 1024;
+          int rd = stream->readBytes(buf, avail);
+          if (rd <= 0) break;
+          if (first) { magic = (rd >= 2 && buf[0] == 0x1f && buf[1] == 0x8b); first = false; }
+          // Write the full chunk. An SD/FAT backend can short-write a big file, so
+          // retry the remainder; if the backend stalls (write returns 0) bail —
+          // a partial write must NOT silently truncate the .tmp (Andreas: brick).
+          int off = 0;
+          while (off < rd) {
+            size_t wr = f.write(buf + off, rd - off);
+            if (wr == 0) { write_err = true; break; }
+            off += (int)wr;
+          }
+          if (write_err) break;
+          written += rd;
+          if (!unknown) len -= rd;
+        } else {
+          delay(1);                                 // yield to WiFi/other tasks
+        }
+      }
+      free(buf);
+    }
+#ifdef ESP32
+    disableLoopWDT();                               // the cache-disabled close() can run multi-second
+#endif
+    f.close();
+#ifdef ESP32
+    feedLoopWDT(); enableLoopWDT();
+#endif
+  }
+  http.end();
+  TinyCFsWriteResume();
+  if (written < 1000 || !magic) {                   // reject garbage/short downloads — keep the old IDE
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch rejected (%d B, gzip=%d) — kept old"), written, magic);
+    ufsp->remove(tmp);
+    return -5;
+  }
+  // `written` counts what was DOWNLOADED, not what the FS actually persisted — an
+  // SD/FAT backend can short-write a big file (return < requested, or even a wrong
+  // count). Reopen the .tmp and require the on-disk size to match before renaming
+  // over the live IDE; a truncated-but-gzip-magic file would otherwise pass the
+  // check above and brick the served IDE (Andreas, S3-ETH SD/FAT, cut at 12-37 KB).
+  uint32_t on_disk = 0;
+  { File vf = ufsp->open(tmp, "r"); if (vf) { on_disk = (uint32_t)vf.size(); vf.close(); } }
+  if (write_err || on_disk != (uint32_t)written) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE write incomplete (%u/%d B on disk%s) — kept old"),
+           on_disk, written, write_err ? ", short-write" : "");
+    ufsp->remove(tmp);
+    return -7;
+  }
+  // Atomically replace the live IDE. Try a direct rename first — LittleFS
+  // overwrites atomically, so there is no window where the served IDE is
+  // missing. Only if that fails (e.g. a FAT/SD backend that can't rename over
+  // an existing file) fall back to remove + retry.
+  if (!ufsp->rename(tmp, dst)) {
+    ufsp->remove(dst);
+    if (!ufsp->rename(tmp, dst)) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE rename failed"));
+      ufsp->remove(tmp);
+      return -6;
+    }
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE updated %d bytes from %s"), written, url);
+  return written;
+}
+#endif // USE_UFILESYS
+
+// TinyCIde [url] — download tinyc_ide.html.gz from the repo (or a given URL) and
+// replace the served IDE on the filesystem. No Tasmota file-manager needed.
+//   TinyCIde            -> default repo (TINYC_DEFAULT_IDE_URL)
+//   TinyCIde <full-url> -> a specific URL (e.g. a self-hosted / branch build)
+void CmndTinyCIde(void) {
+#ifdef USE_UFILESYS
+  char url[200];
+  if (XdrvMailbox.data_len > 0 && XdrvMailbox.data[0]) {
+    strlcpy(url, XdrvMailbox.data, sizeof(url));
+  } else {
+    strlcpy(url, TINYC_DEFAULT_IDE_URL, sizeof(url));
+  }
+  int n = tc_fetch_ide(url);
+  if (n > 0) { Response_P(PSTR("{\"TinyCIde\":{\"updated\":%d}}"), n); }
+  else       { Response_P(PSTR("{\"TinyCIde\":{\"error\":%d}}"), n); }
+#else
+  ResponseCmndChar_P(PSTR("no filesystem"));
+#endif
+}
+
+static void HandleTinyCUpload(void) {
+  if (!Tinyc) return;
+
+  HTTPUpload& upload = Webserver->upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    // Determine target slot from ?slot=N parameter (default 0)
+    Tinyc->upload_slot = 0;
+    if (Webserver->hasArg(F("slot"))) {
+      uint8_t rs = Webserver->arg(F("slot")).toInt();
+      if (rs < TC_MAX_VMS) Tinyc->upload_slot = rs;
+    }
+    uint8_t slot_num = Tinyc->upload_slot;
+
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload start: %s (slot %d)"), upload.filename.c_str(), slot_num);
+
+    // Capture uploaded filename (prepend / for filesystem path)
+    snprintf(Tinyc->upload_filename, sizeof(Tinyc->upload_filename), "/%s", upload.filename.c_str());
+
+    // Allocate slot if needed
+    if (!Tinyc->slots[slot_num]) {
+      Tinyc->slots[slot_num] = tc_slot_alloc();
+      if (!Tinyc->slots[slot_num]) {
+        Web.upload_error = 1;
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Slot %d alloc failed"), slot_num);
+        return;
+      }
+    }
+    TcSlot *s = Tinyc->slots[slot_num];
+
+    // Stop any running program in this slot
+    TinyCStopVM(s);
+    s->cmd_prefix_saved[0] = '\0';   // a new .tcb is being uploaded — drop the old
+                                     // program's sticky prefix (new main() re-registers).
+    TinyCClearDurablePrefix(slot_num);  // and the persisted copy — new program may differ
+    // Allocate upload buffer.
+    //
+    // Sizing: the HTTP client may send `?fsz=N` (matches the `/ufsu` upload
+    // convention used by push_tcb.sh) — if present we allocate exactly that
+    // (clamped to TC_MAX_PROGRAM). Without the hint we fall back to the full
+    // TC_MAX_PROGRAM. This avoids the failure mode where a 3 KB .tcb upload
+    // fails because the device's heap is too fragmented to provide a single
+    // contiguous 64 KB block.
+    //
+    // Allocation strategy: PSRAM first on ESP32 (avoids fragmented internal
+    // heap on long-running devices with serial scripts etc.), then internal.
+    if (Tinyc->upload_buf) { free(Tinyc->upload_buf); Tinyc->upload_buf = nullptr; }
+    size_t alloc_size = TC_MAX_PROGRAM;
+    if (Webserver->hasArg(F("fsz"))) {
+      long fsz = Webserver->arg(F("fsz")).toInt();
+      if (fsz > 0) {
+        // Add a small headroom (16 B) so an off-by-one in the client's fsz
+        // doesn't immediately trip the "too large" branch in UPLOAD_FILE_WRITE.
+        size_t hint = (size_t)fsz + 16;
+        if (hint < alloc_size) alloc_size = hint;
+      }
+    }
+    Tinyc->upload_alloc_size = alloc_size;
+#ifdef ESP32
+    Tinyc->upload_buf = (uint8_t *)heap_caps_malloc(alloc_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!Tinyc->upload_buf) {
+      Tinyc->upload_buf = (uint8_t *)malloc(alloc_size);
+    }
+#else
+    Tinyc->upload_buf = (uint8_t *)malloc(alloc_size);
+#endif
+    if (!Tinyc->upload_buf) {
+      Web.upload_error = 1;
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Upload malloc(%u) failed — free heap=%u largest block=%u"),
+        (unsigned)alloc_size,
+        (unsigned)ESP_getFreeHeap(),
+#ifdef ESP32
+        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)
+#else
+        (unsigned)ESP.getMaxFreeBlockSize()
+#endif
+      );
+      return;
+    }
+    Tinyc->upload_received = 0;
+    Tinyc->upload_active = true;
+  }
+  else if (upload.status == UPLOAD_FILE_WRITE) {
+    // If a prior phase (malloc fail, slot fail) already marked this upload
+    // invalid, silently discard further chunks — don't re-log per chunk
+    // with a misleading "too large" message.
+    if (Web.upload_error || !Tinyc->upload_buf) {
+      return;
+    }
+    // Bound against the actual allocation size, which may be smaller than
+    // TC_MAX_PROGRAM when the client sent ?fsz=N.
+    size_t cap = Tinyc->upload_alloc_size ? Tinyc->upload_alloc_size : TC_MAX_PROGRAM;
+    if (Tinyc->upload_received + upload.currentSize <= cap) {
+      memcpy(Tinyc->upload_buf + Tinyc->upload_received, upload.buf, upload.currentSize);
+      Tinyc->upload_received += upload.currentSize;
+    } else {
+      Web.upload_error = 1;
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Upload too large (received %u + chunk %u > cap %u)"),
+        (unsigned)Tinyc->upload_received, (unsigned)upload.currentSize, (unsigned)cap);
+    }
+  }
+  else if (upload.status == UPLOAD_FILE_END) {
+    uint8_t slot_num = Tinyc->upload_slot;
+    TcSlot *s = (slot_num < TC_MAX_VMS) ? Tinyc->slots[slot_num] : nullptr;
+
+    if (s && Tinyc->upload_buf && Tinyc->upload_received > 0 && !Web.upload_error) {
+      // Free old program in this slot
+      if (s->program) { free(s->program); }
+
+      // Use upload buffer as program
+      s->program = Tinyc->upload_buf;
+      s->program_size = Tinyc->upload_received;
+      Tinyc->upload_buf = nullptr;
+
+      // Try to load
+      int err = tc_vm_load(&s->vm, s->program, s->program_size);
+      if (err == TC_OK) {
+        s->loaded = true;
+        strlcpy(s->filename, Tinyc->upload_filename, sizeof(s->filename));
+        strlcpy(Tinyc->slot_config[slot_num].filename, s->filename, sizeof(Tinyc->slot_config[slot_num].filename));
+        TinyCSetPersistFile(s, s->filename);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: Loaded %d bytes into slot %d"), s->program_size, slot_num);
+
+        // Save to filesystem with uploaded filename
+#ifdef USE_UFILESYS
+        if (ufsp) {
+          const char *saveName = s->filename[0] ? s->filename : TC_FILE_NAME;
+          // NOTE: small .tcb write — not wrapped in TinyCFsWritePause (that's
+          // for the large /ufsu file-manager uploads that hang). tc_deploy
+          // stops/runs the target slot itself, so stopping all slots here would
+          // needlessly disrupt other running scripts (e.g. a Matter bridge).
+#ifdef USE_WEBCAM
+          WcInterrupt(0);
+#endif
+          File f = ufsp->open(saveName, "w");
+          if (f) {
+            f.write(s->program, s->program_size);
+            f.close();
+          }
+#ifdef USE_WEBCAM
+          WcInterrupt(1);
+#endif
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: Saved to %s"), saveName);
+        }
+        TinyCSaveSettings();
+#endif
+      } else {
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Load error: %s"), tc_error_str(err));
+        free(s->program);
+        s->program = nullptr;
+        s->program_size = 0;
+        s->loaded = false;
+        Web.upload_error = 1;
+      }
+    } else {
+      if (Tinyc->upload_buf) { free(Tinyc->upload_buf); Tinyc->upload_buf = nullptr; }
+    }
+    Tinyc->upload_active = false;
+  }
+}
+
+// ---- API endpoint for browser IDE (JSON + CORS) ----
+// GET /tc_api?cmd=run|stop|status&slot=N
+static void HandleTinyCApi(void) {
+  TCSendCORS("GET, POST, OPTIONS");
+
+  if (!Tinyc) {
+    WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"not initialized\"}"));
+    return;
+  }
+
+  String cmd = Webserver->arg(F("cmd"));
+  uint8_t slot_num = 0;
+  if (Webserver->hasArg(F("slot"))) {
+    slot_num = Webserver->arg(F("slot")).toInt();
+    if (slot_num >= TC_MAX_VMS) slot_num = 0;
+  }
+  char json[384];
+
+  if (cmd == "run") {
+    // Allocate slot if needed
+    // Lazy-load: if slot has a config file but isn't loaded yet, load now
+    if (!Tinyc->slots[slot_num] || !Tinyc->slots[slot_num]->loaded) {
+      if (Tinyc->slot_config[slot_num].filename[0]) {
+        TinyCLoadFile(Tinyc->slot_config[slot_num].filename, slot_num);
+      } else if (!Tinyc->slots[slot_num]) {
+        Tinyc->slots[slot_num] = tc_slot_alloc();
+      }
+    }
+    TcSlot *s = Tinyc->slots[slot_num];
+    if (!s || !s->loaded) {
+      WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"no program loaded\"}"));
+      return;
+    }
+    if (!TinyCStartVM(s)) {
+      WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"start failed\"}"));
+      return;
+    }
+    const char *run_name = s->filename[0] ? s->filename : "";
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: Program started %s (API, slot %d)"), run_name, slot_num);
+    snprintf_P(json, sizeof(json), PSTR("{\"ok\":true,\"running\":true,\"size\":%d,\"slot\":%d,\"file\":\"%s\"}"),
+      s->program_size, slot_num, run_name);
+    WSSendJSON(200, json);
+  }
+  else if (cmd == "stop") {
+    TcSlot *s = Tinyc->slots[slot_num];
+    if (s) {
+      TinyCStopVM(s);
+      s->cmd_prefix_saved[0] = '\0';   // deliberate (API) stop — no prefix self-heal
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Program stopped (API, slot %d)"), slot_num);
+    }
+    WSSendJSON_P(200, PSTR("{\"ok\":true,\"running\":false}"));
+  }
+  else if (cmd == "autoexec") {
+    // Set autoexec: /tc_api?cmd=autoexec&slot=N&value=1|0
+    if (Webserver->hasArg(F("value"))) {
+      Tinyc->slot_config[slot_num].autoexec = (Webserver->arg(F("value")).toInt() != 0);
+    } else {
+      Tinyc->slot_config[slot_num].autoexec = !Tinyc->slot_config[slot_num].autoexec;
+    }
+    TcSlot *s = Tinyc->slots[slot_num];
+    if (s) s->autoexec = Tinyc->slot_config[slot_num].autoexec;
+    TinyCSaveSettings();
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d autoexec=%d (API)"), slot_num, Tinyc->slot_config[slot_num].autoexec ? 1 : 0);
+    snprintf_P(json, sizeof(json), PSTR("{\"ok\":true,\"slot\":%d,\"autoexec\":%d}"),
+      slot_num, Tinyc->slot_config[slot_num].autoexec ? 1 : 0);
+    WSSendJSON(200, json);
+  }
+  else if (cmd == "status") {
+    // Return firmware version markers (so the IDE can warn on a version/ABI
+    // mismatch — see the IDE's checkDeviceVersion) + an array of slot statuses.
+    //   release = TinyC firmware release string   (e.g. "1.6.38")
+    //   tcb     = bytecode FORMAT version the firmware accepts (TC_VERSION)
+    //   abi     = syscall ABI revision (TC_SYSCALL_ABI) — the one that matters:
+    //             a .tcb compiled against a different abi can dispatch syscalls
+    //             to the WRONG firmware function (silent UB), not just fail to load.
+    String result = String(F("{\"ok\":true,\"release\":\"" TC_RELEASE "\",\"tcb\":"))
+                    + TC_VERSION + F(",\"abi\":") + TC_SYSCALL_ABI + F(",\"slots\":[");
+    bool first = true;
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      // Show slot if loaded OR has a config file (lazy-load pending)
+      if (!s && !Tinyc->slot_config[i].filename[0]) continue;
+      if (!first) result += ',';
+      first = false;
+      if (s) {
+        // Loaded slot — show full stats
+        uint32_t vm_ram = sizeof(TcSlot) + s->program_size
+          + s->vm.stack_size * sizeof(int32_t)
+          + s->vm.globals_size * sizeof(int32_t)
+          + s->vm.const_capacity * sizeof(TcConstant)
+          + s->vm.const_data_size;
+        if (s->vm.heap_data) vm_ram += s->vm.heap_used * sizeof(int32_t);
+        if (s->vm.heap_handles) vm_ram += TC_MAX_HEAP_HANDLES * sizeof(TcHeapHandle);
+        if (s->vm.udp_globals) vm_ram += s->vm.udp_global_count * sizeof(struct TcVM::TcUdpGlobalEntry);
+        snprintf_P(json, sizeof(json),
+          PSTR("{\"slot\":%d,\"loaded\":%d,\"running\":%d,\"autoexec\":%d,\"size\":%d,\"file\":\"%s\","
+               "\"pc\":%d,\"sp\":%d,\"instr\":%u,\"ram\":%u,\"error\":\"%s\"}"),
+          i,
+          s->loaded ? 1 : 0,
+          s->running ? 1 : 0,
+          Tinyc->slot_config[i].autoexec ? 1 : 0,
+          s->program_size,
+          s->filename[0] ? s->filename : "",
+          s->vm.pc - s->vm.code_offset,
+          s->vm.sp,
+        s->vm.instruction_count,
+        vm_ram,
+        tc_error_str(s->vm.error));
+      } else {
+        // Unloaded slot — show config info only (lazy-load pending, 0 RAM used)
+        snprintf_P(json, sizeof(json),
+          PSTR("{\"slot\":%d,\"loaded\":0,\"running\":0,\"autoexec\":%d,\"size\":0,\"file\":\"%s\","
+               "\"pc\":0,\"sp\":0,\"instr\":0,\"ram\":0,\"error\":\"OK\"}"),
+          i, Tinyc->slot_config[i].autoexec ? 1 : 0, Tinyc->slot_config[i].filename);
+      }
+      result += json;
+    }
+    result += F("],\"heap\":");
+    {
+      // free heap + fragmentation %% (0 = healthy, ->100 = badly fragmented).
+      // frag = 100 - largest_free_block*100/free_heap. Computed here (the stock
+      // Status JSON never exposes it); works on ESP32 + ESP8266 (both provide
+      // ESP_getMaxAllocHeap/ESP_getFreeHeap). Used by the device-scanner Frag column.
+      uint32_t fh = ESP_getFreeHeap();
+      result += String(fh);
+      int frag = fh ? (int)(100 - (uint64_t)ESP_getMaxAllocHeap() * 100 / fh) : 0;
+      result += F(",\"frag\":");
+      result += String(frag);
+    }
+    result += '}';
+    Webserver->send(200, F("application/json"), result);
+    return;
+  }
+  else if (cmd == "freegpio") {
+    // Return list of free (usable, not flash, not assigned) GPIO pins
+    String result = F("{\"ok\":true,\"gpios\":[");
+    bool first = true;
+    for (uint32_t i = 0; i < MAX_GPIO_PIN; i++) {
+      if (FlashPin(i)) continue;                    // skip flash/reserved pins
+      if (TasmotaGlobal.gpio_pin[i] > 0) continue;  // skip assigned pins
+      if (!first) result += ',';
+      result += String(i);
+      first = false;
+    }
+    result += F("]}");
+    Webserver->send(200, F("application/json"), result);
+    return;
+  }
+#ifdef USE_UFILESYS
+  else if (cmd == "listfiles") {
+    // List files on device filesystem (both ufsp and ffsp)
+    if (!ufsp && !ffsp) {
+      WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"no filesystem\"}"));
+      return;
+    }
+    String result = F("{\"ok\":true,\"files\":[");
+    bool first = true;
+    FS *fss[] = { ufsp, (ffsp && ffsp != ufsp) ? ffsp : nullptr };
+    for (int fi = 0; fi < 2; fi++) {
+      if (!fss[fi]) continue;
+      File root = fss[fi]->open("/", "r");
+      if (!root) continue;
+      File f = root.openNextFile();
+      while (f) {
+        if (!f.isDirectory()) {
+          const char *fname = f.name();
+          if (*fname == '/') fname++;
+          const char *lcp = strrchr(fname, '/');
+          if (lcp) fname = lcp + 1;
+          if (!first) result += ',';
+          result += F("{\"name\":\"");
+          result += fname;
+          result += F("\",\"size\":");
+          result += String(f.size());
+          if (fi == 1) result += F(",\"fs\":\"flash\"");
+          result += '}';
+          first = false;
+        }
+        f = root.openNextFile();
+      }
+      root.close();
+    }
+    result += F("]}");
+    Webserver->send(200, F("application/json"), result);
+    return;
+  }
+  else if (cmd == "deletefile") {
+    // Delete a file: /tc_api?cmd=deletefile&path=/filename (tries ufsp then ffsp)
+    String fpath = Webserver->arg(F("path"));
+    if (fpath.length() == 0 || fpath[0] != '/') {
+      WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"missing path\"}"));
+      return;
+    }
+    if (!ufsp && !ffsp) {
+      WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"no filesystem\"}"));
+      return;
+    }
+    bool deleted = false;
+    if (ufsp) deleted = ufsp->remove(fpath.c_str());
+    if (!deleted && ffsp && ffsp != ufsp) deleted = ffsp->remove(fpath.c_str());
+    if (deleted) {
+      WSSendJSON_P(200, PSTR("{\"ok\":true}"));
+    } else {
+      WSSendJSON_P(404, PSTR("{\"ok\":false,\"error\":\"delete failed\"}"));
+    }
+    return;
+  }
+  else if (cmd == "readfile") {
+    // Read a text file from filesystem: /tc_api?cmd=readfile&path=/sml_meter.def
+    // Supports time-range filter: /tc_api?cmd=readfile&path=/data.csv@1.2.22-00:00_12.2.22-00:00
+    String fpath = Webserver->arg(F("path"));
+    if (fpath.length() == 0 || fpath[0] != '/') {
+      WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"missing path\"}"));
+      return;
+    }
+    if (!ufsp) {
+      WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"no filesystem\"}"));
+      return;
+    }
+
+    // Check for time-range filter: path@from_to
+    char pathbuf[128];
+    strlcpy(pathbuf, fpath.c_str(), sizeof(pathbuf));
+    uint32_t cmp_from = 0, cmp_to = 0;
+    char *atp = strchr(pathbuf, '@');
+    if (atp) {
+      *atp = 0;
+      atp++;
+      // from_to separated by underscore
+      char *tp = strchr(atp, '_');
+      if (tp) {
+        *tp = 0;
+        tp++;
+        cmp_from = tc_ts_cmp(atp);
+        cmp_to = tc_ts_cmp(tp);
+      }
+    }
+
+    File f = ufsp->open(pathbuf, "r");
+    if (!f) {
+      WSSendJSON_P(404, PSTR("{\"ok\":false,\"error\":\"file not found\"}"));
+      return;
+    }
+
+
+    if (cmp_from && cmp_to && cmp_to > cmp_from) {
+      // -- Time-filtered file serving --
+      Webserver->setContentLength(CONTENT_LENGTH_UNKNOWN);
+      Webserver->send(200, F("text/plain"), "");
+
+      char *lbuf = (char*)malloc(512);
+      if (!lbuf) { f.close(); return; }
+
+      // 1. Send header line (first line of CSV)
+      uint16_t li = 0;
+      while (f.available() && li < 510) {
+        uint8_t c;
+        f.read(&c, 1);
+        lbuf[li++] = c;
+        if (c == '\n') break;
+      }
+      lbuf[li] = 0;
+      if (li > 0) Webserver->sendContent(lbuf);
+      uint32_t header_end = f.position();
+
+      // 2. Try index file for fast seek
+      uint32_t seek_pos = 0;
+      {
+        char indpath[128];
+        strlcpy(indpath, pathbuf, sizeof(indpath));
+        char *dot = strrchr(indpath, '.');
+        if (dot) {
+          strcpy(dot, ".ind");
+        } else {
+          strcat(indpath, ".ind");
+        }
+        File ind = ufsp->open(indpath, "r");
+        if (ind) {
+          // Skip index header line
+          while (ind.available()) {
+            uint8_t c; ind.read(&c, 1);
+            if (c == '\n') break;
+          }
+          // Scan index lines: timestamp\tbyte_offset
+          uint32_t last_good_pos = 0;
+          uint16_t ycnt = 0;
+          while (ind.available()) {
+            li = 0;
+            while (ind.available() && li < 510) {
+              uint8_t c; ind.read(&c, 1);
+              lbuf[li++] = c;
+              if (c == '\n') break;
+            }
+            lbuf[li] = 0;
+            uint32_t cmp = tc_ts_cmp(lbuf);
+            if (cmp == 0) continue;
+            if (cmp >= cmp_from) break;  // past our start
+            char *tab = strchr(lbuf, '\t');
+            if (tab) {
+              last_good_pos = strtoul(tab + 1, NULL, 10);
+            }
+            if (++ycnt >= 100) { ycnt = 0; yield(); }
+          }
+          seek_pos = last_good_pos;
+          ind.close();
+        } else {
+          // No index: estimated seek (like Scripter's opt_fext)
+          li = 0;
+          while (f.available() && li < 31) {
+            uint8_t c; f.read(&c, 1);
+            if (c == '\t' || c == '\n') break;
+            lbuf[li++] = c;
+          }
+          lbuf[li] = 0;
+          uint32_t ts_first = tc_ts_cmp(lbuf);
+
+          // Find last line timestamp
+          uint32_t fsize = f.size();
+          uint32_t back = (fsize > 256) ? fsize - 256 : 0;
+          f.seek(back, SeekSet);
+          uint32_t last_nl = 0;
+          while (f.available()) {
+            uint8_t c; f.read(&c, 1);
+            if (c == '\n') last_nl = f.position();
+          }
+          if (last_nl > back) {
+            f.seek(last_nl, SeekSet);
+            li = 0;
+            while (f.available() && li < 31) {
+              uint8_t c; f.read(&c, 1);
+              if (c == '\t' || c == '\n') break;
+              lbuf[li++] = c;
+            }
+            lbuf[li] = 0;
+            uint32_t ts_last = tc_ts_cmp(lbuf);
+            if (ts_last > ts_first && cmp_from > ts_first) {
+              float perc = (float)(cmp_from - ts_first) / (float)(ts_last - ts_first) * 0.8f;
+              if (perc < 0) perc = 0;
+              if (perc > 1) perc = 1;
+              seek_pos = (uint32_t)(perc * fsize);
+            }
+          }
+          // Skip partial line at seek position
+          if (seek_pos > 0) {
+            f.seek(seek_pos, SeekSet);
+            while (f.available()) {
+              uint8_t c; f.read(&c, 1);
+              if (c == '\n') break;
+            }
+            seek_pos = f.position();
+          }
+        }
+      }
+
+      // 3. Seek to start position and stream matching lines
+      if (seek_pos > 0) {
+        f.seek(seek_pos, SeekSet);
+      } else {
+        f.seek(header_end, SeekSet);
+      }
+
+      while (f.available()) {
+        li = 0;
+        while (f.available() && li < 510) {
+          uint8_t c; f.read(&c, 1);
+          lbuf[li++] = c;
+          if (c == '\n') break;
+        }
+        lbuf[li] = 0;
+
+        // Extract timestamp from first column (before first tab)
+        char saved = 0;
+        char *tab = strchr(lbuf, '\t');
+        if (tab) { saved = *tab; *tab = 0; }
+        uint32_t cmp = tc_ts_cmp(lbuf);
+        if (tab) *tab = saved;
+
+        if (cmp == 0) continue;         // skip invalid/header
+        if (cmp > cmp_to) break;        // past end, done (data is chronological)
+        if (cmp >= cmp_from) {
+          Webserver->sendContent(lbuf);
+        }
+        yield();  // feed WDT during streaming
+      }
+      // Signal end of chunked response
+      Webserver->sendContent("");
+
+      free(lbuf);
+      f.close();
+      return;
+    }
+
+    // Normal full-file streaming (no time filter)
+    Webserver->setContentLength(f.size());
+    Webserver->send(200, F("text/plain"), "");
+    uint8_t buf[256];
+    while (f.available()) {
+      int n = f.read(buf, sizeof(buf));
+      if (n > 0) Webserver->client().write(buf, n);
+    }
+    f.close();
+    return;
+  }
+  else if (cmd == "writefile") {
+    // Write text to a file: /tc_api?cmd=writefile&path=/sml_meter.def  (POST body = content)
+    String fpath = Webserver->arg(F("path"));
+    if (fpath.length() == 0 || fpath[0] != '/') {
+      WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"missing path\"}"));
+      return;
+    }
+    if (!ufsp) {
+      WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"no filesystem\"}"));
+      return;
+    }
+    String body = Webserver->arg(F("plain"));
+    File f = ufsp->open(fpath.c_str(), "w");
+    if (!f) {
+      WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"write failed\"}"));
+      return;
+    }
+    f.print(body);
+    f.close();
+    snprintf_P(json, sizeof(json), PSTR("{\"ok\":true,\"size\":%d}"), body.length());
+    WSSendJSON(200, json);
+    return;
+  }
+#endif
+  else {
+    // Default: status for a specific slot (backward-compatible single-slot response)
+    TcSlot *s = Tinyc->slots[slot_num];
+    if (s) {
+      snprintf_P(json, sizeof(json),
+        PSTR("{\"ok\":true,\"slot\":%d,\"loaded\":%d,\"running\":%d,\"size\":%d,\"file\":\"%s\","
+             "\"pc\":%d,\"sp\":%d,\"instr\":%u,\"error\":\"%s\",\"heap\":%d}"),
+        slot_num,
+        s->loaded ? 1 : 0,
+        s->running ? 1 : 0,
+        s->program_size,
+        s->filename[0] ? s->filename : "",
+        s->vm.pc - s->vm.code_offset,
+        s->vm.sp,
+        s->vm.instruction_count,
+        tc_error_str(s->vm.error),
+        ESP_getFreeHeap());
+    } else {
+      snprintf_P(json, sizeof(json),
+        PSTR("{\"ok\":true,\"slot\":%d,\"loaded\":0,\"running\":0,\"size\":0,\"heap\":%d}"),
+        slot_num, ESP_getFreeHeap());
+    }
+    WSSendJSON(200, json);
+  }
+}
+
+// CORS preflight for /tc_api
+static void HandleTinyCApiCORS(void) {
+  TCSendCORS("GET, OPTIONS");
+  Webserver->send(204);
+}
+
+// ---- HomeKit QR Code pairing page (/hk) ----
+#ifdef USE_HOMEKIT
+extern "C" {
+  extern const char *homekit_get_uri(void);
+  extern const char *homekit_get_code(void);
+}
+
+static void HandleHomeKitQR(void) {
+  const char *uri = homekit_get_uri();
+  const char *code = homekit_get_code();
+
+  if (!uri || !uri[0]) {
+    WSContentStart_P(PSTR("HomeKit"));
+    WSContentSendStyle();
+    WSContentSend_P(PSTR("<p>HomeKit not running.</p>"));
+    WSContentSpaceButton(BUTTON_MAIN);
+    WSContentEnd();
+    return;
+  }
+
+  WSContentStart_P(PSTR("HomeKit Pairing"));
+  WSContentSendStyle();
+  // Use qrcode.js from CDN — the iPhone viewing this page has internet access
+  WSContentSend_P(PSTR(
+    "<div style='text-align:center'>"
+    "<h2>HomeKit Pairing</h2>"
+    "<div id='qr' style='display:inline-block;padding:8px;background:#fff'></div>"
+    "<p style='font-size:24px;font-family:monospace;letter-spacing:4px'><b>%s</b></p>"
+    "<p>Scan with iPhone Camera or Home app</p>"
+    "<p id='uri' style='font-size:10px;color:#888'></p>"
+    "</div>"
+    "<script src='https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js'></script>"
+    "<script>"
+    "var u='%s';"
+    "document.getElementById('uri').textContent=u;"
+    "try{new QRCode(document.getElementById('qr'),{text:u,width:200,height:200,"
+    "correctLevel:QRCode.CorrectLevel.M});}catch(e){"
+    "document.getElementById('qr').innerHTML='<p>QR library failed: '+e.message+'</p>';}"
+    "</script>"
+  ), code, uri);
+  WSContentSpaceButton(BUTTON_MAIN);
+  WSContentEnd();
+}
+#endif  // USE_HOMEKIT
+
+// ---- Matter pairing page (/mt) — replaces HomeKit when USE_MATTER_C ----
+// HomeKit and Matter are mutually exclusive (see user_config_override.h:
+// TINYC_HOMEKIT vs TINYC_MATTER). They share the same TinyC integration
+// slot, so this is the structural twin of HandleHomeKitQR above. The page
+// also forces the reusable matter_c library to link in a TINYC_MATTER build.
+#ifdef USE_MATTER_C
+#include "matter_c.h"
+#include <esp_random.h>
+#include <AsyncUDP.h>
+#include <mdns.h>          // ESP-IDF mDNS: commissionable subtypes (_L/_S/_CM)
+
+// Matter operational/commissioning UDP socket (port 5540). Inbound packets
+// are pumped into matter_udp_rx; the responder replies to the last peer.
+#define MTRC_COMMISSION_PORT_HOST 5540    // Matter operational/commissioning UDP port
+static AsyncUDP mtrc_udp;
+static IPAddress mtrc_peer_ip;
+static uint16_t  mtrc_peer_port = 0;
+// Last KNOWN-GOOD IPv6 peer. AsyncUDP intermittently mis-flags an inbound IPv6
+// datagram as IPv4 (isIPv6()==false -> remoteIP() returns garbage like
+// 158.158.110.255), which would clobber the reply address. We only refresh this
+// from datagrams that are reliably IPv6, and reply here for Matter (IPv6) peers.
+static IPAddress mtrc_peer_ip6;
+static uint16_t  mtrc_peer_port6 = 0;
+static bool      mtrc_udp_listening = false;
+
+// Per-packet AddLog formatting (`IPAddress::toString()` for IPv6 link-local
+// strings + vsnprintf into Tasmota's LOGSZ stack buffer) overflowed the
+// AsyncTCP task's ~4 KB stack and corrupted the saved RA with format-string
+// bytes — crashed .122 ~hourly with `Instruction access fault` MEPC=RA=ASCII
+// fragments like `,"Ho` / `stname":"ESP` / `rx 42 B` (captured live on serial
+// 2026-05-27 15:34:50, BootCount 290). matter_udp_rx itself was fine on that
+// stack (no crashes in crypto/IM dispatch); the overflow was specifically in
+// the log path. Fix: count packets in the async lambda (no formatting), then
+// log aggregated counters periodically from the main task where 8 KB+ of stack
+// is available. Volatile counters are word-sized → atomic on single-core C6.
+static volatile uint32_t mtrc_rx_pkts  = 0;
+static volatile uint32_t mtrc_rx_bytes = 0;
+static uint32_t          mtrc_rx_pkts_last  = 0;  // last logged value (main task)
+static uint32_t          mtrc_rx_bytes_last = 0;
+static uint32_t          mtrc_rx_log_ms     = 0;  // throttle: emit at most every 5 s
+
+// ---- Matter Invoke deferral queue ----------------------------------------
+// matter_udp_rx() (hence im_handle_invoke -> on_command) runs in the
+// async-tcpip task. Executing the Tasmota command pipeline
+// (ExecuteCommandPower) or a TinyC VM there overflows that task's small stack
+// and races the main loop -> crash. So on_command only ENQUEUES the action
+// (lightweight, async-safe) and replies SUCCESS; the main loop drains the
+// queue (FUNC_EVERY_50_MSECOND) and performs the relay/script action in the
+// safe main-task context. SPSC ring: producer = async task, consumer = main
+// loop; the C6 is single-core so byte/word index updates are atomic.
+struct MtrcInvokeJob { uint16_t ep; uint32_t cluster; uint32_t command; int32_t arg; };
+#define MTRC_INV_Q 8
+static volatile MtrcInvokeJob mtrc_inv_q[MTRC_INV_Q];
+static volatile uint8_t mtrc_inv_head = 0, mtrc_inv_tail = 0;
+static void mtrc_invoke_enqueue(uint16_t ep, uint32_t cl, uint32_t cmd, int32_t arg) {
+  uint8_t nh = (uint8_t)((mtrc_inv_head + 1) % MTRC_INV_Q);
+  if (nh == mtrc_inv_tail) return;       // full: drop (drained every 50 ms; won't happen)
+  mtrc_inv_q[mtrc_inv_head].ep      = ep;
+  mtrc_inv_q[mtrc_inv_head].cluster = cl;
+  mtrc_inv_q[mtrc_inv_head].command = cmd;
+  mtrc_inv_q[mtrc_inv_head].arg     = arg;
+  mtrc_inv_head = nh;                     // publish AFTER fields are written
+}
+
+// Route a Matter command Invoke to the script's MatterInvoke(ep, cluster, cmd)
+// callback on every slot that defines it (the structural twin of HomeKit's
+// tc_hk_write_callback). Returns true if at least one script handled it, so the
+// caller can fall back to the built-in OnOff->relay behavior otherwise.
+static bool MatterC_DispatchInvoke(uint16_t ep, uint32_t cluster, uint32_t cmd) {
+  if (!Tinyc) return false;
+  bool handled = false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+    // Does this slot define a MatterInvoke callback?
+    bool has = false;
+    for (int c = 0; c < s->vm.callback_count; c++)
+      if (strcmp(s->vm.callbacks[c].name, "MatterInvoke") == 0) { has = true; break; }
+    if (!has) continue;
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+    if (s->vm.halted && s->vm.error == TC_OK) {
+      tc_current_slot = s;
+      TcVM *vm = &s->vm;
+      if (vm->sp + 3 <= vm->stack_size) {
+        // Pin pre-push SP so the 3 consumed args don't re-materialise (see
+        // tc_hk_write_callback for the same idiom).
+        uint16_t pre_push_sp = vm->sp;
+        vm->stack[vm->sp++] = (int32_t)ep;
+        vm->stack[vm->sp++] = (int32_t)cluster;
+        vm->stack[vm->sp++] = (int32_t)cmd;
+        tc_vm_call_callback(vm, "MatterInvoke");
+        vm->sp = pre_push_sp;
+        handled = true;
+      }
+      tc_current_slot = nullptr;
+    }
+#ifdef ESP32
+    if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+  }
+  return handled;
+}
+
+// Does any loaded slot define a MatterInvoke callback? Cheap (callback-name
+// scan, no VM execution) so it is safe to call from the async-tcpip task.
+static bool mtrc_have_matterinvoke(void) {
+  if (!Tinyc) return false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    TcSlot *s = Tinyc->slots[i];
+    if (!s || !s->loaded) continue;
+    for (int c = 0; c < s->vm.callback_count; c++)
+      if (strcmp(s->vm.callbacks[c].name, "MatterInvoke") == 0) return true;
+  }
+  return false;
+}
+
+// Drain queued Matter Invoke actions in the MAIN-LOOP task context (called from
+// FUNC_EVERY_50_MSECOND). Mirrors the old inline on_command body: offer to the
+// script first (MatterInvoke), then the built-in OnOff->relay-1 default.
+static void mtrc_invoke_drain(void) {
+  while (mtrc_inv_head != mtrc_inv_tail) {
+    MtrcInvokeJob j;                                       // copy out of volatile slot
+    j.ep      = mtrc_inv_q[mtrc_inv_tail].ep;
+    j.cluster = mtrc_inv_q[mtrc_inv_tail].cluster;
+    j.command = mtrc_inv_q[mtrc_inv_tail].command;
+    j.arg     = mtrc_inv_q[mtrc_inv_tail].arg;
+    mtrc_inv_tail = (uint8_t)((mtrc_inv_tail + 1) % MTRC_INV_Q);
+    if (MatterC_DispatchInvoke(j.ep, j.cluster, j.command)) continue;  // script handled
+    if (j.cluster == 0x0006 && j.command <= 2) {           // OnOff -> relay 1 (default)
+      AddLog(LOG_LEVEL_INFO, PSTR("MTR: OnOff -> Power %u (default)"), (unsigned)j.command);
+      ExecuteCommandPower(1, j.command, SRC_BUTTON);        // 0=off 1=on 2=toggle
+    }
+  }
+}
+
+// ---- matter_c host port (Tasmota backing for the firmware-agnostic lib) --
+// For the discovery + PASE-rx milestone we provide log / millis / CSPRNG /
+// a minimal kv store + mdns_publish (ESPmDNS) + udp_send (AsyncUDP). A
+// UFS-backed kv comes with the fabric-store milestone.
+extern "C" {
+  static uint32_t mtrc_p_millis(void *ctx) { (void)ctx; return millis(); }
+  static void mtrc_p_log(void *ctx, matter_log_level_t lvl, const char *msg) {
+    (void)ctx;
+    AddLog(lvl == MATTER_LOG_DEBUG ? LOG_LEVEL_DEBUG : LOG_LEVEL_INFO,
+           PSTR("MTR: %s"), msg);
+  }
+  static matter_err_t mtrc_p_random(void *ctx, void *buf, size_t len) {
+    (void)ctx; esp_fill_random(buf, len); return MATTER_OK;   // hardware CSPRNG
+  }
+  // UFS-backed key/value store (Matter fabric table persistence). Keys map to
+  // files "/mtr_<key>" on the Tasmota filesystem. Falls back to not-found/no-op
+  // when the filesystem is unavailable (matter still runs, just doesn't persist).
+#ifdef USE_UFILESYS
+  static void mtrc_kv_fname(const char *k, char *out, size_t cap) {
+    snprintf(out, cap, "/mtr_%s", k);
+  }
+  static matter_err_t mtrc_p_kv_get(void *ctx, const char *k, void *b, size_t *l) {
+    (void)ctx;
+    char fn[40]; mtrc_kv_fname(k, fn, sizeof(fn));
+    if (!TfsFileExists(fn)) return MATTER_ERR_STORE;
+    size_t fsz = TfsFileSize(fn);
+    if (fsz == 0 || fsz > *l) return MATTER_ERR_STORE;
+    if (!TfsLoadFile(fn, (uint8_t *)b, fsz)) return MATTER_ERR_STORE;
+    *l = fsz;
+    return MATTER_OK;
+  }
+  static matter_err_t mtrc_p_kv_set(void *ctx, const char *k, const void *b, size_t l) {
+    (void)ctx;
+    char fn[40]; mtrc_kv_fname(k, fn, sizeof(fn));
+    return TfsSaveFile(fn, (const uint8_t *)b, (uint32_t)l) ? MATTER_OK : MATTER_ERR_STORE;
+  }
+  static matter_err_t mtrc_p_kv_del(void *ctx, const char *k) {
+    (void)ctx;
+    char fn[40]; mtrc_kv_fname(k, fn, sizeof(fn));
+    if (TfsFileExists(fn)) TfsDeleteFile(fn);
+    return MATTER_OK;
+  }
+#else
+  static matter_err_t mtrc_p_kv_get(void *ctx, const char *k, void *b, size_t *l) {
+    (void)ctx;(void)k;(void)b;(void)l; return MATTER_ERR_STORE; }
+  static matter_err_t mtrc_p_kv_set(void *ctx, const char *k, const void *b, size_t l) {
+    (void)ctx;(void)k;(void)b;(void)l; return MATTER_OK; }
+  static matter_err_t mtrc_p_kv_del(void *ctx, const char *k) {
+    (void)ctx;(void)k; return MATTER_OK; }
+#endif  // USE_UFILESYS
+  static matter_err_t mtrc_p_mdns(void *ctx, const char *service, const char *instance,
+                                  uint16_t port, const char *const *txt, size_t n) {
+    (void)ctx;
+    if (!Mdns.begun) return MATTER_ERR_TRANSPORT;     // responder not up yet
+    bool operational = (strcmp(service, "matter") == 0);
+    // Matter DNS-SD service-type quirk (Core Spec §4.3.1): OPERATIONAL discovery
+    // is published under _matter._TCP — even though the operational transport is
+    // still UDP on 5540. Only commissionable (_matterc) and commissioner
+    // (_matterd) use _udp. Advertising operational under _udp makes Apple/Google
+    // home hubs (which browse _matter._tcp) find nothing, so they finish AddNOC
+    // but never start operational CASE (no Sigma1) and pairing fails at the end.
+    const char *proto  = operational ? "tcp"  : "udp";   // ESPmDNS form
+    const char *protou = operational ? "_tcp" : "_udp";  // esp-mdns component form
+    char stype0[20]; snprintf(stype0, sizeof(stype0), "_%s", service);
+
+    if (operational) {
+      // OPERATIONAL discovery: ONE _matter._tcp instance PER FABRIC. A node can
+      // belong to several fabrics (Apple Home alone may commission the device into
+      // TWO fabrics during one "Add"). ESP-IDF mdns keys a service by its instance
+      // name, so each fabric MUST be a distinct instance added via
+      // mdns_service_add_for_host(<CFID>-<nodeId>, ...). The previous code used
+      // MDNS.addService + mdns_service_instance_name_set, which keeps a SINGLE
+      // _matter._tcp service and RENAMES it on each call — so the 2nd fabric erased
+      // the 1st fabric's record, and that controller could never re-resolve the
+      // node operationally → Apple shows "Keine Antwort". Instance/host pair is
+      // idempotent: re-announcing the same fabric is a no-op (returns "exists").
+      mdns_txt_item_t items[8]; size_t ni = 0;
+      static char kvbuf[8][24];                          // key\0value, serialized in main task
+      for (size_t i = 0; i < n && ni < 8; i++) {
+        const char *eq = strchr(txt[i], '=');
+        if (!eq) continue;
+        size_t len = strlen(txt[i]);
+        if (len >= sizeof(kvbuf[0])) len = sizeof(kvbuf[0]) - 1;
+        memcpy(kvbuf[ni], txt[i], len); kvbuf[ni][len] = 0;
+        char *v = strchr(kvbuf[ni], '='); *v = 0; v++;   // split in place
+        items[ni].key = kvbuf[ni]; items[ni].value = v; ni++;
+      }
+      esp_err_t err = mdns_service_add_for_host(instance, stype0, protou, NULL, port,
+                                                ni ? items : NULL, ni);
+      // Operational browse subtype _I<compressedFabricId> (Core Spec §4.3.4):
+      // controllers browse _I<CFID>._sub._matter._tcp to re-find the node. The
+      // subtype must attach to THIS fabric's instance, not the default one.
+      char sub[24]; const char *dash = strchr(instance, '-');
+      size_t cl = dash ? (size_t)(dash - instance) : strlen(instance);
+      if (cl > 20) cl = 20;
+      snprintf(sub, sizeof(sub), "_I%.*s", (int)cl, instance);
+      mdns_service_subtype_add_for_host(instance, stype0, protou, NULL, sub);
+      AddLog(LOG_LEVEL_INFO, PSTR("MTR: operational mDNS %s._matter._tcp (%s) rc=%d"),
+             instance, sub, (int)err);
+      return MATTER_OK;
+    }
+
+    // COMMISSIONABLE (_matterc._udp): only one pairing window at a time → a single
+    // instance is correct here.
+    MDNS.addService(service, proto, port);
+    {
+      // Matter REQUIRES a 16-hex commissioning instance name (Core Spec §4.3.1);
+      // ESPmDNS defaults it to the hostname, which Apple Home rejects. Use a
+      // STABLE id derived from the chip MAC (not the core's per-boot random one)
+      // so reboots reuse the same instance and never seed new mDNS phantoms in
+      // controllers' caches.
+      // 16-hex instance, formatted byte-by-byte — newlib-nano printf (default on
+      // several Tasmota envs) ignores the 'll' modifier and emits garbage for a
+      // 64-bit "%016llX". Harmless here (Apple matches commissionable by the D=
+      // discriminator TXT), but the operational instance MUST be valid hex, so
+      // keep the formatting consistent and spec-correct everywhere.
+      char inst16[17]; unsigned long long mac = (unsigned long long)ESP.getEfuseMac();
+      for (int i = 0; i < 8; i++)
+        snprintf(inst16 + 2 * i, 3, "%02X", (unsigned)((mac >> ((7 - i) * 8)) & 0xFF));
+      mdns_service_instance_name_set(stype0, protou, inst16);
+    }
+    uint16_t disc = 0;
+    for (size_t i = 0; i < n; i++) {
+      const char *eq = strchr(txt[i], '=');
+      if (!eq) continue;
+      char key[12]; size_t kl = (size_t)(eq - txt[i]);
+      if (kl >= sizeof(key)) kl = sizeof(key) - 1;
+      memcpy(key, txt[i], kl); key[kl] = 0;
+      MDNS.addServiceTxt(service, proto, key, eq + 1);
+      if (kl == 1 && key[0] == 'D') disc = (uint16_t)atoi(eq + 1);
+    }
+    // Matter commissionable mDNS subtypes (Core Spec §4.3.4): commissioners
+    // (Apple Home / Google) browse _L<long-disc> / _S<short-disc> / _CM under
+    // _matterc._udp to find a device. Without these, Apple never discovers us.
+    // ESPmDNS has no subtype API, so call the ESP-IDF mdns component directly.
+    char sub[16];
+    snprintf(sub, sizeof(sub), "_L%u", (unsigned)disc);
+    mdns_service_subtype_add_for_host(NULL, stype0, protou, NULL, sub);
+    snprintf(sub, sizeof(sub), "_S%u", (unsigned)(disc >> 8));         // short = top 4 bits
+    mdns_service_subtype_add_for_host(NULL, stype0, protou, NULL, sub);
+    mdns_service_subtype_add_for_host(NULL, stype0, protou, NULL, "_CM");
+    AddLog(LOG_LEVEL_INFO, PSTR("MTR: mDNS subtypes _L%u _S%u _CM added"),
+           (unsigned)disc, (unsigned)(disc >> 8));
+    return MATTER_OK;
+  }
+  // Withdraw a per-fabric operational instance (RemoveFabric / Unbind). Only the
+  // operational _matter._tcp service is per-fabric; commissionable is singular.
+  static matter_err_t mtrc_p_mdns_remove(void *ctx, const char *service, const char *instance) {
+    (void)ctx;
+    if (!Mdns.begun) return MATTER_ERR_TRANSPORT;
+    if (strcmp(service, "matter") != 0) return MATTER_OK;
+    esp_err_t err = mdns_service_remove_for_host(instance, "_matter", "_tcp", NULL);
+    AddLog(LOG_LEVEL_INFO, PSTR("MTR: operational mDNS remove %s rc=%d"), instance, (int)err);
+    return MATTER_OK;
+  }
+  // Reply to the last peer that sent us a datagram (PASE/CASE is a single
+  // exchange at a time). ip6/port from the core are ignored for now.
+  static matter_err_t mtrc_p_udp_send(void *ctx, const uint8_t ip6[16],
+                                      uint16_t port, const void *buf, size_t len) {
+    (void)ctx;
+    // Reply to THIS request's own source (the core passes the originating
+    // controller's IPv6) so concurrent controllers each get their answer. A
+    // zero address means the source was unknown (AsyncUDP mis-flagged the
+    // inbound packet as IPv4) -> fall back to the last KNOWN-GOOD IPv6 peer.
+    bool have_src = false;
+    if (port) { for (int i = 0; i < 16; i++) if (ip6[i]) { have_src = true; break; } }
+    IPAddress dst; uint16_t dport;
+    if (have_src) {
+      // Carry the STA interface zone so a link-local (fe80::) reply has an
+      // egress scope — Apple runs operational CASE from its link-local address.
+      // All controllers share the WiFi-STA interface, so the last-good peer's
+      // zone is the correct zone for every reconstructed address.
+      dst = IPAddress(IPv6, ip6, mtrc_peer_ip6.zone()); dport = port;
+    } else {
+      dst   = mtrc_peer_port6 ? mtrc_peer_ip6   : mtrc_peer_ip;
+      dport = mtrc_peer_port6 ? mtrc_peer_port6 : mtrc_peer_port;
+    }
+    if (!dport) return MATTER_ERR_TRANSPORT;
+    // Force the WiFi-STA netif. ESP-IDF lwIP is built without LWIP_IPV6_SCOPES,
+    // so a link-local (fe80::/10) destination has no zone and udp_sendto can't
+    // pick an egress interface — the datagram is silently dropped. Apple Home
+    // runs operational CASE *from its link-local address*. writeTo(...,tcpip_if)
+    // routes via _udp_sendto_if on the named netif; if STA is down it falls back
+    // to the default route, so global/ULA replies are unaffected.
+    size_t sent = mtrc_udp.writeTo((const uint8_t *)buf, len, dst, dport,
+                                   TCPIP_ADAPTER_IF_STA);
+    AddLog(LOG_LEVEL_DEBUG, PSTR("MTR: tx %u B -> [%s]:%u sent=%u"),
+           (unsigned)len, dst.toString().c_str(), (unsigned)dport, (unsigned)sent);
+    return MATTER_OK;
+  }
+  // Matter wrote a device attribute. OnOff (cluster 0x0006) -> Tasmota relay:
+  // the OnOff command id (Off=0/On=1/Toggle=2) maps 1:1 to POWER_OFF/ON/TOGGLE.
+  static void mtrc_p_on_attr_write(void *ctx, uint16_t endpoint, uint32_t cluster,
+                                   uint32_t attr, const uint8_t *tlv, size_t len) {
+    (void)ctx; (void)endpoint; (void)attr;
+    if (cluster == 0x0006 && len >= 1) {
+      AddLog(LOG_LEVEL_INFO, PSTR("MTR: OnOff -> Power %u"), (unsigned)tlv[0]);
+      ExecuteCommandPower(1, tlv[0], SRC_BUTTON);   // 0=off 1=on 2=toggle
+    }
+  }
+  // Matter reads an attribute -> return the live device value. OnOff (0x0006
+  // attr 0) reflects the real relay state (Power1).
+  static matter_err_t mtrc_p_on_attr_read(void *ctx, uint16_t endpoint,
+                                          uint32_t cluster, uint32_t attr,
+                                          uint64_t *out) {
+    (void)ctx;
+    // Only endpoint 1 (the plug) mirrors relay 1; other endpoints (e.g. an RGB
+    // light) keep their own OnOff in the data-model registry.
+    if (endpoint == 1 && cluster == 0x0006 && attr == 0x0000) {
+      *out = bitRead(TasmotaGlobal.power, 0) ? 1 : 0;
+      return MATTER_OK;
+    }
+    return MATTER_ERR_NOT_IMPLEMENTED;
+  }
+  // Matter invoked a command. First offer it to the script (MatterInvoke); if
+  // no script handles it, apply the built-in default (OnOff -> relay 1). The
+  // default runs ONLY when unhandled, so a script that drives the relay itself
+  // never double-toggles. Returns 1 if handled (core replies SUCCESS).
+  static int mtrc_p_on_command(void *ctx, uint16_t endpoint, uint32_t cluster,
+                               uint32_t command, int32_t arg) {
+    (void)ctx;
+    // Runs in the async-tcpip task: do NOT execute the relay pipeline or a
+    // TinyC VM here (stack overflow + reentrancy -> crash). Queue the action
+    // for the main loop and reply SUCCESS optimistically. "known" mirrors the
+    // old return value so im_handle_invoke's OnOff/catch-all status stays
+    // correct (LevelControl/ColorControl reply SUCCESS regardless of return).
+    bool known = (cluster == 0x0006 && command <= 2) ||
+                 cluster == 0x0008 || cluster == 0x0300 ||
+                 mtrc_have_matterinvoke();
+    if (known) mtrc_invoke_enqueue(endpoint, cluster, command, arg);
+    return known ? 1 : 0;
+  }
+}
+
+static matter_port_t mtrc_port;
+static bool mtrc_core_inited = false;   // matter_init() done — data model live
+static bool mtrc_started     = false;   // matter_start() done — advertising
+static bool mtrc_want_start  = false;   // a script asked to start; finish when mDNS is up
+
+// Commissioning window (web Bind/Unbind). Bind opens it for MTRC_BIND_WINDOW_S
+// seconds: the device accepts PASE and /mt shows the QR; on timeout (or Unbind)
+// it closes — QR hidden + PASE refused. mtrc_window_end is a millis() deadline.
+#ifndef MTRC_BIND_WINDOW_S
+#define MTRC_BIND_WINDOW_S  600          // 10 minutes
+#endif
+static uint32_t mtrc_window_end = 0;     // millis() deadline; 0 = window closed
+static bool mtrc_window_open(void) {
+  return mtrc_window_end != 0 && (int32_t)(mtrc_window_end - millis()) > 0;
+}
+static uint32_t mtrc_window_left_s(void) {
+  if (!mtrc_window_open()) return 0;
+  return (mtrc_window_end - millis()) / 1000;
+}
+
+// Initialize the Matter CORE once: wire the host port + matter_init() (seeds the
+// data model, loads persisted fabrics). Does NOT touch mDNS/UDP or advertise —
+// that is matterStart(). Called lazily from the mtr* syscalls, so a firmware
+// with Matter compiled-in costs nothing at runtime until a TinyC script uses it.
+static bool mtrc_ensure_inited(void) {
+  if (mtrc_core_inited) return true;
+  memset(&mtrc_port, 0, sizeof(mtrc_port));
+  mtrc_port.millis        = mtrc_p_millis;
+  mtrc_port.log           = mtrc_p_log;
+  mtrc_port.random_bytes  = mtrc_p_random;
+  mtrc_port.kv_get        = mtrc_p_kv_get;
+  mtrc_port.kv_set        = mtrc_p_kv_set;
+  mtrc_port.kv_del        = mtrc_p_kv_del;
+  mtrc_port.mdns_publish  = mtrc_p_mdns;
+  mtrc_port.mdns_remove   = mtrc_p_mdns_remove;
+  mtrc_port.udp_send      = mtrc_p_udp_send;
+  mtrc_port.on_attr_write = mtrc_p_on_attr_write;
+  mtrc_port.on_attr_read  = mtrc_p_on_attr_read;
+  mtrc_port.on_command    = mtrc_p_on_command;
+
+  matter_config_t cfg;
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.vendor_id     = 0xFFF1;          // Matter test VID
+  cfg.product_id    = 0x8000;
+  cfg.discriminator = 0x0A12;          // 2578 — unique, avoids old test-3840 phantom
+  cfg.passcode      = 13572468;        // unique non-trivial passcode
+  cfg.device_name   = TasmotaGlobal.hostname;
+
+  if (matter_init(&mtrc_port, &cfg) != MATTER_OK) return false;
+  mtrc_core_inited = true;
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: core init (data model live)"));
+  return true;
+}
+
+// Called every second: finishes a pending matterStart() once mDNS is ready. Does
+// NOTHING unless a script requested start (mtrc_want_start) — so an unused build
+// never enables mDNS, opens the UDP socket, or advertises.
+static void MatterC_MaybeStart(void) {
+  if (!mtrc_want_start || mtrc_started) return;
+  if (!mtrc_ensure_inited()) return;
+  // Matter on-network commissioning REQUIRES mDNS; SetOption55 defaults off.
+  if (!Settings->flag3.mdns_enabled) {
+    Settings->flag3.mdns_enabled = 1;
+    StartMdns();          // MDNS.begin(hostname)
+    return;               // let it settle; finish next tick
+  }
+  if (!Mdns.begun) { StartMdns(); return; }
+
+  // Listen on UDP 5540 for Matter operational/commissioning datagrams and
+  // pump them into the core. (onPacket runs in the async-tcpip task.)
+  if (!mtrc_udp_listening && mtrc_udp.listen(MTRC_COMMISSION_PORT_HOST)) {
+    mtrc_udp_listening = true;
+    mtrc_udp.onPacket([](AsyncUDPPacket p) {
+      // Matter commissioning/operational traffic from real controllers (Apple,
+      // chip-tool, Google) arrives over IPv6. AsyncUDP's remoteIP() returns
+      // 0.0.0.0 for IPv6 packets, so capture remoteIPv6() and reply there —
+      // otherwise our PASE/CASE responses go nowhere and the controller stalls.
+      mtrc_peer_ip   = p.isIPv6() ? p.remoteIPv6() : p.remoteIP();
+      mtrc_peer_port = p.remotePort();
+      if (p.isIPv6()) {                     // only trust reliably-IPv6 datagrams
+        mtrc_peer_ip6   = p.remoteIPv6();
+        mtrc_peer_port6 = p.remotePort();
+      }
+      // DO NOT call AddLog here — IPv6 toString() + vsnprintf overflows the
+      // AsyncTCP task's ~4 KB stack (see counter declarations above). Just
+      // bump cheap counters; main loop logs aggregates periodically.
+      mtrc_rx_pkts  += 1;
+      mtrc_rx_bytes += (uint32_t)p.length();
+      // Pass the datagram's own IPv6 source so the core can reply to the exact
+      // controller (Apple opens several sessions from different addresses).
+      // Only IPv6 is trusted (AsyncUDP mis-flags some v6 packets as v4); for a
+      // mis-flagged packet we pass zero -> the host falls back to last-good peer.
+      uint8_t ip6[16] = {0};
+      if (p.isIPv6()) { IPAddress a6 = p.remoteIPv6(); for (int i = 0; i < 16; i++) ip6[i] = a6[i]; }
+      matter_udp_rx(ip6, p.remotePort(), p.data(), p.length());
+    });
+    AddLog(LOG_LEVEL_INFO, PSTR("MTR: listening on UDP %u"), MTRC_COMMISSION_PORT_HOST);
+  }
+
+  matter_start();          // operational mDNS for fabrics; NOT pairable until Bind
+  mtrc_started = true;
+}
+
+// matterStart() backend: a TinyC script asked Matter to go live. Ensure the
+// core is inited, flag the request, and complete immediately if mDNS is already
+// up (else MatterC_MaybeStart finishes on the next tick). Returns 0 = accepted.
+static int mtrc_request_start(void) {
+  if (!mtrc_ensure_inited()) return -1;
+  mtrc_want_start = true;
+  MatterC_MaybeStart();
+  return 0;
+}
+
+// ---- Bind / Unbind (web) ----------------------------------------------
+// Bind: start Matter (if needed) and open the commissioning window for
+// MTRC_BIND_WINDOW_S — advertise commissionable (_matterc), accept PASE, show QR.
+static void mtrc_bind(void) {
+  mtrc_request_start();                 // ensure core + operational up
+  matter_open_commissioning_window();   // publish _matterc + accept PASE (sets commissionable)
+  mtrc_window_end = millis() + (uint32_t)MTRC_BIND_WINDOW_S * 1000;
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: Bind — commissioning window open %us"),
+         (unsigned)MTRC_BIND_WINDOW_S);
+}
+
+// Close the window: stop advertising commissionable + refuse new PASE (existing
+// fabrics / operational sessions are unaffected).
+static void mtrc_close_window(void) {
+  mtrc_window_end = 0;
+  matter_set_commissionable(0);
+  if (Mdns.begun) mdns_service_remove("_matterc", "_udp");   // stop being discoverable
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: commissioning window closed (QR expired)"));
+}
+
+// Unbind: leave all fabrics (factory reset) + close the window.
+static void mtrc_unbind(void) {
+  mtrc_ensure_inited();                 // load a persisted fabric so it can be wiped
+  matter_factory_reset();
+  mtrc_close_window();
+  AddLog(LOG_LEVEL_INFO, PSTR("MTR: Unbind — left all fabrics"));
+}
+
+// Unbind confirm + button markup, reused below.
+#define MTRC_UNBIND_BTN \
+  "<form action='/mt' method='get'><button name='unbind' value='1' " \
+  "onclick=\"return confirm('Remove this device from all Matter controllers?')\">" \
+  "Unbind</button></form>"
+
+static void HandleMatterQR(void) {
+  if (!mtrc_core_inited) {            // no TinyC script has defined a Matter device
+    WSContentStart_P(PSTR("Matter"));
+    WSContentSendStyle();
+    WSContentSend_P(PSTR("<div style='text-align:center'><h2>Matter</h2>"
+      "<p>No Matter device is defined. Add one from a TinyC script "
+      "(e.g. <b>matterAdd()</b> / <b>matterStart()</b>) — then Bind / Unbind "
+      "appear here.</p></div>"));
+    WSContentSpaceButton(BUTTON_MAIN);
+    WSContentStop();
+    return;
+  }
+  if (Webserver->hasArg(F("bind")))   mtrc_bind();      // open the pairing window
+  if (Webserver->hasArg(F("unbind"))) mtrc_unbind();    // leave all fabrics
+
+  bool open = mtrc_window_open();
+  uint32_t left = mtrc_window_left_s();
+
+  WSContentStart_P(PSTR("Matter Pairing"));
+  WSContentSendStyle();
+  WSContentSend_P(PSTR("<div style='text-align:center'><h2>Matter</h2>"));
+
+  if (open && matter_qr_uri()[0]) {
+    // Render the QR as an SVG ON THE DEVICE — no CDN / JS / internet needed.
+    int qn = matter_qr_size();
+    if (qn > 0) {
+      int q = 4, dim = qn + 2 * q;     // quiet zone
+      WSContentSend_P(PSTR("<svg xmlns='http://www.w3.org/2000/svg' width='240' height='240' "
+        "viewBox='0 0 %d %d' shape-rendering='crispEdges' style='background:#fff;padding:8px'>"
+        "<rect width='%d' height='%d' fill='#fff'/><g fill='#000'>"), dim, dim, dim, dim);
+      char row[640];
+      for (int y = 0; y < qn; y++) {
+        int p = 0; int x = 0;
+        while (x < qn) {
+          if (matter_qr_dark(x, y)) {
+            int w = 1; while (x + w < qn && matter_qr_dark(x + w, y)) w++;
+            if (p < (int)sizeof(row) - 48)
+              p += snprintf(row + p, sizeof(row) - p,
+                            "<rect x='%d' y='%d' width='%d' height='1'/>", x + q, y + q, w);
+            x += w;
+          } else x++;
+        }
+        if (p) WSContentSend_P(PSTR("%s"), row);
+      }
+      WSContentSend_P(PSTR("</g></svg>"));
+    }
+    WSContentSend_P(PSTR(
+      "<p style='font-size:24px;font-family:monospace;letter-spacing:4px'><b>%s</b></p>"
+      "<p>Scan with the Apple Home / Google Home / Alexa app</p>"
+      "<p style='color:#080'>Pairing window open — closes in <span id='cd'>%um %02us</span></p>"
+      "<p style='font-size:10px;color:#888'>%s</p>"),
+      matter_manual_code(), left / 60, left % 60, matter_qr_uri());
+    // Live countdown; when it hits 0 reload /mt -> window is closed, QR gone.
+    WSContentSend_P(PSTR("<script>var s=%u;function t(){var e=document.getElementById('cd');"
+      "if(s<=0){location.href='/mt';return;}"
+      "e.textContent=Math.floor(s/60)+'m '+('0'+(s%%60)).slice(-2)+'s';s--;"
+      "setTimeout(t,1000);}t();</script>"), left);
+    WSContentSend_P(PSTR(MTRC_UNBIND_BTN));
+  } else {
+    WSContentSend_P(PSTR("<p>Matter is %s.<br>Press <b>Bind</b> to open a %u-minute "
+      "pairing window and show the QR code.</p>"),
+      mtrc_started ? PSTR("running (not in pairing mode)") : PSTR("off"),
+      (unsigned)(MTRC_BIND_WINDOW_S / 60));
+    WSContentSend_P(PSTR("<form action='/mt' method='get'>"
+      "<button name='bind' value='1'>Bind — open %u min pairing</button></form>"),
+      (unsigned)(MTRC_BIND_WINDOW_S / 60));
+    WSContentSend_P(PSTR(MTRC_UNBIND_BTN));
+  }
+  WSContentSend_P(PSTR("</div>"));
+  WSContentSpaceButton(BUTTON_MAIN);
+  WSContentEnd();
+}
+#endif  // USE_MATTER_C
+
+// ---- Self-hosted IDE (optional -- #define USE_TINYC_IDE) ----
+// Port 80 /ide handler: on ESP32 with port-82 download server up, issues a
+// 302 redirect to port 82 /ide so the actual 150 KB streaming happens in a
+// dedicated FreeRTOS task (see tc_ide_serve_task) and doesn't block the main
+// HTTP loop. This eliminates the multi-second device stalls that occur when
+// loading the IDE while a TinyC script is running (file-I/O contention).
+//
+// Falls back to synchronous serving when port 82 isn't up yet (early boot
+// before WiFi connects) or on ESP8266 where the port-82 task pattern isn't
+// available.
+#ifdef USE_TINYC_IDE
+#ifdef USE_UFILESYS
+static void HandleTinyCIde(void) {
+  if (!ffsp && !ufsp) {
+    WSSend_P(503, PSTR("text/plain"), PSTR("Filesystem not available"));
+    return;
+  }
+
+#ifdef ESP32
+  // Fast path: redirect to port 82 background-task server. Returns
+  // immediately; main loop is freed for other work.
+  // Escape hatch: `/ide?direct=1` forces the synchronous fallback
+  // below even when dl_server is up. Useful when port 82 is blocked
+  // (VBox / corporate firewall / partial port-forward setups) and
+  // also for debugging the synchronous code path on real hardware.
+  bool skip_redirect = (Webserver->hasArg(F("direct")) &&
+                        Webserver->arg(F("direct")) != F("0"));
+  if (Tinyc && Tinyc->dl_server && !skip_redirect) {
+    // Format the IP manually — `%_I` is a Tasmota-custom format
+    // specifier that snprintf_P here doesn't expand (the override only
+    // applies in some translation units), so it leaked through as
+    // literal "_I" with a junk port. Use portable %u.%u.%u.%u
+    // instead. Bug: gemu's setup AND Andreas's VBox setup both saw
+    // `Location: http://_I:-1883461440/ide` with the regression
+    // introduced by commit bb72b46f7.
+    IPAddress ip = WiFi.localIP();
+    char loc[80];
+    snprintf_P(loc, sizeof(loc), PSTR("http://%u.%u.%u.%u:%d/ide"),
+               ip[0], ip[1], ip[2], ip[3], TC_DLPORT);
+    Webserver->sendHeader(F("Location"), loc);
+    WSSend_P(302, PSTR("text/plain"), PSTR("Redirecting to background IDE server"));
+    return;
+  }
+#endif
+
+  // Fallback: synchronous serve (used before port-82 server starts, or on
+  // ESP8266). Blocks the main loop for the duration of the file read.
+  bool gzipped = false;
+  File f;
+  if (ufsp) f = ufsp->open("/tinyc_ide.html.gz", "r");
+  if (f) {
+    gzipped = true;
+  } else {
+    if (ufsp) f = ufsp->open("/tinyc_ide.html", "r");
+    if (!f && ffsp && ffsp != ufsp) {
+      f = ffsp->open("/tinyc_ide.html.gz", "r");
+      if (f) {
+        gzipped = true;
+      } else {
+        f = ffsp->open("/tinyc_ide.html", "r");
+      }
+    }
+  }
+
+  if (!f) {
+    WSSend_P(404, PSTR("text/plain"), PSTR("TinyC IDE not found. Upload tinyc_ide.html.gz to filesystem."));
+    return;
+  }
+
+  uint32_t fsize = f.size();
+  if (gzipped) {
+    Webserver->sendHeader(F("Content-Encoding"), F("gzip"));
+  }
+  // Never cache the IDE — it's a fast-iterating dev tool. A prior
+  // max-age=600 on the port-82 path caused users to keep running a
+  // stale IDE for 10 min after a gz update (incl. window.open named-
+  // window reuse not reloading at all). Force a fresh fetch every time.
+  Webserver->sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  Webserver->setContentLength(fsize);
+  WSSend_P(200, PSTR("text/html"), PSTR(""));
+
+  uint8_t buf[256];
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n > 0) {
+      Webserver->client().write(buf, n);
+    }
+    yield();
+  }
+  f.close();
+}
+
+#endif  // USE_UFILESYS
+#endif  // USE_TINYC_IDE
+
+// ---- /cedit: serve sml_chart_editor.html from FS as inline text/html ----
+// Companion to tasmota/tinyc/utils/sml_chart_editor.html. The user uploads that
+// file (preferably .html.gz) to the device's filesystem, then visits
+// http://<device>/cedit and the page renders in the browser instead of being
+// downloaded — Tasmota's generic /ufsd?download= forces Content-Disposition
+// attachment, so a small inline-serving route is the simplest way to host the
+// editor on the device. Same-origin fetches from the editor hit /ufsd?download=
+// to load /sml_chart.bin, /ufsu to save, and /cm to restart the slot.
+#ifdef USE_UFILESYS
+static void HandleSmlChartEditor(void) {
+  if (!ffsp && !ufsp) {
+    WSSend_P(503, PSTR("text/plain"), PSTR("Filesystem not available"));
+    return;
+  }
+  bool gzipped = false;
+  File f;
+  if (ufsp) f = ufsp->open("/sml_chart_editor.html.gz", "r");
+  if (f) {
+    gzipped = true;
+  } else {
+    if (ufsp) f = ufsp->open("/sml_chart_editor.html", "r");
+    if (!f && ffsp && ffsp != ufsp) {
+      f = ffsp->open("/sml_chart_editor.html.gz", "r");
+      if (f) gzipped = true;
+      else f = ffsp->open("/sml_chart_editor.html", "r");
+    }
+  }
+  if (!f) {
+    WSSend_P(404, PSTR("text/plain"), PSTR(
+      "sml_chart_editor not found on the filesystem. Upload "
+      "sml_chart_editor.html.gz (or .html) — see "
+      "tasmota/tinyc/utils/sml_chart_editor.md."));
+    return;
+  }
+  uint32_t fsize = f.size();
+  if (gzipped) {
+    Webserver->sendHeader(F("Content-Encoding"), F("gzip"));
+  }
+  Webserver->sendHeader(F("Cache-Control"), F("no-cache, no-store, must-revalidate"));
+  Webserver->setContentLength(fsize);
+  WSSend_P(200, PSTR("text/html"), PSTR(""));
+  uint8_t buf[256];
+  while (f.available()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n > 0) Webserver->client().write(buf, n);
+    yield();
+  }
+  f.close();
+}
+#endif  // USE_UFILESYS
+
+// ---- WebUI: shared sv= parameter handler ----
+
+// Process sv= widget value updates from AJAX requests
+// Format: sv=gidx_value | sv=gidx_s_string | sv=gidx_t_HH:MM
+// Uses slot 0 for globals access (WebUI is bound to slot 0)
+// `slot_idx` is the slot that owns the WebUI/WebPage being rendered.
+// /tc_ui resolves it from page_slot[]; the main-page path passes 0. A
+// hardcoded slot 0 here silently dropped every widget write for any
+// script not running in slot 0 (widgets render from the owning slot but
+// writes landed in slot 0 → "WebUI does nothing"). Takes an index, not
+// a TcSlot* — a pointer param breaks Arduino's auto-prototype (TcSlot
+// is declared later than the generated forward decl in tasmota.ino).
+static void TinyC_WebSetVar(uint8_t slot_idx) {
+  if (!Tinyc) return;
+  if (slot_idx >= TC_MAX_VMS) return;
+  TcSlot *s = Tinyc->slots[slot_idx];
+  if (!s || !s->loaded) return;
+  if (!Webserver->hasArg(F("sv"))) return;
+
+  String sv = Webserver->arg(F("sv"));
+  int sep = sv.indexOf('_');
+  if (sep > 0) {
+    int32_t gidx = sv.substring(0, sep).toInt();
+    String val = sv.substring(sep + 1);
+    if (gidx >= 0 && gidx < TC_MAX_GLOBALS) {
+      if (val.startsWith("s_")) {
+        // String value: write chars as int32 into globals[gidx..]
+        const char *str = val.c_str() + 2;
+        int32_t maxLen = TC_MAX_GLOBALS - gidx - 1;
+        int i;
+        for (i = 0; i < maxLen && str[i]; i++) {
+          s->vm.globals[gidx + i] = (int32_t)(uint8_t)str[i];
+        }
+        s->vm.globals[gidx + i] = 0;  // null terminate
+      } else if (val.startsWith("t_")) {
+        // Time value: HH:MM -> HHMM integer
+        const char *ts = val.c_str() + 2;
+        int hh = 0, mm = 0;
+        sscanf(ts, "%d:%d", &hh, &mm);
+        s->vm.globals[gidx] = hh * 100 + mm;
+      } else {
+        int32_t newval = val.toInt();
+        int32_t oldval = s->vm.globals[gidx];
+        // Watch-aware write: if `gidx` is a `watch` global, also bumps
+        // shadow (gidx+1 = oldval) and written-flag (gidx+2 = 1) so that
+        // EverySecond's `written(var)` / `changed(var)` intrinsics see the
+        // external write. Plain (non-watch) globals: same as a raw write.
+        tc_global_write_with_watch(&s->vm, (uint16_t)gidx, newval, oldval);
+        // Dispatch TouchButton callback when a webButton value changes
+        if (newval != oldval) {
+          tinyc_touch_button((uint8_t)gidx, (int16_t)newval);
+        }
+      }
+    }
+  }
+}
+
+// ---- Display framebuffer mirror ----
+#ifdef USE_DISPLAY
+
+// Serve raw framebuffer binary: 8-byte header + raw pixel data
+static bool tc_mirror_busy = false;
+
+static void HandleTinyCDisplayRaw(void) {
+  // Reject if a previous transfer is still in progress
+  if (tc_mirror_busy) {
+    Webserver->send(503, "text/plain", "Busy");
+    return;
+  }
+  if (!renderer) {
+    Webserver->send(503, "text/plain", "No display");
+    return;
+  }
+  tc_mirror_busy = true;
+  tc_global_pause = true;   // pause VM during framebuffer read
+  delay(0);  // yield to let VM finish current cycle
+
+#ifdef USE_TINYC_LVGL
+  // LVGL active: mirror the LVGL screen via an on-demand RGB565 snapshot. LVGL
+  // renders in PARTIAL mode (no full panel framebuffer) and renderer->framebuffer
+  // is null on HW-DMA panels, so lv_snapshot of the active screen is the only way.
+  if (tc_lvgl_active()) {
+    uint8_t *sdata; uint16_t sw, sh; void *shandle;
+    if (tc_lvgl_snapshot(&sdata, &sw, &sh, &shandle)) {
+      uint32_t lv_fb_size = (uint32_t)sw * sh * 2;   // RGB565, 2 bytes/px
+      uint8_t lh[8];
+      lh[0] = sw & 0xFF; lh[1] = (sw >> 8) & 0xFF;
+      lh[2] = sh & 0xFF; lh[3] = (sh >> 8) & 0xFF;
+      lh[4] = 16;        // bpp 16 (RGB565)
+      lh[5] = 0;         // swap=0, rot=0 — snapshot is already in logical orientation
+      lh[6] = 0; lh[7] = 0;
+      Webserver->sendHeader(F("Connection"), F("close"));
+      Webserver->setContentLength(8 + lv_fb_size);
+      Webserver->send(200, F("application/octet-stream"), "");
+      WiFiClient lc = Webserver->client();
+      lc.setNoDelay(true); lc.setTimeout(5);
+      lc.write(lh, 8);
+      uint32_t lsent = 0;
+      while (lsent < lv_fb_size) {
+        if (!lc.connected()) break;
+        uint32_t chunk = lv_fb_size - lsent; if (chunk > 512) chunk = 512;
+        lc.write(sdata + lsent, chunk);
+        lsent += chunk; yield();
+      }
+      lc.flush(); delay(50); lc.stop();
+      tc_lvgl_snapshot_free(shandle);
+      tc_mirror_busy = false;
+      tc_global_pause = false;
+      return;
+    }
+    // snapshot failed — fall through to the framebuffer path below
+  }
+#endif
+
+  int8_t bpp = renderer->disp_bpp;
+  uint8_t *fb = renderer->framebuffer;
+  uint16_t *rgb = renderer->rgb_fb;
+  // Validate pointers — reject garbage values (valid ESP32 heap/PSRAM >= 0x3C000000)
+  if (fb && (uintptr_t)fb < 0x3C000000) fb = nullptr;
+  if (rgb && (uintptr_t)rgb < 0x3C000000) rgb = nullptr;
+
+  // Derive raw (unrotated) dimensions from rotated width/height + rotation.
+  // Use Tasmota's authoritative Settings->display_rotate instead of
+  // renderer->getRotation(): for EPD panels, the renderer's internal rotation
+  // field can stay 0 even when DisplayRotate=1 puts the renderer dims into
+  // landscape (the framebuffer is still physically laid out in panel-native
+  // orientation, so we need DisplayRotate to know which way to un-rotate the
+  // logical width()/height() back to the raw fb stride). Verified on .122
+  // (E-PAPER-29-V1, DisplayRotate=1: width()=296 height()=128 getRotation()=0
+  // but fb on the wire is 128-wide × 296-tall — the JS client was decoding it
+  // with stride 296 and showing rotated-but-garbled pixels).
+  uint8_t rot = Settings->display_rotate & 3;
+  uint16_t rw, rh;  // raw framebuffer dimensions
+  if (rot == 0 || rot == 2) {
+    rw = renderer->width();
+    rh = renderer->height();
+  } else {
+    rw = renderer->height();
+    rh = renderer->width();
+  }
+
+  // Compute framebuffer data size
+  uint32_t fb_size = 0;
+  uint8_t *data_ptr = nullptr;
+  int8_t abs_bpp = abs(bpp);
+
+  if (abs_bpp == 16 && rgb) {
+    fb_size = (uint32_t)rw * rh * 2;
+    data_ptr = (uint8_t *)rgb;
+  } else if (abs_bpp == 4 && fb) {
+    fb_size = (uint32_t)rw * rh / 2;
+    data_ptr = fb;
+  } else if (abs_bpp == 1 && fb) {
+    if (bpp == -1) {
+      fb_size = (uint32_t)rw * ((rh + 7) / 8);  // column-major
+    } else {
+      fb_size = ((uint32_t)rw * rh + 7) / 8;     // row-major
+    }
+    data_ptr = fb;
+  }
+
+  if (!data_ptr || fb_size == 0) {
+    Webserver->send(503, "text/plain", "Unsupported bpp");
+    tc_mirror_busy = false;
+    tc_global_pause = false;
+    return;
+  }
+
+#ifdef ESP32
+  // Large RGB framebuffers (>32KB): downsample + stream from SRAM
+  // Scale factor: 2=half (400x240=192KB), 1=full (800x480=768KB)
+  #define DISPLAY_MIRROR_SCALE 2
+  if (abs_bpp == 16 && rgb && fb_size > 32768) {
+    uint16_t dw = rw / DISPLAY_MIRROR_SCALE;
+    uint16_t dh = rh / DISPLAY_MIRROR_SCALE;
+    uint32_t line_bytes = dw * 2;
+    uint32_t ds = (uint32_t)dw * dh * 2;
+
+    uint8_t header[8];
+    header[0] = dw & 0xFF;
+    header[1] = (dw >> 8) & 0xFF;
+    header[2] = dh & 0xFF;
+    header[3] = (dh >> 8) & 0xFF;
+    header[4] = (uint8_t)bpp;
+    header[5] = (renderer->lvgl_param.swap_color ? 1 : 0) | ((rot & 3) << 2);
+    header[6] = 0;
+    header[7] = 0;
+
+    // Connection: close ensures client doesn't try keep-alive (Core 3 lwIP fix)
+    Webserver->sendHeader(F("Connection"), F("close"));
+    Webserver->setContentLength(8 + ds);
+    Webserver->send(200, F("application/octet-stream"), "");
+    WiFiClient client = Webserver->client();
+    client.setNoDelay(true);
+    client.setTimeout(5);
+    client.write(header, 8);
+
+    // Batch buffer in internal SRAM — 16 lines at a time reduces TCP write count
+    // 2:1: 16 lines × 400 pixels × 2 bytes = 12800 bytes
+    const uint16_t BATCH = 16;
+    uint32_t batch_bytes = line_bytes * BATCH;
+    uint8_t *buf = (uint8_t *)heap_caps_malloc(batch_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!buf) { buf = (uint8_t *)malloc(batch_bytes); }
+    if (!buf) { tc_mirror_busy = false; tc_global_pause = false; return; }
+
+    uint16_t lines_done = 0;
+    for (uint16_t y = 0; y < rh; y += DISPLAY_MIRROR_SCALE) {
+      if (!client.connected()) break;
+      uint16_t *src = rgb + (uint32_t)y * rw;
+      uint16_t *dst = (uint16_t *)(buf + lines_done * line_bytes);
+      for (uint16_t x = 0; x < rw; x += DISPLAY_MIRROR_SCALE) {
+        *dst++ = src[x];
+      }
+      lines_done++;
+      if (lines_done >= BATCH) {
+        client.write(buf, lines_done * line_bytes);
+        lines_done = 0;
+        delay(5);
+      }
+    }
+    if (lines_done > 0 && client.connected()) {
+      client.write(buf, lines_done * line_bytes);
+    }
+    free(buf);
+    delay(50);  // let last write drain
+    // SO_LINGER{1,0} sends RST → no TIME_WAIT socket accumulation
+    struct linger lin = {1, 0};
+    setsockopt(client.fd(), SOL_SOCKET, SO_LINGER, &lin, sizeof(lin));
+    client.stop();
+    tc_mirror_busy = false;
+    tc_global_pause = false;
+    return;
+  }
+#endif  // ESP32 — large RGB framebuffers
+
+  // Small framebuffers (EPD, OLED) — send full resolution
+  // 8-byte header
+  uint8_t header[8];
+  header[0] = rw & 0xFF;
+  header[1] = (rw >> 8) & 0xFF;
+  header[2] = rh & 0xFF;
+  header[3] = (rh >> 8) & 0xFF;
+  header[4] = (uint8_t)bpp;
+  header[5] = (renderer->lvgl_param.swap_color ? 1 : 0) | ((rot & 3) << 2);
+  header[6] = 0;
+  header[7] = 0;
+
+  uint32_t total = 8 + fb_size;
+  Webserver->sendHeader(F("Connection"), F("close"));
+  Webserver->setContentLength(total);
+  Webserver->send(200, F("application/octet-stream"), "");
+
+  WiFiClient client = Webserver->client();
+  client.setNoDelay(true);
+  client.setTimeout(5);
+  client.write(header, 8);
+
+  // Stream in chunks with yield, checking client is still connected
+  uint32_t sent = 0;
+  while (sent < fb_size) {
+    if (!client.connected()) break;
+    uint32_t chunk = fb_size - sent;
+    if (chunk > 512) chunk = 512;
+    client.write(data_ptr + sent, chunk);
+    sent += chunk;
+    yield();
+  }
+  client.flush();
+  delay(50);
+  client.stop();
+  tc_mirror_busy = false;
+  tc_global_pause = false;
+}
+
+// Serve self-contained HTML/JS display snapshot page
+// Single fetch on page load, manual Refresh button, CSS scale for viewing
+static void HandleTinyCDisplayHTML(void) {
+  Webserver->setContentLength(CONTENT_LENGTH_UNKNOWN);
+  Webserver->send(200, F("text/html"), "");
+
+  Webserver->sendContent_P(PSTR(
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<meta name='viewport' content='width=device-width'>"
+    "<title>Display Mirror</title>"
+    "<style>"
+    "body{background:#111;color:#ddd;font-family:sans-serif;margin:20px;text-align:center}"
+    "canvas{border:1px solid #444}"
+    ".ctrl{margin:10px;display:flex;justify-content:center;gap:10px;align-items:center;flex-wrap:wrap}"
+    "button{padding:6px 16px;border:none;border-radius:4px;cursor:pointer;background:#47c266;color:#fff}"
+    "select{padding:4px 8px;border-radius:4px;border:1px solid #444;background:#222;color:#ddd}"
+    "#st{font-size:.85em;opacity:.7;margin:8px}"
+    "</style></head><body>"
+    "<h2>Display Mirror</h2>"
+    "<canvas id='c'></canvas>"
+    "<div id='st'>Loading...</div>"
+    "<div class='ctrl'>"
+    "<button onclick='go()'>Refresh</button>"
+    "<label>Scale: <select id='sc' onchange='rsc()'>"
+    "<option value='1'>1x</option>"
+    "<option value='2' selected>2x</option>"
+    "<option value='4'>4x</option>"
+    "</select></label>"
+    "<button onclick='dl()'>Save PNG</button>"
+    "</div>"
+  ));
+
+  // JavaScript
+  Webserver->sendContent_P(PSTR(
+    "<script>"
+    "var cv=document.getElementById('c'),cx=cv.getContext('2d');"
+    "function rsc(){"
+    "if(cv.width&&cv.height){var s=+document.getElementById('sc').value;"
+    "cv.style.width=(cv.width*s)+'px';cv.style.height=(cv.height*s)+'px';}}"
+    "function dl(){try{"
+    "if(!cv.width){return;}"
+    "var s=+document.getElementById('sc').value;"
+    "var t=document.createElement('canvas');t.width=cv.width*s;t.height=cv.height*s;"
+    "var tx=t.getContext('2d');tx.imageSmoothingEnabled=false;"
+    "tx.drawImage(cv,0,0,t.width,t.height);"
+    "var a=document.createElement('a');a.download='display.png';"
+    "a.href=t.toDataURL('image/png');a.click();"
+    "}catch(e){document.getElementById('st').textContent='Save failed: '+e;}}"
+  ));
+
+  // Pixel decoders per bpp
+  Webserver->sendContent_P(PSTR(
+    "function src(dx,dy,w,h,rot){"
+    "if(rot==0)return[dx,dy];"
+    "if(rot==1)return[w-1-dy,dx];"
+    "if(rot==2)return[w-1-dx,h-1-dy];"
+    "return[dy,h-1-dx];}"
+
+    "function d1c(px,raw,w,h,dw,dh,rot,inv){"
+    "for(var dy=0;dy<dh;dy++)for(var dx=0;dx<dw;dx++){"
+    "var s=src(dx,dy,w,h,rot),sx=s[0],sy=s[1];"
+    "var v=(raw[sx+(sy>>3)*w]>>(sy&7))&1;"
+    "if(inv)v=1-v;v=v?255:0;var p=(dy*dw+dx)*4;"
+    "px[p]=v;px[p+1]=v;px[p+2]=v;px[p+3]=255;}}"
+
+    "function d1r(px,raw,w,h,dw,dh,rot,inv){"
+    "for(var dy=0;dy<dh;dy++)for(var dx=0;dx<dw;dx++){"
+    "var s=src(dx,dy,w,h,rot),sx=s[0],sy=s[1];"
+    "var i=sx+sy*w,v=(raw[i>>3]>>(7-(i&7)))&1;"
+    "if(inv)v=1-v;v=v?255:0;var p=(dy*dw+dx)*4;"
+    "px[p]=v;px[p+1]=v;px[p+2]=v;px[p+3]=255;}}"
+  ));
+
+  Webserver->sendContent_P(PSTR(
+    "function d4(px,raw,w,h,dw,dh,rot){"
+    "for(var dy=0;dy<dh;dy++)for(var dx=0;dx<dw;dx++){"
+    "var s=src(dx,dy,w,h,rot),sx=s[0],sy=s[1];"
+    "var bi=Math.floor((sy*w+sx)/2),v;"
+    "if((sx+sy*w)%2==0)v=raw[bi]&0xf;else v=(raw[bi]>>4)&0xf;"
+    "v=v*17;var p=(dy*dw+dx)*4;"
+    "px[p]=v;px[p+1]=v;px[p+2]=v;px[p+3]=255;}}"
+
+    "function d16(px,raw,w,h,dw,dh,rot,sw){"
+    "for(var dy=0;dy<dh;dy++)for(var dx=0;dx<dw;dx++){"
+    "var s=src(dx,dy,w,h,rot),sx=s[0],sy=s[1];"
+    "var oi=(sy*w+sx)*2,lo=raw[oi],hi=raw[oi+1],c;"
+    "if(sw)c=(lo<<8)|hi;else c=(hi<<8)|lo;"
+    "var p=(dy*dw+dx)*4;"
+    "px[p]=((c>>11)&0x1f)<<3;px[p+1]=((c>>5)&0x3f)<<2;"
+    "px[p+2]=(c&0x1f)<<3;px[p+3]=255;}}"
+  ));
+
+  // Single fetch — runs on page load, Refresh button calls go() again
+  Webserver->sendContent_P(PSTR(
+    "async function go(){"
+    "document.getElementById('st').textContent='Loading...';"
+    "try{"
+    "var ac=new AbortController();"
+    "var to=setTimeout(function(){ac.abort();},30000);"
+    "var r=await fetch('/tc_display?raw=1',{signal:ac.signal});"
+    "clearTimeout(to);"
+    "if(!r.ok)throw 'HTTP '+r.status;"
+    "var ab=await r.arrayBuffer(),dv=new DataView(ab);"
+    "var w=dv.getUint16(0,1),h=dv.getUint16(2,1),"
+    "bpp=dv.getInt8(4),fl=dv.getUint8(5);"
+    "var sw=fl&1,rot=(fl>>2)&3;"
+    "var dw,dh;"
+    "if(rot==1||rot==3){dw=h;dh=w;}else{dw=w;dh=h;}"
+    "cv.width=dw;cv.height=dh;"
+    "var id=cx.createImageData(dw,dh),px=id.data;"
+    "var raw=new Uint8Array(ab,8);"
+    "if(bpp==-1)d1c(px,raw,w,h,dw,dh,rot,0);"
+    "else if(bpp==1)d1r(px,raw,w,h,dw,dh,rot,0);"
+    "else if(Math.abs(bpp)==4)d4(px,raw,w,h,dw,dh,rot);"
+    "else if(bpp==16)d16(px,raw,w,h,dw,dh,rot,sw);"
+    "cx.putImageData(id,0,0);"
+    "rsc();"
+    "document.getElementById('st').textContent="
+    "dw+'x'+dh+' bpp='+bpp;"
+    "}catch(e){"
+    "document.getElementById('st').textContent='Error: '+e;}}"
+    "go();"
+    "</script></body></html>"
+  ));
+
+  Webserver->sendContent("");
+}
+
+// Dispatch: HTML viewer page or raw binary data
+static void HandleTinyCDisplay(void) {
+  if (!HttpCheckPriviledgedAccess()) return;
+
+  Renderer *r = renderer;  // snapshot pointer
+  if (!r) {
+    Webserver->send(503, "text/plain", "No display");
+    return;
+  }
+  // Validate framebuffer pointers — rgb_fb may contain uninitialized garbage
+  // on displays where the LCD peripheral manages DMA buffers directly.
+  // Valid ESP32 heap pointers are >= 0x3C000000.
+  uint8_t *fb = r->framebuffer;
+  uint16_t *rgb = r->rgb_fb;
+  bool fb_ok = fb && ((uintptr_t)fb >= 0x3C000000);
+  bool rgb_ok = rgb && ((uintptr_t)rgb >= 0x3C000000);
+  bool lvgl_on = false;
+#ifdef USE_TINYC_LVGL
+  lvgl_on = tc_lvgl_active();   // LVGL mirrors via an on-demand screen snapshot
+#endif
+  if (!fb_ok && !rgb_ok && !lvgl_on) {
+    Webserver->send(503, "text/plain", "No framebuffer (display uses HW DMA)");
+    return;
+  }
+
+  if (Webserver->hasArg(F("raw"))) {
+    HandleTinyCDisplayRaw();
+  } else {
+    HandleTinyCDisplayHTML();
+  }
+}
+
+#endif  // USE_DISPLAY
+
+// ---- Custom web handlers (webOn) -- uses slot 0 ----
+
+// A slot running a TaskLoop (Modbus/BYD polls etc.) is only sub-ms
+// non-halted; returning 503 immediately gave a "TinyC not ready"
+// white page on every page-switch. Wait briefly for halted instead.
+#ifndef TC_WEBON_HALTED_WAIT_MS
+#define TC_WEBON_HALTED_WAIT_MS 1500
+#endif
+
+// When the halted-wait above expires, return an HTML page with a
+// meta-refresh instead of a plain-text 503. The browser auto-reloads
+// after 1 s — by then the previous webOn render is essentially always
+// done. Removes the "TinyC busy (timeout)" stutter when the user clicks
+// through several /tcN routes quickly. (Andreas FYI 2026-05-20 22:07.)
+static const char TC_BUSY_HTML[] PROGMEM =
+  "<!DOCTYPE html><html><head>"
+  "<meta http-equiv=\"refresh\" content=\"1\">"
+  "<title>TinyC busy</title></head>"
+  "<body>TinyC busy &mdash; reloading in 1 s ...</body></html>";
+
+static void HandleTinyCWebOn(uint8_t handler_num) {
+  if (!Tinyc) { Webserver->send(503, "text/plain", "TinyC not ready"); return; }
+  TcSlot *s = Tinyc->slots[0];
+  if (!s || !s->loaded || s->vm.error != TC_OK) {     // truly fatal
+    Webserver->send(503, "text/plain", "TinyC not ready");
+    return;
+  }
+  { uint32_t _t0 = millis();
+    while (!s->vm.halted && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
+      delay(20); yield();
+    } }
+  if (!s->vm.halted) {
+    Webserver->send_P(503, PSTR("text/html"), TC_BUSY_HTML);
+    return;
+  }
+  Tinyc->current_web_handler = handler_num;
+  Tinyc->web_content_begun   = 0;
+  Tinyc->web_raw_active      = 0;
+#ifdef USE_HTTP_KEEPALIVE
+  // Per-request opt-in: handler must call webKeepAlive() each iteration
+  // to keep the TCP socket open. Reset here so a previously kept-alive
+  // request doesn't carry its flag into the next request handler.
+  if (Webserver) Webserver->setKeepAlive(false);
+#endif
+
+  // WSContentBegin + CORS are now LAZY: triggered on the first webSend()
+  // call inside the callback (see SYS_WEB_SEND / SYS_WEB_SEND_STR). This
+  // lets raw-mode handlers — those that call webRawMode() and write the
+  // full HTTP response via webRawWrite() — bypass Tasmota's chunked
+  // text/html wrapping entirely. Motivating use case: emulating storage
+  // devices whose firmware expects an exact 3-header EcoTracker response
+  // (HTTP/1.1 200 OK + Content-Type + Content-Length, nothing else) plus
+  // a kept-alive TCP socket — Jackery Homepower 2000 Ultra and friends.
+  // Existing webOn scripts that just call webSend() see byte-identical
+  // wire format vs. the old eager-WSContentBegin path.
+  tc_slot_callback(s, "WebOn");
+
+  if (Tinyc->web_content_begun) {
+    WSContentEnd();
+  } else if (!Tinyc->web_raw_active) {
+    // Handler called neither webSend() nor webRaw*() — preserve the
+    // pre-lazy-begin behaviour of emitting an empty-body chunked
+    // response so scripts that register an endpoint without producing
+    // content (rare but legitimate, e.g. side-effect-only triggers)
+    // don't regress to "client gets nothing on the wire".
+    TCSendCORS("GET, POST, OPTIONS");
+    WSContentBegin(200, CT_HTML);
+    WSContentEnd();
+  }
+  Tinyc->current_web_handler = 0;
+}
+
+static void HandleTinyCWebOn1(void) { HandleTinyCWebOn(1); }
+static void HandleTinyCWebOn2(void) { HandleTinyCWebOn(2); }
+static void HandleTinyCWebOn3(void) { HandleTinyCWebOn(3); }
+static void HandleTinyCWebOn4(void) { HandleTinyCWebOn(4); }
+static void HandleTinyCWebOn5(void) { HandleTinyCWebOn(5); }
+static void HandleTinyCWebOn6(void) { HandleTinyCWebOn(6); }
+static void HandleTinyCWebOn7(void) { HandleTinyCWebOn(7); }
+
+// ---- Camera JPEG endpoint: /tc_cam?slot=N — serve PSRAM slot directly ----
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+static void HandleTinyCCam(void) {
+  int slot = 1;  // default slot 1
+  if (Webserver->hasArg("slot")) {
+    slot = Webserver->arg("slot").toInt();
+  }
+  if (slot < 1 || slot > TC_CAM_MAX_SLOTS) {
+    Webserver->send(400, "text/plain", "invalid slot");
+    return;
+  }
+  int idx = slot - 1;
+  if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
+    Webserver->send(503, "text/plain", "no image");
+    return;
+  }
+  Webserver->sendHeader("Cache-Control", "no-cache, no-store");
+  Webserver->send_P(200, "image/jpeg", (const char*)tc_cam_slot[idx].buf, tc_cam_slot[idx].len);
+}
+
+// ---- MJPEG streaming server on port 81 ----
+
+static void TC_CamStreamHandler(void) {
+  tc_cam_stream.stream_active = 1;
+  tc_cam_stream.client = tc_cam_stream.server->client();
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: stream client connected"));
+}
+
+static void TC_CamStreamRoot(void) {
+  tc_cam_stream.server->sendHeader("Location", "/cam.mjpeg");
+  tc_cam_stream.server->send(302, "", "");
+}
+
+static void TC_CamStreamTask(void) {
+  if (!tc_cam_stream.client.connected()) {
+    tc_cam_stream.stream_active = 0;
+    return;
+  }
+  if (1 == tc_cam_stream.stream_active) {
+    tc_cam_stream.client.flush();
+    tc_cam_stream.client.setNoDelay(true);
+    tc_cam_stream.client.setTimeout(1);
+    tc_cam_stream.client.print("HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace;boundary=" TC_CAM_BOUNDARY "\r\n"
+      "\r\n");
+    tc_cam_stream.stream_active = 2;
+  }
+  if (2 == tc_cam_stream.stream_active) {
+    // Copy frame to send buffer first (slot may be overwritten during slow TCP send)
+    if (!tc_cam_slot[0].buf || tc_cam_slot[0].len == 0 || tc_cam_slot[0].writing) return;
+    uint32_t len = tc_cam_slot[0].len;
+    // (Re)allocate send buffer if needed
+    if (!tc_cam_stream.send_buf || tc_cam_stream.send_alloc < len) {
+      if (tc_cam_stream.send_buf) free(tc_cam_stream.send_buf);
+      tc_cam_stream.send_buf = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      tc_cam_stream.send_alloc = tc_cam_stream.send_buf ? len : 0;
+    }
+    if (!tc_cam_stream.send_buf) return;
+    memcpy(tc_cam_stream.send_buf, tc_cam_slot[0].buf, len);
+    tc_cam_stream.send_len = len;
+    // Send from the copy — safe even if slot gets overwritten now
+    tc_cam_stream.client.print("--" TC_CAM_BOUNDARY "\r\n");
+    tc_cam_stream.client.printf("Content-Type: image/jpeg\r\nContent-Length: %d\r\n\r\n",
+      (int)tc_cam_stream.send_len);
+    tc_cam_stream.client.write(tc_cam_stream.send_buf, tc_cam_stream.send_len);
+    tc_cam_stream.client.print("\r\n");
+  }
+  if (0 == tc_cam_stream.stream_active) {
+    tc_cam_stream.client.flush();
+    tc_cam_stream.client.stop();
+    AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: stream client disconnected"));
+  }
+}
+
+void TC_CamStreamInit(void) {
+  if (tc_cam_stream.server) return;  // already running
+  // Defer if WiFi not ready (early boot autoexec)
+  if (!WifiHasIP()) {
+    tc_cam_stream.pending = 1;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: stream server deferred (no WiFi)"));
+    return;
+  }
+  tc_cam_stream.pending = 0;
+  tc_cam_stream.stream_active = 0;
+  tc_cam_stream.server = new ESP8266WebServer(TC_CAM_STREAM_PORT);
+  if (tc_cam_stream.server) {
+    tc_cam_stream.server->on("/", TC_CamStreamRoot);
+    tc_cam_stream.server->on("/cam.mjpeg", TC_CamStreamHandler);
+    tc_cam_stream.server->on("/cam.jpg", TC_CamStreamHandler);
+    tc_cam_stream.server->on("/stream", TC_CamStreamHandler);
+    tc_cam_stream.server->begin();
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: MJPEG stream server on port %d"), TC_CAM_STREAM_PORT);
+  }
+}
+
+void TC_CamStreamStop(void) {
+  if (tc_cam_stream.server) {
+    tc_cam_stream.stream_active = 0;
+    tc_cam_stream.server->stop();
+    delete tc_cam_stream.server;
+    tc_cam_stream.server = nullptr;
+    if (tc_cam_stream.send_buf) { free(tc_cam_stream.send_buf); tc_cam_stream.send_buf = nullptr; }
+    tc_cam_stream.send_len = 0;
+    tc_cam_stream.send_alloc = 0;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: stream server stopped"));
+  }
+}
+
+static void TC_CamStreamLoop(void) {
+  // Deferred init: create server once WiFi is ready
+  if (tc_cam_stream.pending && !tc_cam_stream.server && WifiHasIP()) {
+    TC_CamStreamInit();
+  }
+  if (tc_cam_stream.server) {
+    tc_cam_stream.server->handleClient();
+    if (tc_cam_stream.stream_active) { TC_CamStreamTask(); }
+  }
+}
+
+// ---- Motion detection (frame-diff from PSRAM slot 0) ----
+
+static void TC_CamMotionDetect(void) {
+  if (!tc_cam_motion.interval_ms) return;
+  if ((millis() - tc_cam_motion.last_time) < tc_cam_motion.interval_ms) return;
+  tc_cam_motion.last_time = millis();
+
+  // Need a valid JPEG in slot 0 with known dimensions, not currently being written
+  if (!tc_cam_slot[0].buf || tc_cam_slot[0].len == 0 ||
+      tc_cam_slot[0].width == 0 || tc_cam_slot[0].height == 0 ||
+      tc_cam_slot[0].writing) return;
+
+  uint32_t w = tc_cam_slot[0].width;
+  uint32_t h = tc_cam_slot[0].height;
+  uint32_t pixels = w * h;
+
+  // Decode JPEG to RGB888 in temp buffer
+  uint8_t *rgb = (uint8_t*)heap_caps_malloc(pixels * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!rgb) return;
+
+#if defined(CONFIG_IDF_TARGET_ESP32P4)
+  // P4 has no DVP fmt2rgb888 software decoder; motion-detect via JPEG decode is
+  // a TODO on the HW jpeg_decode engine. Skip for now (capture/save still work).
+  free(rgb);
+  return;
+#else
+  if (!fmt2rgb888(tc_cam_slot[0].buf, tc_cam_slot[0].len, PIXFORMAT_JPEG, rgb)) {
+    free(rgb);
+    return;
+  }
+#endif
+
+  // Allocate reference buffer if needed
+  if (!tc_cam_motion.ref_buf || tc_cam_motion.ref_size != pixels) {
+    if (tc_cam_motion.ref_buf) free(tc_cam_motion.ref_buf);
+    tc_cam_motion.ref_buf = (uint8_t*)heap_caps_malloc(pixels, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    tc_cam_motion.ref_size = pixels;
+    if (tc_cam_motion.ref_buf) {
+      // First frame — fill reference, no comparison
+      uint8_t *pxi = rgb;
+      for (uint32_t i = 0; i < pixels; i++) {
+        tc_cam_motion.ref_buf[i] = (pxi[0] + pxi[1] + pxi[2]) / 3;
+        pxi += 3;
+      }
+    }
+    free(rgb);
+    return;
+  }
+
+  // Compare with reference
+  uint64_t accu = 0;
+  uint64_t bright = 0;
+  uint8_t *pxi = rgb;
+  uint8_t *pxr = tc_cam_motion.ref_buf;
+  for (uint32_t i = 0; i < pixels; i++) {
+    int32_t gray = (pxi[0] + pxi[1] + pxi[2]) / 3;
+    int32_t lgray = pxr[0];
+    pxr[0] = gray;
+    pxi += 3;
+    pxr++;
+    accu += abs(gray - lgray);
+    bright += gray;
+  }
+  free(rgb);
+
+  uint32_t divider = pixels / 100;
+  if (divider == 0) divider = 1;
+  tc_cam_motion.motion_trigger = (uint32_t)(accu / divider);
+  tc_cam_motion.motion_brightness = (uint32_t)(bright / divider);
+  tc_cam_motion.triggered = (tc_cam_motion.threshold > 0 && tc_cam_motion.motion_trigger > tc_cam_motion.threshold) ? 1 : 0;
+}
+
+#endif // USE_WEBCAM || USE_TINYC_CAMERA
+
+// ---- WebUI: interactive widget page (/tc_ui) ----
+
+static void HandleTinyCUI(void) {
+  if (!HttpCheckPriviledgedAccess()) return;
+  if (!Tinyc) { Webserver->send(503, "text/plain", "TinyC not ready"); return; }
+
+  // Read page number from ?p= parameter (0-5, default 0)
+  uint8_t page = 0;
+  if (Webserver->hasArg(F("p"))) {
+    page = Webserver->arg(F("p")).toInt();
+    if (page >= TC_MAX_WEB_PAGES) page = 0;
+  }
+  Tinyc->current_page = page;
+
+  // Find the slot that registered this page
+  uint8_t si = (page < Tinyc->page_count) ? Tinyc->page_slot[page] : 0;
+  TcSlot *s = Tinyc->slots[si];
+  if (!s || !s->loaded || s->vm.error != TC_OK) {     // truly fatal
+    Webserver->send(503, "text/plain", "TinyC not ready");
+    return;
+  }
+  { uint32_t _t0 = millis();
+    while (!s->vm.halted && (millis() - _t0) < TC_WEBON_HALTED_WAIT_MS) {
+      delay(20); yield();
+    } }
+  if (!s->vm.halted) {
+    Webserver->send_P(503, PSTR("text/html"), TC_BUSY_HTML);
+    return;
+  }
+
+  // Handle sv= parameter -- widget value update (target the slot that
+  // owns this page, NOT a hardcoded slot 0).
+  TinyC_WebSetVar(si);
+
+  // Reset WebChart state before rendering
+  tc_chart_seq = 0;
+  tc_chart_lib_sent = false;
+  tc_chart_time_base = 0;
+
+  // AJAX mode (m=1): just re-render widgets via WebUI() callback
+  if (Webserver->hasArg(F("m"))) {
+    WSContentBegin(200, CT_HTML);
+    tc_slot_callback(s, "WebUI");
+    WSContentEnd();
+    return;
+  }
+
+  // Full page: HTML skeleton with JavaScript for AJAX refresh
+  const char *title = (page < Tinyc->page_count && Tinyc->page_label[page][0])
+                    ? Tinyc->page_label[page] : "TinyC UI";
+  WSContentStart_P(title);
+  WSContentSendStyle();
+  WSContentSend_P(PSTR(
+    "<script>"
+    "var rfsh=1,x=null,lt;"
+    "function la(p){"
+      "var a=p||'';"
+      "if(p)clearTimeout(lt);"
+      "if(x)x.abort();"
+      "x=new XMLHttpRequest();"
+      "x.onreadystatechange=function(){"
+        "if(x.readyState==4&&x.status==200){"
+          "var r=x.responseText;"
+          "if(r.indexOf('script src=')>=0){location.reload();return;}"
+          "var el=document.getElementById('ui');"
+          "el.innerHTML=r;"
+          "var ss=el.getElementsByTagName('script');"
+          "for(var i=0;i<ss.length;i++){eval(ss[i].textContent);}"
+        "}"
+      "};"
+      "if(rfsh){"
+        "x.open('GET','./tc_ui?p=%d&m=1'+a,true);"
+        "x.send();"
+        "lt=setTimeout(la,2000);"
+      "}"
+    "}"
+    "function seva(v,i){rfsh=1;la('&sv='+i+'_'+v);rfsh=0;}"
+    "function tcbtn(e,v,i){if(e.dataset.b)return;e.dataset.b=1;seva(v,i);"
+      "var o=e.textContent,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background;"
+      "e.textContent=a;e.style.background='#0a0';e.style.color='#fff';"
+      "setTimeout(function(){e.textContent=o;e.style.background=c;e.style.color='';delete e.dataset.b;},2500);}"
+    "function siva(v,i){rfsh=1;la('&sv='+i+'_s_'+v);rfsh=0;}"
+    "function sivat(v,i){rfsh=1;la('&sv='+i+'_t_'+v);rfsh=0;}"
+    "function pr(f){if(f){lt=setTimeout(la,2000);rfsh=1;}else{clearTimeout(lt);rfsh=0;}}"
+    "window.onload=la;"
+    "</script>"
+  ), page);
+  WSContentSend_P(PSTR("<div id='ui'>"));
+  tc_slot_callback(s, "WebUI");
+  WSContentSend_P(PSTR("</div>"));
+  WSContentSpaceButton(BUTTON_MAIN);
+  WSContentEnd();
+}
+
+#endif  // USE_WEBSERVER
+
+/*********************************************************************************************\
+ * Tasmota: JSON telemetry
+\*********************************************************************************************/
+
+static void TinyCShow(bool json) {
+  if (!Tinyc) return;
+
+  if (json) {
+    // Iterate all slots for JSON output
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (!s) continue;
+      if (i == 0) {
+        // Slot 0 uses backward-compatible key "TinyC"
+        ResponseAppend_P(PSTR(",\"TinyC\":{\"Running\":%d,\"Loaded\":%d,\"Size\":%d,\"Instr\":%u,\"Heap\":\"%u/%u\"}"),
+          s->running ? 1 : 0,
+          s->loaded ? 1 : 0,
+          s->program_size,
+          s->vm.instruction_count,
+          s->vm.heap_used,
+          s->vm.heap_capacity);
+      } else {
+        ResponseAppend_P(PSTR(",\"TinyC%d\":{\"Running\":%d,\"Loaded\":%d,\"Size\":%d,\"Instr\":%u}"),
+          i,
+          s->running ? 1 : 0,
+          s->loaded ? 1 : 0,
+          s->program_size,
+          s->vm.instruction_count);
+      }
+      // Call user's JsonCall() on this slot (skip the slot that triggered sensorGet).
+      // Restored 2026-05-07: `s->loaded && s->vm.halted && error == TC_OK` pre-check.
+      // It was removed in 7be97b97b to fix a UI-disappear case (spawnTask worker
+      // mid-syscall has halted=false, the pre-check would skip its JsonCall and
+      // sensor rows would vanish from the /?m=1 poll). But removing it caused a
+      // reproducible HANG of the entire device when running multi-slot configs:
+      // sensorGet on slot 0 → MqttShowSensor → fan-out JsonCall to slot 5
+      // unconditionally takes slot 5's mutex with portMAX_DELAY. Bisected
+      // against the C3 baseline (commit 63a7e6535, Apr 20) which ran the same
+      // pattern stably for weeks. Multi-slot stability is more important than
+      // the cosmetic spawnTask UI-disappear case; if that case becomes a real
+      // problem, address it via xSemaphoreTake-with-timeout in tc_slot_callback
+      // rather than by removing the pre-check.
+      if (s->loaded && s->vm.halted && s->vm.error == TC_OK && s != tc_sensor_get_slot) {
+        tc_slot_callback(s, "JsonCall");
+      }
+    }
+  }
+#ifdef USE_WEBSERVER
+  else {
+    // Web sensor rows for all slots
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (!s) continue;
+      // Debug info rows (switchable via TinyCInfo command)
+      if (Tinyc->show_info) {
+        char status[10];
+        if (s->running) { strcpy_P(status, PSTR("Running")); }
+        else if (s->loaded) { strcpy_P(status, PSTR("Loaded")); }
+        else { strcpy_P(status, PSTR("Empty")); }
+        if (i == 0) {
+          WSContentSend_PD(PSTR("{s}TinyC{m}%s (%d bytes){e}"),
+            status, s->program_size);
+        } else {
+          WSContentSend_PD(PSTR("{s}TinyC[%d]{m}%s (%d bytes){e}"),
+            i, status, s->program_size);
+        }
+      }
+      // Call user's WebCall() on this slot — pre-check restored 2026-05-07,
+      // see JsonCall comment above. The /?m=1 polling path is the primary
+      // trigger for the multi-slot hang regression introduced by 7be97b97b.
+      if (s->loaded && s->vm.halted && s->vm.error == TC_OK) {
+        tc_slot_callback(s, "WebCall");
+      }
+    }
+  }
+#endif
+}
+
+/*********************************************************************************************\
+ * Port 82 Download Server -- background task for large file serving (ESP32 only)
+ * Serves /ufs/<filename> with optional @from_to time-range filtering
+ * Downloads run in a FreeRTOS task so main loop stays responsive
+\*********************************************************************************************/
+
+#ifdef ESP32
+
+// Background task: streams file to client then exits
+static void tc_download_task(void *param) {
+  char *path = (char*)param;
+
+  // Parse @from_to time range from path
+  uint32_t cmp_from = 0, cmp_to = 0;
+  char *atp = strchr(path, '@');
+  if (atp) {
+    *atp = 0;
+    atp++;
+    char *tp = strchr(atp, '_');
+    if (tp) {
+      *tp = 0;
+      tp++;
+      cmp_from = tc_ts_cmp(atp);
+      cmp_to = tc_ts_cmp(tp);
+    }
+  }
+
+  File file = ufsp->open(path, "r");
+  if (!file) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: DL file not found: %s"), path);
+    free(path);
+    Tinyc->dl_busy = false;
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // Determine content type
+  char ctype[32];
+  if (strstr_P(path, PSTR(".csv")) || strstr_P(path, PSTR(".txt"))) {
+    strcpy_P(ctype, PSTR("text/plain"));
+  } else if (strstr_P(path, PSTR(".html"))) {
+    strcpy_P(ctype, PSTR("text/html"));
+  } else if (strstr_P(path, PSTR(".json"))) {
+    strcpy_P(ctype, PSTR("application/json"));
+  } else {
+    strcpy_P(ctype, PSTR("application/octet-stream"));
+  }
+
+  WiFiClient client = Tinyc->dl_server->client();
+  uint32_t fsize = file.size();
+
+  // Extract just the filename for Content-Disposition
+  char *fname = strrchr(path, '/');
+  if (fname) fname++; else fname = path;
+
+  if (cmp_from && cmp_to && cmp_to > cmp_from) {
+    // -- Time-filtered download --
+    client.printf_P(PSTR("HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
+      "Content-Disposition: attachment; filename=\"%s\"\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "Connection: close\r\n\r\n"), ctype, fname);
+
+    char *lbuf = (char*)malloc(512);
+    if (lbuf) {
+      // Send header line
+      uint16_t li = 0;
+      while (file.available() && li < 510) {
+        uint8_t c; file.read(&c, 1);
+        lbuf[li++] = c;
+        if (c == '\n') break;
+      }
+      if (li > 0) {
+        // Chunked encoding: send size + data + CRLF
+        client.printf("%x\r\n", li);
+        client.write((uint8_t*)lbuf, li);
+        client.print("\r\n");
+      }
+      uint32_t header_end = file.position();
+
+      // Try index file for fast seek
+      uint32_t seek_pos = 0;
+      {
+        char indpath[128];
+        strlcpy(indpath, path, sizeof(indpath));
+        char *dot = strrchr(indpath, '.');
+        if (dot) strcpy(dot, ".ind");
+        else strcat(indpath, ".ind");
+
+        File ind = ufsp->open(indpath, "r");
+        if (ind) {
+          // Skip header
+          while (ind.available()) {
+            uint8_t c; ind.read(&c, 1);
+            if (c == '\n') break;
+          }
+          uint32_t last_good_pos = 0;
+          while (ind.available()) {
+            li = 0;
+            while (ind.available() && li < 510) {
+              uint8_t c; ind.read(&c, 1);
+              lbuf[li++] = c;
+              if (c == '\n') break;
+            }
+            lbuf[li] = 0;
+            uint32_t cmp = tc_ts_cmp(lbuf);
+            if (cmp == 0) continue;
+            if (cmp >= cmp_from) break;
+            char *tab = strchr(lbuf, '\t');
+            if (tab) last_good_pos = strtoul(tab + 1, NULL, 10);
+          }
+          seek_pos = last_good_pos;
+          ind.close();
+        } else {
+          // No index: estimated seek (opt_fext approach)
+          li = 0;
+          while (file.available() && li < 31) {
+            uint8_t c; file.read(&c, 1);
+            if (c == '\t' || c == '\n') break;
+            lbuf[li++] = c;
+          }
+          lbuf[li] = 0;
+          uint32_t ts_first = tc_ts_cmp(lbuf);
+
+          uint32_t back = (fsize > 256) ? fsize - 256 : 0;
+          file.seek(back, SeekSet);
+          uint32_t last_nl = 0;
+          while (file.available()) {
+            uint8_t c; file.read(&c, 1);
+            if (c == '\n') last_nl = file.position();
+          }
+          if (last_nl > back) {
+            file.seek(last_nl, SeekSet);
+            li = 0;
+            while (file.available() && li < 31) {
+              uint8_t c; file.read(&c, 1);
+              if (c == '\t' || c == '\n') break;
+              lbuf[li++] = c;
+            }
+            lbuf[li] = 0;
+            uint32_t ts_last = tc_ts_cmp(lbuf);
+            if (ts_last > ts_first && cmp_from > ts_first) {
+              float perc = (float)(cmp_from - ts_first) / (float)(ts_last - ts_first) * 0.8f;
+              if (perc < 0) perc = 0;
+              if (perc > 1) perc = 1;
+              seek_pos = (uint32_t)(perc * fsize);
+            }
+          }
+          if (seek_pos > 0) {
+            file.seek(seek_pos, SeekSet);
+            while (file.available()) {
+              uint8_t c; file.read(&c, 1);
+              if (c == '\n') break;
+            }
+            seek_pos = file.position();
+          }
+        }
+      }
+
+      // Stream matching lines
+      if (seek_pos > 0) file.seek(seek_pos, SeekSet);
+      else file.seek(header_end, SeekSet);
+
+      while (file.available()) {
+        li = 0;
+        while (file.available() && li < 510) {
+          uint8_t c; file.read(&c, 1);
+          lbuf[li++] = c;
+          if (c == '\n') break;
+        }
+        lbuf[li] = 0;
+
+        char saved = 0;
+        char *tab = strchr(lbuf, '\t');
+        if (tab) { saved = *tab; *tab = 0; }
+        uint32_t cmp = tc_ts_cmp(lbuf);
+        if (tab) *tab = saved;
+
+        if (cmp == 0) continue;
+        if (cmp > cmp_to) break;
+        if (cmp >= cmp_from) {
+          client.printf("%x\r\n", li);
+          client.write((uint8_t*)lbuf, li);
+          client.print("\r\n");
+        }
+        yield();  // feed WDT during long transfers
+      }
+      // Chunked encoding terminator
+      client.print("0\r\n\r\n");
+      free(lbuf);
+    }
+  } else {
+    // -- Full file download --
+    client.printf_P(PSTR("HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
+      "Content-Disposition: attachment; filename=\"%s\"\r\n"
+      "Content-Length: %d\r\n"
+      "Connection: close\r\n\r\n"), ctype, fname, fsize);
+
+    uint8_t buf[512];
+    while (fsize > 0) {
+      uint16_t len = (fsize < sizeof(buf)) ? fsize : sizeof(buf);
+      file.read(buf, len);
+      client.write(buf, len);
+      fsize -= len;
+      yield();  // feed WDT during long transfers
+    }
+  }
+
+  file.close();
+  client.stop();
+  free(path);
+  Tinyc->dl_busy = false;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: DL task done"));
+  vTaskDelete(NULL);
+}
+
+// HTTP handler for /ufs/* requests on port 82
+static void TC_DLServeFile(void) {
+  String uri = Tinyc->dl_server->uri();
+  const char *cp = strstr_P(uri.c_str(), PSTR("/ufs/"));
+  if (!cp) {
+    Tinyc->dl_server->send(404, F("text/plain"), F("Not found"));
+    return;
+  }
+  cp += 4;  // skip "/ufs" -> keep leading "/"
+
+  if (!ufsp) {
+    Tinyc->dl_server->send(500, F("text/plain"), F("No filesystem"));
+    return;
+  }
+
+  if (Tinyc->dl_busy) {
+    Tinyc->dl_server->send(503, F("text/plain"), F("Download busy"));
+    return;
+  }
+
+  Tinyc->dl_busy = true;
+  char *path = (char*)malloc(128);
+  if (!path) {
+    Tinyc->dl_busy = false;
+    Tinyc->dl_server->send(500, F("text/plain"), F("Out of memory"));
+    return;
+  }
+  strlcpy(path, cp, 128);
+  xTaskCreatePinnedToCore(tc_download_task, "TCDL", 6000, (void*)path, 3, NULL, 1);
+}
+
+// Root handler
+static void TC_DLRoot(void) {
+  Tinyc->dl_server->send(200, F("text/plain"), F("TinyC File Server"));
+}
+
+/*-------------------------------------------------------------------------------------------*\
+ * IDE serving via background task (port 82 /ide)
+ *
+ * The IDE file (~150 KB gzipped) was previously streamed synchronously by the
+ * main HTTP loop (port 80 /ide handler), holding the main loop for the whole
+ * 600+ chunk read+write cycle. Under script contention (LittleFS single-threaded
+ * + scripts doing their own file I/O for .pvs persist + sensor logs), this would
+ * block the whole device for 1-3 s per IDE load — even on dual-core ESP32.
+ *
+ * Now: port 80 /ide issues a 302 redirect to port 82 /ide, which spawns a
+ * dedicated FreeRTOS task that streams the file. Main loop unaffected; the
+ * task uses larger 1 KB chunks for fewer yields and sends Connection: close
+ * for clean teardown.
+\*-------------------------------------------------------------------------------------------*/
+static bool tc_ide_busy = false;
+
+static void tc_ide_serve_task(void *param) {
+  // Match the tc_download_task pattern: take the client from the dl_server
+  // INSIDE the task, not before spawning. This is what the existing /ufs/*
+  // path does and is known to work — the framework keeps the client alive
+  // after the handler returns since no send() was called.
+  WiFiClient client = Tinyc->dl_server->client();
+
+  // Locate the file: try ufsp (SD/user) first then ffsp (flash). Prefer .gz.
+  bool gzipped = false;
+  File f;
+  if (ufsp) f = ufsp->open("/tinyc_ide.html.gz", "r");
+  if (f) {
+    gzipped = true;
+  } else {
+    if (ufsp) f = ufsp->open("/tinyc_ide.html", "r");
+    if (!f && ffsp && ffsp != ufsp) {
+      f = ffsp->open("/tinyc_ide.html.gz", "r");
+      if (f) gzipped = true;
+      else   f = ffsp->open("/tinyc_ide.html", "r");
+    }
+  }
+
+  if (!f) {
+    client.print(F("HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                   "Connection: close\r\n\r\nIDE not found on filesystem."));
+    delay(50);
+    client.stop();
+    tc_ide_busy = false;
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE task: file not found"));
+    vTaskDelete(NULL);
+    return;
+  }
+
+  uint32_t fsize = f.size();
+  // Write status + headers in one printf call. Order: status, type,
+  // optional Content-Encoding, length, cache, connection.
+  if (gzipped) {
+    client.printf_P(PSTR(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Encoding: gzip\r\n"
+        "Content-Length: %u\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Connection: close\r\n\r\n"), fsize);
+  } else {
+    client.printf_P(PSTR(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/html; charset=utf-8\r\n"
+        "Content-Length: %u\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Connection: close\r\n\r\n"), fsize);
+  }
+
+  // 1 KB chunks — fewer LittleFS reads + fewer client.write() calls than
+  // the old 256-byte loop.
+  uint8_t buf[1024];
+  while (f.available() && client.connected()) {
+    int n = f.read(buf, sizeof(buf));
+    if (n <= 0) break;
+    int written = client.write(buf, n);
+    if (written < n) break;   // client gone
+  }
+  f.close();
+  delay(80);  // let last write drain
+  client.stop();
+
+  tc_ide_busy = false;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: IDE task done (%u bytes)"), fsize);
+  vTaskDelete(NULL);
+}
+
+static void TC_DLServeIDE(void) {
+  if (tc_ide_busy) {
+    Tinyc->dl_server->send(503, F("text/plain"), F("IDE serve busy"));
+    return;
+  }
+  tc_ide_busy = true;
+  BaseType_t rc = xTaskCreatePinnedToCore(
+      tc_ide_serve_task, "TCIDE", 4096, NULL, 3, NULL, 1);
+  if (rc != pdPASS) {
+    tc_ide_busy = false;
+    Tinyc->dl_server->send(500, F("text/plain"), F("Task spawn failed"));
+    return;
+  }
+  // Note: NOT calling send() — the task writes its own response directly
+  // to the client. This matches the existing tc_download_task pattern.
+}
+
+// Initialize port 82 download server
+static void TC_DLServerInit(void) {
+  if (!Tinyc || Tinyc->dl_server) return;  // already initialized
+  Tinyc->dl_server = new ESP8266WebServer(TC_DLPORT);
+  if (Tinyc->dl_server) {
+    Tinyc->dl_server->on(UriGlob("/ufs/*"), HTTP_GET, TC_DLServeFile);
+    Tinyc->dl_server->on("/ide", HTTP_GET, TC_DLServeIDE);
+    Tinyc->dl_server->on("/", HTTP_GET, TC_DLRoot);
+    Tinyc->dl_server->begin();
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: Download server started on port %d"), TC_DLPORT);
+  }
+}
+
+// Poll for incoming connections (called from FUNC_LOOP)
+static void TC_DLServerLoop(void) {
+  if (Tinyc && Tinyc->dl_server) {
+    Tinyc->dl_server->handleClient();
+  }
+}
+
+#endif // ESP32
+
+#ifdef USE_MQTT
+/*********************************************************************************************\
+ * MQTT subscribe / publish bridge for TinyC scripts
+ * Scripts subscribe to external topics via mqttSubscribe("foo/#") and receive
+ * data in a user-defined callback: void OnMqttData(char topic[], char payload[]).
+ * '#' wildcard matches any suffix after the prefix (MQTT spec multi-level).
+\*********************************************************************************************/
+
+#define TC_MAX_MQTT_SUBS   10
+#define TC_MQTT_TOPIC_LEN  128
+
+struct TcMqttSub {
+  char topic[TC_MQTT_TOPIC_LEN];
+  bool active;
+  bool wildcard;       // true if topic ends in '#' (multi-level) or contains '+'
+  uint8_t prefix_len;  // bytes that must match verbatim before the wildcard
+};
+
+static TcMqttSub tc_mqtt_subs[TC_MAX_MQTT_SUBS];
+static uint8_t   tc_mqtt_sub_count = 0;
+
+static bool tc_mqtt_topic_match(const char *sub_topic, const char *recv_topic,
+                                bool is_wildcard, uint8_t prefix_len) {
+  if (!is_wildcard) return (strcmp(sub_topic, recv_topic) == 0);
+  return (strncmp(sub_topic, recv_topic, prefix_len) == 0);
+}
+
+int tc_mqtt_subscribe(const char *topic) {
+  if (!topic || !topic[0]) return -1;
+  // Already subscribed? return existing slot
+  for (uint8_t i = 0; i < tc_mqtt_sub_count; i++) {
+    if (tc_mqtt_subs[i].active && strcmp(tc_mqtt_subs[i].topic, topic) == 0) return i;
+  }
+  int slot = -1;
+  for (uint8_t i = 0; i < TC_MAX_MQTT_SUBS; i++) {
+    if (!tc_mqtt_subs[i].active) { slot = i; break; }
+  }
+  if (slot < 0) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: MQTT sub failed, max %d"), TC_MAX_MQTT_SUBS);
+    return -1;
+  }
+  strlcpy(tc_mqtt_subs[slot].topic, topic, TC_MQTT_TOPIC_LEN);
+  tc_mqtt_subs[slot].active = true;
+  const char *hash = strchr(topic, '#');
+  if (hash) {
+    tc_mqtt_subs[slot].wildcard = true;
+    tc_mqtt_subs[slot].prefix_len = (uint8_t)(hash - topic);
+  } else {
+    tc_mqtt_subs[slot].wildcard = false;
+    tc_mqtt_subs[slot].prefix_len = strlen(topic);
+  }
+  if ((uint8_t)slot >= tc_mqtt_sub_count) tc_mqtt_sub_count = slot + 1;
+  MqttSubscribe(topic);
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: MQTT sub [%d] '%s'%s"),
+         slot, topic, hash ? " (wildcard)" : "");
+  return slot;
+}
+
+int tc_mqtt_unsubscribe(const char *topic) {
+  if (!topic) return -1;
+  for (uint8_t i = 0; i < tc_mqtt_sub_count; i++) {
+    if (tc_mqtt_subs[i].active && strcmp(tc_mqtt_subs[i].topic, topic) == 0) {
+      MqttUnsubscribe(topic);
+      tc_mqtt_subs[i].active = false;
+      tc_mqtt_subs[i].topic[0] = 0;
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: MQTT unsub [%d] '%s'"), i, topic);
+      return 0;
+    }
+  }
+  return -1;
+}
+
+// Re-send MQTT SUBSCRIBE packets after (re)connect. Hooked on FUNC_MQTT_INIT.
+static void tc_mqtt_resubscribe(void) {
+  for (uint8_t i = 0; i < tc_mqtt_sub_count; i++) {
+    if (tc_mqtt_subs[i].active) {
+      MqttSubscribe(tc_mqtt_subs[i].topic);
+      AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: MQTT resub [%d] '%s'"), i, tc_mqtt_subs[i].topic);
+    }
+  }
+}
+
+// Dispatch incoming MQTT message to matching subs → fires OnMqttData on each slot.
+// Uses the cached well-known callback index (TC_CB_ON_MQTT_DATA) when present.
+static bool tc_mqtt_data_handler(void) {
+  if (tc_mqtt_sub_count == 0) return false;
+  char *topic = XdrvMailbox.topic;
+  char *data  = XdrvMailbox.data;
+  if (!topic || !data) return false;
+
+  bool any = false;
+  for (uint8_t i = 0; i < tc_mqtt_sub_count; i++) {
+    if (!tc_mqtt_subs[i].active) continue;
+    if (!tc_mqtt_topic_match(tc_mqtt_subs[i].topic, topic,
+                             tc_mqtt_subs[i].wildcard,
+                             tc_mqtt_subs[i].prefix_len)) continue;
+
+    // Variable-length local null-terminated copy of the payload
+    uint32_t plen = XdrvMailbox.data_len;
+    if (plen > 1024) plen = 1024;
+    char payload[plen + 1];
+    memcpy(payload, data, plen);
+    payload[plen] = 0;
+
+    for (uint8_t sidx = 0; sidx < TC_MAX_VMS; sidx++) {
+      TcSlot *slot = Tinyc->slots[sidx];
+      if (!slot || !slot->loaded) continue;
+      if (!slot->vm.halted || slot->vm.error != TC_OK) continue;
+      // Skip if script didn't define OnMqttData — fast cache check
+      if (slot->vm.cb_index[TC_CB_ON_MQTT_DATA] < 0) continue;
+      tc_current_slot = slot;
+#ifdef ESP32
+      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      // Re-check halted AFTER the lock (TOCTOU): the core-1 VM task can flip
+      // halted=false between the pre-lock check above and here; running
+      // OnMqttData on a non-halted VM corrupts its frame -> crash under MQTT
+      // traffic. Same race as tc_udp_on_receive (Bug #1 pattern).
+      if (!slot->vm.halted || slot->vm.error != TC_OK) {
+        if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+        tc_current_slot = nullptr;
+        continue;
+      }
+#endif
+      tc_vm_call_callback_str2(&slot->vm, "OnMqttData", topic, payload);
+#ifdef ESP32
+      if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+#endif
+      tc_current_slot = nullptr;
+    }
+    any = true;
+    break;  // first matching sub wins — don't double-fire per broker message
+  }
+  return any;
+}
+
+// NOTE: no tc_mqtt_clear() — subs persist across script reloads so in-flight
+// messages aren't lost during a TinyCRun. Scripts that want a clean slate
+// should call mqttUnsubscribe() for their topics in OnExit().
+#endif  // USE_MQTT
+
+/*********************************************************************************************\
+ * Dynamic task spawn — spawnTask / killTask / taskRunning (ESP32 only)
+ *
+ * Runs a named user function on a dedicated FreeRTOS task, sharing the spawning VM's
+ * globals/heap. Mirrors the existing TaskLoop mutex-discipline: hold vm_mutex while
+ * executing VM instructions, release during delay(). Cooperative kill via a flag
+ * polled in the exec loop.
+ *
+ * The pool is global (spans all VM slots) — up to TC_MAX_SPAWN_TASKS live tasks at
+ * a time. Task names are scoped per-VM-slot, so two slots can each have a task
+ * named "Worker" without colliding.
+\*********************************************************************************************/
+
+#ifdef ESP32
+
+#define TC_MAX_SPAWN_TASKS   4
+#define TC_SPAWN_NAME_LEN    24
+// Default native-task stack. tc_vm_step is a giant switch with lots of
+// per-case locals and AddLog() uses vprintf — 3 KB crashes with
+// StoreProhibited on first worker that logs. 5 KB is the minimum that
+// works reliably. Users can still override per-call via the 2-arg form:
+//   spawnTask("Worker", 8)  // KB
+#define TC_SPAWN_STACK_DEF   5     // KB, 5*1024 = 5120
+#define TC_SPAWN_STACK_MAX   16    // KB upper clamp
+#define TC_SPAWN_STACK_MIN   3     // KB lower clamp (works for simple blink-only workers)
+#define TC_SPAWN_WAIT_MAIN   5000  // ms to wait for main() to halt before giving up
+
+struct TcSpawnTask {
+  char          name[TC_SPAWN_NAME_LEN];  // "" = pool entry free
+  TaskHandle_t  handle;
+  TcSlot       *slot;
+  uint8_t       slot_idx;         // 0..TC_MAX_VMS-1
+  volatile uint8_t stop_requested;
+  volatile uint8_t running;       // 1 while FreeRTOS task alive
+};
+
+static TcSpawnTask tc_spawn_pool[TC_MAX_SPAWN_TASKS];
+static SemaphoreHandle_t tc_spawn_pool_mutex = nullptr;
+
+static void tc_spawn_pool_lock(void) {
+  if (!tc_spawn_pool_mutex) tc_spawn_pool_mutex = xSemaphoreCreateMutex();
+  if (tc_spawn_pool_mutex) xSemaphoreTake(tc_spawn_pool_mutex, portMAX_DELAY);
+}
+static void tc_spawn_pool_unlock(void) {
+  if (tc_spawn_pool_mutex) xSemaphoreGive(tc_spawn_pool_mutex);
+}
+
+// TinyCStack — list every live spawnTask worker with its FreeRTOS stack high-water
+// mark (uxTaskGetStackHighWaterMark = the minimum free stack ever seen) so worker
+// stacks can be sized from data instead of guessed (Andreas's wish). Reports the
+// configured VM-task stack too.
+// NB the high-water mark is in StackType_t units. On ESP-IDF (both Xtensa and RISC-V)
+// StackType_t is uint8_t, so the value is already BYTES — do NOT multiply by 4 (the
+// vanilla-FreeRTOS "words*4" assumption, which over-reported a 10 KB worker as 23 KB
+// free; Andreas caught it). xTaskCreate's stack arg is likewise in bytes on ESP-IDF,
+// so VmTaskStack/stack_bytes and this number are the same unit and directly comparable.
+void CmndTinyCStack(void) {
+  Response_P(PSTR("{\"" D_PRFX_TINYC "Stack\":{\"VmTaskStack\":%d"), (int)TC_VM_TASK_STACK);
+  tc_spawn_pool_lock();
+  for (int i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    TcSpawnTask *e = &tc_spawn_pool[i];
+    if (!e->running || !e->handle || !e->name[0]) { continue; }
+    uint32_t freeb = (uint32_t)uxTaskGetStackHighWaterMark(e->handle);  // already bytes on ESP-IDF
+    ResponseAppend_P(PSTR(",\"%s\":{\"Slot\":%d,\"StackFreeMin\":%u}"),
+                     e->name, e->slot_idx, freeb);
+  }
+  tc_spawn_pool_unlock();
+  ResponseAppend_P(PSTR("}}"));
+}
+
+// FreeRTOS task body — executes the user function to completion or stop-request.
+// Re-resolves callback index by name at start (robust against VM reloads).
+// Wrapped in a do/while(0) so `break` substitutes for goto-to-cleanup (C++
+// forbids goto crossing initializations).
+static void tc_spawn_task_body(void *param) {
+  TcSpawnTask *entry = (TcSpawnTask *)param;
+  TcSlot *slot = entry->slot;
+  TcVM   *vm   = &slot->vm;
+  const char *name = entry->name;
+
+  do {
+    // Wait for main() to halt (if this was spawned from inside main).
+    // Most callers are in callback context where halted==true already.
+    uint32_t waited = 0;
+    while (!entry->stop_requested && slot->loaded && !vm->halted && waited < TC_SPAWN_WAIT_MAIN) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      waited += 10;
+    }
+    if (entry->stop_requested || !slot->loaded) break;
+    if (!vm->halted) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask('%s') aborted — main never halted"), name);
+      break;
+    }
+
+    // Re-resolve callback name → index (VM could have been reloaded between spawn + wake)
+    int cb_idx = -1;
+    for (uint8_t i = 0; i < vm->callback_count; i++) {
+      if (strcmp(vm->callbacks[i].name, name) == 0) { cb_idx = i; break; }
+    }
+    if (cb_idx < 0) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask('%s') — function gone after wait"), name);
+      break;
+    }
+
+    // Execute the user function under vm_mutex. The pattern follows TaskLoop:
+    // release mutex during delay() so Tasmota callbacks can interleave.
+    if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+    tc_current_slot = slot;
+
+    uint8_t  saved_frame_count      = vm->frame_count;
+    uint16_t saved_pc                = vm->pc;
+    uint16_t saved_sp                = vm->sp;
+    uint16_t saved_heap_used         = vm->heap_used;
+    uint8_t  saved_heap_handle_count = vm->heap_handle_count;
+
+    if (vm->frame_count >= TC_MAX_FRAMES) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask('%s') frame overflow"), name);
+      tc_current_slot = nullptr;
+      if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+      break;
+    }
+
+    vm->halted = false;
+    vm->running = true;
+    TcFrame *frame = &vm->frames[vm->frame_count];
+    frame->return_pc = 0;
+    if (!tc_frame_alloc(frame)) {
+      vm->halted = true; vm->running = false;
+      tc_current_slot = nullptr;
+      if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask('%s') stack alloc fail"), name);
+      break;
+    }
+    vm->fp = vm->frame_count;
+    vm->frame_count++;
+    vm->pc = vm->code_offset + vm->callbacks[cb_idx].address;
+    vm->worker_borrowed = true;   // stays set across delay() windows; cleared at cleanup
+
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: spawnTask('%s') running on slot %d"), name, entry->slot_idx);
+
+    uint32_t count = 0;
+    while (vm->frame_count > saved_frame_count
+           && !vm->halted
+           && vm->error == TC_OK
+           && !entry->stop_requested
+           && slot->loaded) {
+      int err = tc_vm_step(vm);
+      if (err == TC_ERR_PAUSED) {
+        if (vm->delayed) {
+          // Release mutex during the actual sleep so other work can proceed.
+          vm->halted = true;
+          vm->running = false;
+          tc_current_slot = nullptr;
+          if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+          int32_t remaining = (int32_t)(vm->delay_until - millis());
+          while (remaining > 0 && !entry->stop_requested && slot->loaded) {
+            int32_t chunk = (remaining > 50) ? 50 : remaining;
+            vTaskDelay(pdMS_TO_TICKS(chunk));
+            remaining = (int32_t)(vm->delay_until - millis());
+          }
+          vm->delayed = false;
+          if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+          tc_current_slot = slot;
+          if (entry->stop_requested || !slot->loaded) break;
+          vm->halted = false;
+          vm->running = true;
+        }
+        continue;
+      }
+      if (err != TC_OK) {
+        vm->error = err;
+        AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask('%s') err %d at PC=%u"), name, err, vm->pc);
+        tc_crash_log(err, vm->pc, vm->instruction_count, name);
+        break;
+      }
+      count++;
+      vm->instruction_count++;
+      // Yield periodically to feed WDT and let other work run.
+      if ((count & 0xFFFF) == 0) {
+        vm->halted = true; vm->running = false;
+        if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+        vTaskDelay(1);
+        if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+        tc_current_slot = slot;
+        if (entry->stop_requested || !slot->loaded) break;
+        vm->halted = false; vm->running = true;
+      }
+    }
+
+    // Clean up callback frame
+    while (vm->frame_count > saved_frame_count) {
+      tc_frame_free(&vm->frames[--vm->frame_count]);
+    }
+    vm->fp = vm->frame_count > 0 ? vm->frame_count - 1 : 0;
+
+    vm->worker_borrowed = false;
+    vm->halted = true;
+    vm->running = false;
+    vm->pc = saved_pc;
+    vm->sp = saved_sp;
+    if (vm->heap_handles && vm->heap_handle_count > saved_heap_handle_count) {
+      for (uint8_t i = saved_heap_handle_count; i < vm->heap_handle_count; i++) {
+        vm->heap_handles[i].alive = false;
+      }
+      vm->heap_handle_count = saved_heap_handle_count;
+    }
+    vm->heap_used = saved_heap_used;
+    tc_output_flush();
+
+    tc_current_slot = nullptr;
+    if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+  } while (0);
+
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: spawnTask('%s') finished%s"),
+         name, entry->stop_requested ? " (killed)" : "");
+  tc_spawn_pool_lock();
+  entry->handle = nullptr;
+  entry->running = 0;
+  entry->stop_requested = 0;
+  entry->slot = nullptr;
+  entry->slot_idx = 0xFF;
+  entry->name[0] = 0;
+  tc_spawn_pool_unlock();
+  vTaskDelete(NULL);
+}
+
+// Called from SYS_SPAWN_TASK / SYS_SPAWN_TASK_STACK syscalls.
+// stack_kb=0 → use default. Returns pool index (0..N-1) or -1.
+int tc_spawn_task_create(const char *name, uint16_t stack_kb) {
+  if (!name || !name[0]) return -1;
+  if (strlen(name) >= TC_SPAWN_NAME_LEN) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask: name '%s' too long (max %d)"),
+           name, TC_SPAWN_NAME_LEN - 1);
+    return -1;
+  }
+  if (!tc_current_slot) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask: no active slot"));
+    return -1;
+  }
+
+  // Find slot index of the caller
+  uint8_t sidx = 0xFF;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slots[i] == tc_current_slot) { sidx = i; break; }
+  }
+  if (sidx == 0xFF) return -1;
+
+  // Verify function is defined — fail early so users catch typos
+  TcVM *vm = &tc_current_slot->vm;
+  int cb_idx = -1;
+  for (uint8_t i = 0; i < vm->callback_count; i++) {
+    if (strcmp(vm->callbacks[i].name, name) == 0) { cb_idx = i; break; }
+  }
+  if (cb_idx < 0) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask: function '%s' not defined"), name);
+    return -1;
+  }
+
+  tc_spawn_pool_lock();
+  // Already running on same slot? Refuse — user must killTask first.
+  for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    if (tc_spawn_pool[i].running
+        && tc_spawn_pool[i].slot_idx == sidx
+        && strcmp(tc_spawn_pool[i].name, name) == 0) {
+      tc_spawn_pool_unlock();
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: spawnTask('%s') already running on slot %d"), name, sidx);
+      return -1;
+    }
+  }
+
+  int free_idx = -1;
+  for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    if (!tc_spawn_pool[i].running && !tc_spawn_pool[i].handle) { free_idx = i; break; }
+  }
+  if (free_idx < 0) {
+    tc_spawn_pool_unlock();
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask: pool full (max %d)"), TC_MAX_SPAWN_TASKS);
+    return -1;
+  }
+
+  TcSpawnTask *entry = &tc_spawn_pool[free_idx];
+  strlcpy(entry->name, name, TC_SPAWN_NAME_LEN);
+  entry->slot = tc_current_slot;
+  entry->slot_idx = sidx;
+  entry->stop_requested = 0;
+  entry->running = 1;
+  entry->handle = nullptr;
+  tc_spawn_pool_unlock();
+
+  uint16_t stack_bytes = (stack_kb ? stack_kb : TC_SPAWN_STACK_DEF) * 1024;
+  char tname[24];
+  snprintf(tname, sizeof(tname), "tc_spawn_%u", (unsigned)free_idx);
+  BaseType_t rc = xTaskCreatePinnedToCore(
+    tc_spawn_task_body, tname, stack_bytes, entry,
+    tskIDLE_PRIORITY + 1, &entry->handle, 1);
+  if (rc != pdPASS) {
+    tc_spawn_pool_lock();
+    entry->running = 0;
+    entry->handle = nullptr;
+    entry->name[0] = 0;
+    tc_spawn_pool_unlock();
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: spawnTask: xTaskCreate failed"));
+    return -1;
+  }
+  return free_idx;
+}
+
+int tc_spawn_task_kill(const char *name) {
+  if (!name || !name[0]) return -1;
+  if (!tc_current_slot) return -1;
+  uint8_t sidx = 0xFF;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slots[i] == tc_current_slot) { sidx = i; break; }
+  }
+  if (sidx == 0xFF) return -1;
+
+  int found = -1;
+  tc_spawn_pool_lock();
+  for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    if (tc_spawn_pool[i].running
+        && tc_spawn_pool[i].slot_idx == sidx
+        && strcmp(tc_spawn_pool[i].name, name) == 0) {
+      tc_spawn_pool[i].stop_requested = 1;
+      found = 0;
+      break;
+    }
+  }
+  tc_spawn_pool_unlock();
+  if (found == 0) AddLog(LOG_LEVEL_INFO, PSTR("TCC: killTask('%s') signaled"), name);
+  return found;
+}
+
+int tc_spawn_task_running(const char *name) {
+  if (!name || !name[0]) return 0;
+  if (!tc_current_slot) return 0;
+  uint8_t sidx = 0xFF;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slots[i] == tc_current_slot) { sidx = i; break; }
+  }
+  if (sidx == 0xFF) return 0;
+
+  int r = 0;
+  tc_spawn_pool_lock();
+  for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    if (tc_spawn_pool[i].running
+        && tc_spawn_pool[i].slot_idx == sidx
+        && strcmp(tc_spawn_pool[i].name, name) == 0) {
+      r = 1;
+      break;
+    }
+  }
+  tc_spawn_pool_unlock();
+  return r;
+}
+
+// Called from TinyCStopVM to kill all spawned tasks owned by a VM slot
+// before the VM is torn down. Each task observes stop_requested and exits
+// cleanly at its next instruction boundary or delay boundary.
+void tc_spawn_task_cleanup_slot(uint8_t slot_idx) {
+  tc_spawn_pool_lock();
+  int kills = 0;
+  for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+    if (tc_spawn_pool[i].running && tc_spawn_pool[i].slot_idx == slot_idx) {
+      tc_spawn_pool[i].stop_requested = 1;
+      kills++;
+    }
+  }
+  tc_spawn_pool_unlock();
+  if (!kills) return;
+  // Wait up to ~2 s for tasks to observe the flag and self-delete.
+  for (int wait = 0; wait < 200; wait++) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    tc_spawn_pool_lock();
+    int still = 0;
+    for (uint8_t i = 0; i < TC_MAX_SPAWN_TASKS; i++) {
+      if (tc_spawn_pool[i].running && tc_spawn_pool[i].slot_idx == slot_idx) still++;
+    }
+    tc_spawn_pool_unlock();
+    if (!still) return;
+  }
+  AddLog(LOG_LEVEL_ERROR, PSTR("TCC: cleanup: %d spawn task(s) still alive on slot %d"), kills, slot_idx);
+}
+
+#endif  // ESP32
+
+/*********************************************************************************************\
+ * Tasmota: Driver entry point
+\*********************************************************************************************/
+
+// Event callback edge-detection flags
+static bool tc_init_done = false;
+static bool tc_wifi_up = false;
+// One-shot for the deferred autoexec spawner. Fires on the first
+// non-paused FUNC_LOOP — at that point every other Tasmota driver's
+// FUNC_INIT has run and peripherals are settled, so user main()
+// (which spawns in tc_vm_task) doesn't race the platform's own
+// init. See TinyCStartAutoexec().
+static bool tc_autoexec_started = false;
+// BootInit() fires per-slot, gated by s->boot_init_pending (set in
+// TinyCStartVM, cleared after dispatch). Scanned in FUNC_LOOP. Kept
+// as an opt-in convenience for users who want hardware init separate
+// from main() — but with the deferred autoexec above, plain main()
+// works without any BootInit/delay workarounds.
+
+bool Xdrv124(uint32_t function) {
+  bool result = false;
+
+  if (FUNC_INIT == function) {
+    TinyCInit();
+    return false;
+  }
+
+  if (!Tinyc) { return false; }
+
+  // Auto-pause VM callbacks during OTA updates and filesystem uploads
+  // to prevent timeouts and upload failures
+  bool tc_paused = (TasmotaGlobal.ota_state_flag != 0) ||
+                   (TasmotaGlobal.restart_flag != 0) ||
+                   Tinyc->upload_active ||
+                   tc_global_pause;
+
+  // Auto-STOP all slots on OTA start — the tc_paused flag above only
+  // suppresses callbacks, but tc_vm_task keeps running main()/TaskLoop()
+  // which hammers SPI/network/heap and frequently hangs the firmware
+  // upload. Detect the 0→active transition for ota_state_flag and call
+  // TinyCStopVM on every loaded slot once, so the OTA writer has full
+  // exclusive access to flash. (We deliberately don't trigger on
+  // restart_flag — normal restarts go through FUNC_SAVE_BEFORE_RESTART
+  // which handles cleanup properly. We also don't trigger on
+  // upload_active — that's our own .tcb upload path, which manages
+  // slot state internally.)
+  static bool tc_ota_was_active = false;
+  bool tc_ota_now = (TasmotaGlobal.ota_state_flag != 0);
+  if (tc_ota_now && !tc_ota_was_active) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: OTA detected — stopping all VM slots"));
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      TcSlot *s = Tinyc->slots[i];
+      if (s && s->loaded) {
+        TinyCStopVM(s);
+      }
+    }
+  }
+  tc_ota_was_active = tc_ota_now;
+
+  switch (function) {
+    case FUNC_LOOP:
+#ifdef USE_MATTER_C
+      matter_loop();   // process any queued Matter datagram (PASE responder)
+      // Throttled aggregate log of UDP RX (every 5 s, only if traffic).
+      // Runs on main task → safe stack for the format/log path.
+      {
+        uint32_t now_ms = millis();
+        if ((uint32_t)(now_ms - mtrc_rx_log_ms) >= 5000) {
+          uint32_t pkts  = mtrc_rx_pkts;
+          uint32_t bytes = mtrc_rx_bytes;
+          uint32_t dp = pkts  - mtrc_rx_pkts_last;
+          uint32_t db = bytes - mtrc_rx_bytes_last;
+          if (dp) {
+            AddLog(LOG_LEVEL_DEBUG, PSTR("MTR: udp rx %u pkts / %u B (last 5s)"),
+                   (unsigned)dp, (unsigned)db);
+            mtrc_rx_pkts_last  = pkts;
+            mtrc_rx_bytes_last = bytes;
+          }
+          mtrc_rx_log_ms = now_ms;
+        }
+      }
+#endif
+      if (tc_paused) { break; }
+      // Deferred autoexec start — one-shot, gated on uptime so we
+      // wait through Wi-Fi/RF coex bring-up. Spawning tc_vm_task at
+      // FUNC_INIT (the historical timing) raced Tasmota's own driver
+      // init AND the Wi-Fi/RF coex phase. main() runs in its own
+      // FreeRTOS task so its serialBegin / i2cBegin / spiBegin would
+      // execute concurrently with platform peripheral init — UART
+      // claim "succeeds" but the GPIO matrix routing gets clobbered,
+      // 0 bytes ever arrive on RX. Same root cause as the historical
+      // 15-second delay() workaround at the top of main().
+      //
+      // Two-stage fix:
+      //   (a) Defer the spawn from FUNC_INIT to FUNC_LOOP — by then
+      //       every other driver's FUNC_INIT is done.
+      //   (b) Additionally wait for `TasmotaGlobal.uptime >=
+      //       TC_AUTOEXEC_MIN_UPTIME` so Wi-Fi/RF coex has had time
+      //       to stabilize. Without (b), main() runs at uptime
+      //       ~250 ms — still within the Wi-Fi bring-up window —
+      //       and serialBegin still silently fails to receive bytes.
+      //       3 s covers a typical Wi-Fi-up window. Override via
+      //       `-DTC_AUTOEXEC_MIN_UPTIME=N` for slow networks.
+      if (!tc_autoexec_started &&
+          TasmotaGlobal.uptime >= TC_AUTOEXEC_MIN_UPTIME) {
+        tc_autoexec_started = true;
+        TinyCStartAutoexec();
+      }
+      // Per-slot BootInit dispatch. `boot_init_pending` is set in
+      // TinyCStartVM and cleared after dispatch. Mutex held across
+      // {check vm.halted, fire callback, clear flag} to serialize
+      // against TaskLoop callbacks running concurrently in the slot's
+      // task (TaskLoop momentarily sets halted=false per iteration).
+      // Note: with the deferred autoexec above, main() itself is the
+      // natural place for hardware init — BootInit is now an opt-in
+      // convenience for users who want to separate it out, not a
+      // workaround for a timing bug.
+      for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+        TcSlot *s = Tinyc->slots[i];
+        if (!s || !s->loaded || !s->boot_init_pending) continue;
+        if (s->vm.cb_index[TC_CB_BOOT_INIT] < 0) {
+          s->boot_init_pending = false;
+          continue;
+        }
+#ifdef ESP32
+        if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+#endif
+        if (s->vm.halted && s->vm.error == TC_OK) {
+          tc_current_slot = s;
+          tc_vm_call_callback_id(&s->vm, TC_CB_BOOT_INIT);
+          tc_current_slot = nullptr;
+          s->boot_init_pending = false;
+        }
+#ifdef ESP32
+        if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+      }
+      // Poll UDP multicast for incoming variables
+      tc_udp_poll();
+#ifdef ESP32
+      // Lazy-init port 82 download server once WiFi is connected
+      if (!Tinyc->dl_server && WifiHasIP()) {
+        TC_DLServerInit();
+      }
+      // Poll port 82 download server for incoming file requests
+      TC_DLServerLoop();
+#if defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA)
+      // Poll port 81 MJPEG stream server
+      TC_CamStreamLoop();
+      // Run motion detection if enabled
+      TC_CamMotionDetect();
+#endif
+#endif
+      // Call user's EveryLoop() callback on all active slots
+      tc_all_callbacks_id(TC_CB_LOOP);
+      break;
+    case FUNC_EVERY_50_MSECOND:
+      tc_dmx_tick();   // DMX refresh + watchdog — runs even if VM paused
+                       // so the dimmer never loses its frame (no-op
+                       // until first dmxWrite / if TC_DMX_TX_PIN unset)
+#ifdef USE_MATTER_C
+      mtrc_invoke_drain();  // run queued Matter Invoke actions in the main task
+                            // (enqueued by on_command from the async-tcpip task)
+#endif
+      if (tc_paused) { break; }
+      TinyCEvery50ms();
+      if (TasmotaGlobal.rules_flag.mqtt_disconnected) {
+        TasmotaGlobal.rules_flag.mqtt_disconnected = 0;
+        tc_all_callbacks_id(TC_CB_ON_MQTT_DISCONNECT);
+      }
+      break;
+    case FUNC_EVERY_100_MSECOND:
+      if (tc_paused) { break; }
+      tc_all_callbacks_id(TC_CB_EVERY_100_MSECOND);
+      break;
+    case FUNC_EVERY_SECOND:
+      // Boot-loop marker cleanup runs even when paused — the device
+      // is healthy enough to dispatch FUNC_EVERY_SECOND, so we want
+      // to declare the boot a success and clear the marker so future
+      // recovery cycles work.
+      TinyCCheckBootStable();
+      TinyCFsRestartRetry();   // (B) re-start any slot whose post-write restart failed
+      TinyCPrefixReheal();     // re-arm a loaded slot's command prefix if it was lost without a main() re-run
+#ifdef USE_MATTER_C
+#ifdef TC_MATTER_AUTOSTART
+      mtrc_want_start = true;   // compile-time opt-in: start Matter without a script
+#endif
+      MatterC_MaybeStart();   // no-op unless a script called matterStart() (or autostart)
+      if (mtrc_window_end && !mtrc_window_open()) mtrc_close_window();  // Bind window timeout
+#endif
+      if (tc_paused) { break; }
+      // Call user's EverySecond() callback on all active slots
+      tc_all_callbacks_id(TC_CB_EVERY_SECOND);
+      break;
+    case FUNC_NETWORK_UP:
+      if (!tc_init_done) {
+        tc_init_done = true;
+        tc_all_callbacks_id(TC_CB_ON_INIT);
+      }
+      if (!tc_wifi_up) {
+        tc_wifi_up = true;
+        tc_all_callbacks_id(TC_CB_ON_WIFI_CONNECT);
+      }
+      break;
+    case FUNC_NETWORK_DOWN:
+      if (tc_wifi_up) {
+        tc_wifi_up = false;
+        tc_all_callbacks_id(TC_CB_ON_WIFI_DISCONNECT);
+      }
+      break;
+    case FUNC_MQTT_INIT:
+      tc_all_callbacks_id(TC_CB_ON_MQTT_CONNECT);
+#ifdef USE_MQTT
+      tc_mqtt_resubscribe();
+#endif
+      break;
+#ifdef USE_MQTT
+    case FUNC_MQTT_DATA:
+      result = tc_mqtt_data_handler();
+      break;
+#endif
+    case FUNC_TIME_SYNCED:
+      tc_all_callbacks_id(TC_CB_ON_TIME_SET);
+      break;
+    case FUNC_COMMAND:
+      result = DecodeCommand(kTinyCCommands, TinyCCommand);
+      if (!result && Tinyc) {
+        // Check each slot for registered command prefix match
+        bool tc_busy = false;   // a prefix matched but its VM was busy -> answer "Busy", not "Unknown"
+        for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+          TcSlot *s = Tinyc->slots[i];
+          if (!s || !s->loaded) continue;
+          if (!s->cmd_prefix[0]) continue;
+          int plen = strlen(s->cmd_prefix);
+          if (strncasecmp(XdrvMailbox.topic, s->cmd_prefix, plen) == 0) {
+            // Build command string: "{subcommand} {data}"
+            char cmd_str[256];
+            const char *sub = XdrvMailbox.topic + plen;
+            if (XdrvMailbox.data_len > 0) {
+              snprintf(cmd_str, sizeof(cmd_str), "%s %s", sub, XdrvMailbox.data);
+            } else {
+              snprintf(cmd_str, sizeof(cmd_str), "%s", sub);
+            }
+#ifdef ESP32
+            // 1.6.23 — Andreas's .104 (C3 single-core) saw the HTTP server
+            // hang for ~2:30 min when this lock was portMAX_DELAY and the
+            // VM-task TaskLoop was busy in a shareSetFloat burst. The HTTP
+            // serving task (loopTask on C3) blocked here, AsyncTCP backed
+            // up, and only the 60-s UDP-multicast socket reset recovered
+            // it. Use a bounded try-lock: if the VM is genuinely busy past
+            // 200 ms, bail out and let Tasmota return "Command unknown"
+            // — keeps the web server responsive and the user retries.
+            if (s->vm_mutex &&
+                xSemaphoreTake(s->vm_mutex, pdMS_TO_TICKS(200)) != pdTRUE) {
+              tc_busy = true;   // ours, but locked past 200 ms (slot busy) — transient
+              continue;
+            }
+#endif
+            if (!s->vm.halted || s->vm.error != TC_OK) {
+#ifdef ESP32
+              if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+              tc_busy = true;   // ours, but VM mid-execution / not idle — transient
+              continue;
+            }
+            tc_current_slot = s;
+            tc_vm_call_callback_str(&s->vm, "Command", cmd_str);
+            tc_current_slot = nullptr;
+#ifdef ESP32
+            if (s->vm_mutex) xSemaphoreGive(s->vm_mutex);
+#endif
+            result = true;
+            break;
+          }
+        }
+        // 1.6.34 (Andreas, .107 UI-flicker) — a registered prefix matched a
+        // slot but it was busy: the bounded 200 ms try-lock (1.6.23) timed
+        // out, or the VM was mid-execution. Reply a DISTINCT {"Command":
+        // "Busy"} instead of falling through to the generic {"Command":
+        // "Unknown"}, so a polling HTML UI can keep its last good value on a
+        // transient busy rather than blanking (which looked like data loss).
+        if (!result && tc_busy) {
+          Response_P(PSTR("{\"Command\":\"Busy\"}"));
+          result = true;
+        }
+      }
+      break;
+    case FUNC_RULES_PROCESS:
+      // Call user's Event(char json[]) callback with the event JSON data
+      if (ResponseLength()) {
+        tc_all_callbacks_str("Event", ResponseData());
+      }
+      break;
+    case FUNC_JSON_APPEND:
+      TinyCShow(true);
+      break;
+#ifdef USE_WEBSERVER
+    case FUNC_WEB_GET_ARG:
+      // Process sv= widget value updates from main page AJAX. The main
+      // page renders WebPage() for all slots; slot 0 remains the write
+      // target here (pre-existing multi-slot main-page assumption — the
+      // /tc_ui path above is slot-accurate).
+      TinyC_WebSetVar(0);
+      break;
+    case FUNC_WEB_SENSOR:
+      TinyCShow(false);
+      break;
+    case FUNC_WEB_ADD_MAIN_BUTTON:
+#ifdef USE_MATTER_C
+      // Only show the Matter pairing UI once a TinyC script has defined a Matter
+      // device (any mtr* syscall lazily inits the core).
+      if (mtrc_core_inited)
+        WSContentSend_P(PSTR("<p></p><form action='/mt' method='get'><button>"
+                             "Matter Pairing (Bind / Unbind)</button></form>"));
+#endif
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+      // Show MJPEG stream from port 81 — rendered once, not AJAX-refreshed
+      // onerror retry reconnects if stream drops (e.g. client disconnect)
+      if ((tc_cam_stream.server || tc_cam_stream.pending) && tc_cam_slot[0].len > 0) {
+        // Use onload script to set src AFTER page is fully rendered
+        // This prevents the stream request from blocking page load
+        WSContentSend_P(PSTR("<p></p><center>"
+          "<img id='tccam' onerror='setTimeout(()=>{this.src=\"http://%_I:%d/stream\";},2000)' "
+          "alt='TinyC Camera' style='width:99%%;'>"
+          "</center><p></p>"
+          "<script>window.addEventListener('load',()=>{document.getElementById('tccam').src="
+          "'http://%_I:%d/stream';});</script>"),
+          (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
+          (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT);
+      }
+#endif
+      // Reset WebChart state before calling WebPage()
+      tc_chart_seq = 0;
+      tc_chart_lib_sent = false;
+      tc_chart_width = 0;
+      tc_chart_height = 0;
+      tc_chart_time_base = 0;
+      // Wrap charts in block container to prevent inline-block cascading width expansion
+      WSContentSend_P(PSTR("<div style='display:block;width:100%%;overflow:hidden'>"));
+      // Call user's WebPage() on all active slots
+      for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+        TcSlot *s = Tinyc->slots[i];
+        if (!s || !s->loaded || !s->vm.halted || s->vm.error != TC_OK) continue;
+        tc_slot_callback(s, "WebPage");
+      }
+      WSContentSend_P(PSTR("</div>"));
+      // Inject JavaScript for widget interactions on main page (all slots)
+      {
+        bool js_sent = false;
+        bool has_webui = false;
+        for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+          TcSlot *si = Tinyc->slots[i];
+          if (!si || !si->loaded || !si->vm.halted || si->vm.error != TC_OK) continue;
+          if (!js_sent && tc_has_callback(&si->vm, "WebCall")) {
+            WSContentSend_P(PSTR(
+              "<script>"
+              "function seva(v,i){rfsh=1;la('&sv='+i+'_'+v);rfsh=0;}"
+              "function tcbtn(e,v,i){if(e.dataset.b)return;e.dataset.b=1;seva(v,i);"
+                "var o=e.textContent,a=e.getAttribute('data-a')||'\\u2713',c=e.style.background;"
+                "e.textContent=a;e.style.background='#0a0';e.style.color='#fff';"
+                "setTimeout(function(){e.textContent=o;e.style.background=c;e.style.color='';delete e.dataset.b;},2500);}"
+              "function siva(v,i){la('&sv='+i+'_s_'+v);}"
+              "function sivat(v,i){la('&sv='+i+'_t_'+v);}"
+              "function pr(f){if(f){lt=setTimeout(la,%d);}else{clearTimeout(lt);clearTimeout(ft);}}"
+              "</script>"
+            ), Settings->web_refresh);
+            js_sent = true;
+          }
+          if (tc_has_callback(&si->vm, "WebUI")) {
+            has_webui = true;
+          }
+        }
+        // Add buttons to /tc_ui pages if any slot has WebUI callback
+        if (has_webui) {
+          if (Tinyc->page_count > 0) {
+            for (uint8_t p = 0; p < Tinyc->page_count; p++) {
+              if (Tinyc->page_label[p][0]) {
+                WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'>"
+                  "<input type='hidden' name='p' value='%d'>"
+                  "<button>%s</button></form>"), p, Tinyc->page_label[p]);
+              }
+            }
+          } else {
+            WSContentSend_P(PSTR("<p></p><form action='tc_ui' method='get'><button>TinyC UI</button></form>"));
+          }
+        }
+      }
+      break;
+    case FUNC_WEB_ADD_CONSOLE_BUTTON:
+      if (XdrvMailbox.index) {
+        XdrvMailbox.index++;
+      } else {
+        WSContentSend_P(HTTP_FORM_BUTTON, PSTR("tc"), PSTR("TinyC Console"));
+        // Emit script-registered console buttons
+        if (Tinyc) {
+          for (uint8_t i = 0; i < Tinyc->console_btn_count; i++) {
+            WSContentSend_P(HTTP_FORM_BUTTON,
+              Tinyc->console_btn_url[i],
+              Tinyc->console_btn_label[i]);
+          }
+        }
+      }
+      break;
+    case FUNC_WEB_ADD_HANDLER:
+      WebServer_on(PSTR("/tc"), HandleTinyCPage);
+      Webserver->on("/tc_upload", HTTP_POST, HandleTinyCUploadDone, HandleTinyCUpload);
+      Webserver->on("/tc_upload", HTTP_OPTIONS, HandleTinyCUploadCORS);
+      // CORS preflight handler MUST be registered BEFORE the HTTP_ANY catch-all
+      // (HandleTinyCApi defaults to HTTP_ANY = 255 which matches every method
+      // including OPTIONS). Arduino-ESP32 WebServer iterates handlers in
+      // registration order, first-match-wins. Without this swap, OPTIONS
+      // preflight requests for /tc_api flow into HandleTinyCApi which then
+      // tries to execute the `cmd=readfile` etc. and returns the file body
+      // — Safari sees a non-empty preflight response and rejects the
+      // subsequent GET as a CORS failure, surfacing in the IDE as
+      // "Error: Load failed" on the "Load from Device" button.
+      Webserver->on("/tc_api", HTTP_OPTIONS, HandleTinyCApiCORS);
+      WebServer_on(PSTR("/tc_api"), HandleTinyCApi);
+      WebServer_on(PSTR("/tc_ui"), HandleTinyCUI);
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+      WebServer_on(PSTR("/tc_cam"), HandleTinyCCam);
+#endif
+      // Register any webOn handlers that were set up before web server started
+      if (Tinyc) {
+        for (int i = 0; i < Tinyc->web_handler_count && i < TC_MAX_WEB_HANDLERS; i++) {
+          if (Tinyc->web_handler_url[i][0]) {
+            Webserver->on(Tinyc->web_handler_url[i], TinyCWebOnHandlers[i]);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered (deferred)"), i + 1, Tinyc->web_handler_url[i]);
+          }
+        }
+      }
+#if defined(USE_TINYC_IDE) && defined(USE_UFILESYS)
+      WebServer_on(PSTR("/ide"), HandleTinyCIde);
+#endif
+#ifdef USE_UFILESYS
+      WebServer_on(PSTR("/cedit"), HandleSmlChartEditor);
+#endif
+#ifdef USE_HOMEKIT
+      WebServer_on(PSTR("/hk"), HandleHomeKitQR);
+#endif
+#ifdef USE_MATTER_C
+      WebServer_on(PSTR("/mt"), HandleMatterQR);   // Matter pairing (replaces /hk)
+#endif
+#ifdef USE_DISPLAY
+      WebServer_on(PSTR("/tc_display"), HandleTinyCDisplay);
+#endif
+      break;
+#endif
+    case FUNC_SAVE_BEFORE_RESTART:
+      // Fix A: a commanded restart / OTA is graceful — Tasmota calls
+      // FUNC_SAVE_BEFORE_RESTART ONLY here, never on crash/WDT/panic.
+      // Drop the boot-loop marker FIRST so a user's (even repeated)
+      // `Restart` is never mistaken for a crash-loop and cannot
+      // disable autoexec. Real loops (no FUNC_SAVE_BEFORE_RESTART)
+      // still leave the marker.
+      tc_bootloop_marker_delete();
+      // Call user's CleanUp() callback on all active slots (like scripter's >R section)
+      tc_all_callbacks_id(TC_CB_CLEAN_UP);
+      // Save persist variables for all loaded slots
+      for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+        TcSlot *s = Tinyc->slots[i];
+        if (s && s->loaded) {
+          tc_persist_save(&s->vm);
+        }
+      }
+      break;
+    case FUNC_ACTIVE:
+      result = true;
+      break;
+  }
+  return result;
+}
+
+#endif  // USE_TINYC
