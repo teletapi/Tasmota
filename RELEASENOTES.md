@@ -115,10 +115,12 @@ The latter links can be used for OTA upgrades too like ``OtaUrl https://ota.tasm
 ## Changelog v15.5.0.2
 ### Added
 - Support for baudrate 74880 replacing 74700 [#24924](https://github.com/arendst/Tasmota/issues/24924)
+- Limited support for BLE BTHome [#20763](https://github.com/arendst/Tasmota/issues/20763)
 - TLS support for EC P-384 curve in server certificate [#24909](https://github.com/arendst/Tasmota/issues/24909)
 - MagicSwitch configurable masking window fixing problems with multiple false triggering [#24888](https://github.com/arendst/Tasmota/issues/24888)
 - Support for WiZ compatible IoTorero ESP-Now Remote Control additional buttons P5 to P7
 - Berry `bytes` methods `setbits`/`getbits` transposed to native and support for big endian [#24857](https://github.com/arendst/Tasmota/issues/24857)
+- Berry extend `sortedmap` constructor [#24955](https://github.com/arendst/Tasmota/issues/24955)
 - HASPmota ability to set default screen background on `p0b0` object [#24874](https://github.com/arendst/Tasmota/issues/24874)
 - HASPmota and LVGL `stripes` widget [#24907](https://github.com/arendst/Tasmota/issues/24907)
 - Matter virtual IR HVAC thermostat support [#24821](https://github.com/arendst/Tasmota/issues/24821)
@@ -128,6 +130,7 @@ The latter links can be used for OTA upgrades too like ``OtaUrl https://ota.tasm
 ### Changed
 - Library `PubSubClient` renamed to `TasmotaPubSub`, hardening fixes and comprehensive non-regression tests [#24916](https://github.com/arendst/Tasmota/issues/24916)
 - MiElHVAC auto-enable i-See widevane when setting AirDirection [#24860](https://github.com/arendst/Tasmota/issues/24860)
+- Berry `json.dump()` works with subclasses of `map` and `list` [#24954](https://github.com/arendst/Tasmota/issues/24954)
 
 ### Fixed
 - Default button/switch actions on builds without rules regression from v15.4.0.2 [#24871](https://github.com/arendst/Tasmota/issues/24871)
@@ -135,8 +138,10 @@ The latter links can be used for OTA upgrades too like ``OtaUrl https://ota.tasm
 - Can sniffer functionality [#18287](https://github.com/arendst/Tasmota/issues/18287)
 - Udisp SPI for mono color display [#24899](https://github.com/arendst/Tasmota/issues/24899)
 - Minor fixes in `LList` [#24927](https://github.com/arendst/Tasmota/issues/24927)
+- NeoPool issue with localized JSON keys [#24962](https://github.com/arendst/Tasmota/issues/24962)
 - TLS fix public key fingerprint for ECDSA certificates [#24928](https://github.com/arendst/Tasmota/issues/24928)
 - Reset BLE scan flag on new operation [#24925](https://github.com/arendst/Tasmota/issues/24925)
 - BLE EQ3 float output in mqtt messages regression from v15.4.0.2 [#24869](https://github.com/arendst/Tasmota/issues/24869)
+- HASPmota better support for `textarea` [#24946](https://github.com/arendst/Tasmota/issues/24946)
 
 ### Removed
