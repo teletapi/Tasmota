@@ -350,6 +350,10 @@ void tinyc_touch_button(uint8_t btn, int16_t val) {
 // counter is gone before the crash, so it never accumulates across
 // reboots and Tasmota's no_autoexec never fires.
 #define TC_BOOT_MARKER "/tinyc.boot.lock"
+// Why autoexec is off. Written when a boot loop clears the flags, read on every later boot, and
+// removed as soon as autoexec is switched back on. Separate from TC_BOOT_MARKER, which is the
+// short-lived "a VM is starting right now" lock.
+#define TC_BOOTLOOP_FLAG "/tinyc.bootloop"
 #ifndef TC_BOOT_STABLE_S
 #define TC_BOOT_STABLE_S 30   // uptime at which boot is considered "succeeded"
 #endif
@@ -382,6 +386,16 @@ static void TinyCSaveSettings(void) {
   // Extra line for show_info
   f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
   f.close();
+  // Autoexec on again anywhere? Then the boot-loop explanation has served its purpose. Note this
+  // runs on the load path too (stale entries), but there every autoexec is already 0 after a wipe.
+  bool any_autoexec = false;
+  for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+    if (Tinyc->slot_config[i].autoexec) { any_autoexec = true; break; }
+  }
+  if (any_autoexec && fs->exists(TC_BOOTLOOP_FLAG)) {
+    fs->remove(TC_BOOTLOOP_FLAG);
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: autoexec re-enabled — boot-loop notice cleared"));
+  }
   AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: Settings saved"));
 }
 
@@ -600,8 +614,31 @@ static void TinyCLoadSettings(void) {
         AddLog(LOG_LEVEL_ERROR,
                PSTR("TCC: Boot loop (count=%d) — %s rewritten with autoexec=0 for all slots"),
                RtcReboot.fast_reboot_count, TC_CFG_FILE);
+        // Leave a trace that outlives THIS boot. The line above is printed exactly once, on the
+        // boot that does the rewrite. Every later boot then shows the ordinary
+        // "Slot 0: /x.tcb (autoexec=0 prefix=)" and is indistinguishable from a slot the user
+        // switched off himself -- which took a `Status 12` dump to untangle in the field
+        // (Hans, report 05.09.2026).
+        File mf = fs->open(TC_BOOTLOOP_FLAG, "w");
+        if (mf) {
+          mf.printf("%d", RtcReboot.fast_reboot_count);
+          mf.close();
+        }
       }
     }
+  }
+
+  // Still off because of a boot loop? Then say so on every boot, not just on the one that did the
+  // clearing. Cleared by TinyCSaveSettings as soon as any slot has autoexec again.
+  if (fs->exists(TC_BOOTLOOP_FLAG)) {
+    File bf = fs->open(TC_BOOTLOOP_FLAG, "r");
+    String cnt = bf ? bf.readString() : String();
+    if (bf) bf.close();
+    cnt.trim();
+    AddLog(LOG_LEVEL_ERROR,
+           PSTR("TCC: autoexec is OFF for every slot because a boot loop was detected "
+                "(fast_reboot_count=%s) — not because it was switched off. Enable a slot to clear this."),
+           cnt.length() ? cnt.c_str() : "?");
   }
 
   File f = fs->open(TC_CFG_FILE, "r");
@@ -1743,6 +1780,70 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
 }
 #endif
 
+#ifdef USE_UFILESYS
+// Read the optional plain name / info URL out of a .tcb header WITHOUT loading
+// the program. Both are TLV records behind the fixed 40-byte V6 header; the
+// header is self-describing (header_size in B20-21), so this is just "read the
+// first header_size bytes and walk the records past byte 40".
+//
+// ⚠️ Costs one open + one short read per .tcb on every /tc render. That is the
+// price for a readable list, and it is paid on a page the user asked for, not
+// in the loop task -- the mistake that made the repository box block the whole
+// device before it moved into the browser (see the Repository section below).
+//
+// Returns true if at least one field was found. Both buffers are always
+// NUL-terminated, empty when the field is absent.
+static bool tc_tcb_meta(FS *fs, const char *path,
+                        char *name, size_t nsz, char *info, size_t isz) {
+  if (name && nsz) name[0] = 0;
+  if (info && isz) info[0] = 0;
+  if (!fs) return false;
+  File f = fs->open(path, "r");
+  if (!f) return false;
+  uint8_t hdr[40];
+  bool ok = false;
+  if (f.read(hdr, sizeof(hdr)) == (int)sizeof(hdr)) {
+    uint32_t magic = ((uint32_t)hdr[0] << 24) | ((uint32_t)hdr[1] << 16) |
+                     ((uint32_t)hdr[2] << 8) | hdr[3];
+    uint16_t version = (hdr[4] << 8) | hdr[5];
+    uint16_t hsize   = (hdr[20] << 8) | hdr[21];
+    // Only V6+ has a self-describing header; hsize == 40 means "no metadata".
+    // The upper bound keeps a corrupt file from making us read the whole flash.
+    if (magic == TC_MAGIC && version >= 6 && hsize > 40 && hsize <= 40 + 512) {
+      uint16_t mlen = hsize - 40;
+      uint8_t *meta = (uint8_t *)malloc(mlen);
+      if (meta && f.read(meta, mlen) == (int)mlen) {
+        uint16_t i = 0;
+        while (i + 2 <= mlen) {
+          uint8_t tag = meta[i], len = meta[i + 1];
+          if (i + 2 + len > mlen) break;            // truncated record -- stop, don't guess
+          char *dst = nullptr; size_t dsz = 0;
+          if      (tag == 1) { dst = name; dsz = nsz; }
+          else if (tag == 2) { dst = info; dsz = isz; }
+          if (dst && dsz) {
+            size_t n = (len < dsz - 1) ? len : dsz - 1;
+            memcpy(dst, meta + i + 2, n);
+            dst[n] = 0;
+            ok = true;
+          }
+          i += 2 + len;                              // unknown tags are skipped by length
+        }
+      }
+      if (meta) free(meta);
+    }
+  }
+  f.close();
+  // ⚠️ Only http(s) links are handed to the page. The URL comes out of a file
+  // that someone else compiled, and it ends up in an onclick that opens it --
+  // a `javascript:` in there would run in the device's own origin.
+  if (info && info[0] && strncasecmp(info, "http://", 7) != 0
+                      && strncasecmp(info, "https://", 8) != 0) {
+    info[0] = 0;
+  }
+  return ok;
+}
+#endif  // USE_UFILESYS
+
 static void HandleTinyCPage(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
@@ -1970,7 +2071,7 @@ static void HandleTinyCPage(void) {
         "<fieldset><legend><b> Load Program </b></legend>"
         "<p><form action='/tc' method='get'>"
         "<div style='display:flex;gap:8px;align-items:center'>"
-        "<select name='file' style='flex:1'>"));
+        "<select name='file' id='tclf' style='flex:1'>"));
       // Scan up to 2 filesystems: ufsp (SD/main) and ffsp (flash) if different
       FS *fss[] = { ufsp, (ffsp && ffsp != ufsp) ? ffsp : nullptr };
       const char *fslabel[] = { "", " [flash]" };
@@ -1991,8 +2092,18 @@ static void HandleTinyCPage(void) {
           if (nlen > 4 && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
             char fpath[40];
             snprintf(fpath, sizeof(fpath), "/%s", ep);
-            WSContentSend_P(PSTR("<option value='%s'>%s (%d B)%s</option>"),
-              fpath, ep, entry.size(), fslabel[fi]);
+            // Plain name and info link out of the .tcb header, if the program
+            // carries them (`// @name:` / `// @info:` in the .tc). Without them
+            // the entry looks exactly as it always did -- that is the whole
+            // point, nobody has to annotate anything for the page to work.
+            char mname[52] = { 0 }, minfo[168] = { 0 };
+            tc_tcb_meta(fss[fi], fpath, mname, sizeof(mname), minfo, sizeof(minfo));
+            String label = mname[0]
+              ? HtmlEscape(String(mname)) + F(" (") + String(ep) + F(")")
+              : String(ep);
+            WSContentSend_P(PSTR("<option value='%s' data-u='%s'>%s (%d B)%s</option>"),
+              fpath, minfo[0] ? HtmlEscape(String(minfo)).c_str() : "",
+              label.c_str(), entry.size(), fslabel[fi]);
           }
           entry.close();
         }
@@ -2000,6 +2111,18 @@ static void HandleTinyCPage(void) {
       }
       WSContentSend_P(PSTR(
         "</select>"
+        // ⚠️ ONE info button next to the list, not one per entry: inside a
+        // <select> no button can live, and turning the list into a table would
+        // cost far more page bytes than this page can spare. The button follows
+        // the selection and disables itself when the chosen program carries no
+        // link. `tclI()` is defined once below, after the <select> exists.
+        // ⚠️ line-height und font-size MUESSEN mit: Tasmotas `.button` setzt
+        // 2.4rem/1.2rem, der Knopf wurde damit 38.4 px hoch neben einer 32 px
+        // hohen Liste. Das padding allein zu nullen reicht nicht -- die Hoehe
+        // kommt aus der Zeilenhoehe (Hans, 2026-08-28; nachgemessen auf dem C3).
+        "<button type='button' id='tclib' class='button'"
+        " style='width:auto;padding:0 10px;line-height:2rem;font-size:1rem'"
+        " title='Info' onclick='tclI()'>i</button>"
         "<select name='slot' style='width:auto'>"));
       for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
         WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
@@ -2011,7 +2134,20 @@ static void HandleTinyCPage(void) {
         "<button name='cmd' value='delall' class='button bred'"
         " onclick=\"return confirm('Delete all .tcb files, stop all slots and clear the slot list?')\">"
         "Delete All .tcb</button>"
-        "</div></form></p></fieldset>"));
+        "</div></form></p></fieldset>"
+        // The info button follows the selection: each <option> carries its link
+        // in data-u, and an entry without one greys the button out instead of
+        // opening a blank tab.
+        "<script>function tclU(){var s=document.getElementById('tclf');"
+        "return s&&s.selectedIndex>=0?(s.options[s.selectedIndex].dataset.u||''):''}"
+        "function tclI(){var u=tclU();if(u)window.open(u,'_blank','noopener')}"
+        "function tclS(){var b=document.getElementById('tclib');if(!b)return;"
+        // ⚠️ Tasmotas Knopf-CSS kennt kein :disabled -- ein abgeschalteter Knopf
+        // sieht aus wie ein anklickbarer. Also von Hand abblenden.
+        "b.disabled=!tclU();b.style.opacity=b.disabled?'.35':'1';"
+        "b.title=b.disabled?'Kein Info-Link hinterlegt':'Info'}"
+        "(function(){var s=document.getElementById('tclf');"
+        "if(s){s.addEventListener('change',tclS);tclS()}})();</script>"));
 
       // --- Remote repository selector (fetched CLIENT-SIDE; see the <script> below) ---
       {
@@ -2043,6 +2179,10 @@ static void HandleTinyCPage(void) {
             "<fieldset><legend><b> Repository </b></legend>"
             "<div style='display:flex;gap:8px;align-items:center'>"
             "<select id='tcrf' style='flex:1'><option>loading...</option></select>"
+            // Dieselben zwei Zahlen wie bei tclib -- siehe dort.
+            "<button type='button' id='tcrib' class='button'"
+            " style='width:auto;padding:0 10px;line-height:2rem;font-size:1rem'"
+            " title='Info' onclick='tcrI()'>i</button>"
             "<select id='tcrs' style='width:auto'>"));
           for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
             WSContentSend_P(PSTR("<option value='%d'>Slot %d</option>"), i, i);
@@ -2056,15 +2196,58 @@ static void HandleTinyCPage(void) {
           WSContentSend_P(PSTR(
             "<script>var TCREPO='%s';"
             "function tcB(){var b=TCREPO;return b.charAt(b.length-1)=='/'?b.slice(0,-1):b}"
-            "function tcFill(f){var s=document.getElementById('tcrf');"
-            "fetch(tcB()+'/index.txt',{cache:f?'reload':'default'}).then(function(r){"
-            "if(!r.ok)throw r.status;return r.text()}).then(function(t){"
+            // index.json first, index.txt as the fallback -- BOTH directions have
+            // to keep working and neither side can be updated in lockstep:
+            // old firmware against a new repo still reads index.txt (which
+            // build.html keeps writing), new firmware against an old repo falls
+            // back here. Entries are {file,name,info}; anything missing degrades
+            // to exactly the old behaviour, the bare filename.
+            "function tcOpt(s,f,n,u){var o=document.createElement('option');"
+            "o.value=f;o.textContent=n?n+' ('+f+')':f;if(u)o.dataset.u=u;s.appendChild(o)}"
+            "function tcrU(){var s=document.getElementById('tcrf');"
+            "return s&&s.selectedIndex>=0?(s.options[s.selectedIndex].dataset.u||''):''}"
+            "function tcrI(){var u=tcrU();if(u)window.open(u,'_blank','noopener')}"
+            // ⚠️ DIE AUSWAHL UEBERLEBT DAS NEULADEN SONST NICHT. Chromes eigene
+            // Formularwiederherstellung laeuft, BEVOR der fetch fertig ist --
+            // zu dem Zeitpunkt ist die Liste durch `s.innerHTML=''` leer, es
+            // gibt also kein <option>, auf das sie zuruecksetzen koennte, und
+            // die Liste steht danach auf Eintrag 1. Nachgemessen auf dem C3:
+            // Index 3 -> neu laden -> Index 0.
+            //
+            // Das sah wie ein Wackelkontakt aus, weil nichts neu aufgebaut
+            // wird, solange man auf der Seite bleibt. Es trifft genau den
+            // Ablauf, den der neue (i)-Knopf erzeugt: Programm waehlen, seine
+            // Seite lesen, zurueck -- Auswahl weg. (Hans, 2026-08-28.)
+            //
+            // sessionStorage ueberlebt das und gilt nur fuer diesen Tab.
+            // ⚠️ Die Load-Program-Liste braucht das NICHT: ihre <option> stehen
+            // im HTML, das der Server liefert, und werden nicht ersetzt --
+            // dort wirkt die Wiederherstellung des Browsers wie vorgesehen.
+            "function tcrW(){try{sessionStorage.setItem('tcrf',"
+            "document.getElementById('tcrf').value)}catch(e){}}"
+            "function tcrL(){var s=document.getElementById('tcrf'),v='';"
+            "try{v=sessionStorage.getItem('tcrf')||''}catch(e){}"
+            "if(v)for(var i=0;i<s.options.length;i++)"
+            "if(s.options[i].value==v){s.selectedIndex=i;break}"
+            "tcrS()}"
+            "function tcrS(){var b=document.getElementById('tcrib');if(!b)return;"
+            "b.disabled=!tcrU();b.style.opacity=b.disabled?'.35':'1';"
+            "b.title=b.disabled?'Kein Info-Link hinterlegt':'Info'}"
+            "function tcTxt(s,f){return fetch(tcB()+'/index.txt',{cache:f?'reload':'default'})"
+            ".then(function(r){if(!r.ok)throw r.status;return r.text()}).then(function(t){"
             "var ls=t.split(String.fromCharCode(10)).map(function(x){return x.trim()})"
             ".filter(function(x){return x.slice(-4)=='.tcb'});s.innerHTML='';"
             "if(!ls.length){s.innerHTML='<option>(empty)</option>';return}"
-            "ls.forEach(function(n){var o=document.createElement('option');"
-            "o.value=n;o.textContent=n;s.appendChild(o)})}).catch(function(e){"
-            "s.innerHTML='<option>(list failed)</option>';"
+            "ls.forEach(function(n){tcOpt(s,n,'','')})})}"
+            "function tcFill(f){var s=document.getElementById('tcrf');"
+            "fetch(tcB()+'/index.json',{cache:f?'reload':'default'}).then(function(r){"
+            "if(!r.ok)throw r.status;return r.json()}).then(function(j){"
+            "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';s.innerHTML='';"
+            "ls.forEach(function(e){var u=e.info||'';"
+            "if(u&&u.slice(0,7)!='http://'&&u.slice(0,8)!='https://')u='';"
+            "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u)});tcrL()})"
+            ".catch(function(){return tcTxt(s,f).then(tcrL)}).catch(function(e){"
+            "s.innerHTML='<option>(list failed)</option>';tcrS();"
             "document.getElementById('tcrmsg').textContent='Repo list fetch failed: '+e})}"
             "function tcDl(){var f=document.getElementById('tcrf').value,"
             "sl=document.getElementById('tcrs').value,b=document.getElementById('tcdlb'),"
@@ -2077,6 +2260,8 @@ static void HandleTinyCPage(void) {
             "m.textContent='Loaded '+f+' to slot '+sl+', reloading...';"
             "setTimeout(function(){location.reload()},900)}).catch(function(e){"
             "b.disabled=0;b.textContent='Download & Load';m.textContent='Failed: '+e})}"
+            "document.getElementById('tcrf').addEventListener('change',"
+            "function(){tcrW();tcrS()});"
             "tcFill(0);</script>"), repo_url);
         }
       }
@@ -2169,14 +2354,15 @@ static void HandleTinyCPage(void) {
     "localStorage.setItem('tinyc_ide_url',this.value)};</script>"));
 #endif
 #ifdef USE_TINYC_REPO_IDE
-  // The other way round: no IDE on the device at all. /tcrepo is a ~4 KB page
-  // that pulls the compiler out of the repo into the browser and installs a
-  // repo example straight into a slot.
+  // The other way round: no IDE on the device at all. /tcrepo is a ~3 KB page
+  // that pulls the WHOLE IDE out of the repo into the browser and runs it in an
+  // iframe -- edit, compile, upload and run all happen there. Until 2026-09-03
+  // it only installed a repo example and threw the rest of the bundle away.
   WSContentSend_P(PSTR(
     "<p style='text-align:center'>"
-    "<button onclick=\"window.open('/tcrepo','tinyc_repo')\" class='button'>Run example from repo</button>"
+    "<button onclick=\"window.open('/tcrepo','tinyc_repo')\" class='button'>Run IDE from repo</button>"
     "</p>"
-    "<p style='text-align:center;font-size:.85em;opacity:.6'>Nothing stored on the device: the browser fetches the compiler from the repo, compiles there and uploads the .tcb. Needs internet in the browser.</p>"));
+    "<p style='text-align:center;font-size:.85em;opacity:.6'>The full IDE, fetched from the repo into the browser -- edit and run without any IDE on the device. It asks this device for its ABI and compiles to match. Needs internet in the browser; the on-device IDE works offline.</p>"));
 #endif
   WSContentSend_P(PSTR("</fieldset>"));
 
@@ -5057,6 +5243,44 @@ static void HandleTinyCWebOn7(void) { HandleTinyCWebOn(7); }
 
 // ---- Camera JPEG endpoint: /tc_cam?slot=N — serve PSRAM slot directly ----
 #if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+// Einen Kamera-Slot als EIN JPEG ausliefern.
+//
+// ⚠️ ERST KOPIEREN, DANN SENDEN. Der Slot wird von der VM-Task fortlaufend
+// neu beschrieben; `writing` ist nur ein Merker fuer den Augenblick, keine
+// Sperre ueber die Dauer des Sendens. Wer direkt aus dem Slot sendet, liefert
+// ein halbes altes und ein halbes neues Bild -- in Safari sah man genau das:
+// „es wird manchmal nur halb gezeichnet" (gemu 04.09.2026). Der Streampfad
+// macht es seit jeher richtig und sagt es sogar im Kommentar
+// („Copy frame to send buffer first"); die beiden Einzelbild-Handler taten es
+// nicht.
+//
+// Nach dem Kopieren wird NOCHMAL geprueft: faengt der Schreiber waehrend des
+// memcpy an, ist die Kopie schon zerrissen. Dann lieber 503 und der Aufrufer
+// holt sich das naechste Bild -- ein Bild zu ueberspringen faellt bei 10 Bildern
+// je Sekunde niemandem auf, ein zerrissenes schon.
+static void TC_SendCamSlotAsJpeg(int idx) {
+  if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
+    Webserver->send(503, "text/plain", "no image");
+    return;
+  }
+  uint32_t len = tc_cam_slot[idx].len;
+  uint8_t *kopie = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!kopie) { kopie = (uint8_t *)malloc(len); }
+  if (!kopie) {
+    Webserver->send(503, "text/plain", "no memory");
+    return;
+  }
+  memcpy(kopie, tc_cam_slot[idx].buf, len);
+  if (tc_cam_slot[idx].writing || tc_cam_slot[idx].len != len) {
+    free(kopie);
+    Webserver->send(503, "text/plain", "frame changed");
+    return;
+  }
+  Webserver->sendHeader(F("Cache-Control"), F("no-cache, no-store"));
+  Webserver->send_P(200, "image/jpeg", (const char *)kopie, len);
+  free(kopie);
+}
+
 static void HandleTinyCCam(void) {
   int slot = 1;  // default slot 1
   if (Webserver->hasArg("slot")) {
@@ -5066,13 +5290,7 @@ static void HandleTinyCCam(void) {
     Webserver->send(400, "text/plain", "invalid slot");
     return;
   }
-  int idx = slot - 1;
-  if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
-    Webserver->send(503, "text/plain", "no image");
-    return;
-  }
-  Webserver->sendHeader("Cache-Control", "no-cache, no-store");
-  Webserver->send_P(200, "image/jpeg", (const char*)tc_cam_slot[idx].buf, tc_cam_slot[idx].len);
+  TC_SendCamSlotAsJpeg(slot - 1);
 }
 
 // ---- MJPEG streaming server on port 81 ----
@@ -5082,6 +5300,32 @@ static void TC_CamStreamHandler(void) {
   tc_cam_stream.client = tc_cam_stream.server->client();
   AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: stream client connected"));
 }
+
+// GET /tc_cam.jpg — EIN Bild, dann Schluss.
+//
+// ⚠️ WOZU, wo es doch einen Stream gibt: Safari zeigte meistens kein Bild
+// (gemu 04.09.2026), Chrome immer. Zwei Gründe, und beide treffen nur Safari:
+//
+//   * `multipart/x-mixed-replace` in einem `<img>` ist in Safari seit Jahren
+//     unzuverlässig. `webcam.tc` trägt für dasselbe Symptom längst eine
+//     Umgehung mit genau diesem Kommentar -- nur zeichnet beim TinyC-Treiber
+//     das Bild hier in C++, und hier fehlte sie.
+//   * Der Streamserver auf Port 81 hält GENAU EINEN Client
+//     (`tc_cam_stream.client = server->client()`), und alle drei URIs
+//     (/stream, /cam.mjpeg, /cam.jpg) landen im selben Multipart-Handler --
+//     ein Einzelbild gab es dort gar nicht. Safari öffnet Verbindungen gern
+//     spekulativ doppelt; die zweite verdrängt die erste, und das `<img>` auf
+//     dem Schirm hängt an der verworfenen. Das erklärt das „meistens".
+//
+// Deshalb liegt dieser Handler am HAUPTserver (Port 80): der verträgt mehrere
+// Verbindungen, und die Seite kommt von dort -- gleiche Herkunft, keine
+// Sonderfälle.
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+static void HandleTinyCCamJpg(void) {
+  if (!HttpCheckPriviledgedAccess()) { return; }
+  TC_SendCamSlotAsJpeg(0);
+}
+#endif
 
 static void TC_CamStreamRoot(void) {
   tc_cam_stream.server->sendHeader("Location", "/cam.mjpeg");
@@ -5354,6 +5598,24 @@ static void HandleTinyCUI(void) {
     "function siva(v,i,r){rfsh=1;la('&sv='+i+'_S_'+r+'_'+v);rfsh=0;}"
     "function sivat(v,i){rfsh=1;la('&sv='+i+'_t_'+v);rfsh=0;}"
     "function pr(f){if(f){lt=setTimeout(la,2000);rfsh=1;}else{clearTimeout(lt);rfsh=0;}}"
+    // ⚠️ EIN VERSTECKTER TAB FRAGT WEITER. `la()` bewaffnet den Zeitgeber
+    // bedingungslos neu; Chrome bremst ihn im Hintergrund nur, und der
+    // faellige Tick feuert in dem Augenblick, in dem der Tab wieder sichtbar
+    // wird -- was sich anfuehlt, als lade die Seite beim Umschalten neu.
+    //
+    // Teuer ist es, weil der Webserver IMMER NUR EINEN Client bedient (siehe
+    // TasmotaWebServer::handleClient): jeder offene Tab belegt diesen Platz
+    // alle zwei Sekunden, auch wenn ihn niemand ansieht. Anhalten statt
+    // bremsen -- und bei der Rueckkehr EINMAL sofort holen, damit die Anzeige
+    // nicht zwei Sekunden alt dasteht. (Hans, 2026-08-28.)
+    // ⚠️ Beim Zurueckkommen den VORHERIGEN Zustand wiederherstellen, nicht
+    // einschalten. Erste Fassung setzte `rfsh=1` -- eine Seite, auf der das
+    // Abfragen ueber pr(0) ausgeschaltet war, fing danach an zu fragen. Beim
+    // Nachmessen aufgefallen und nicht beim Lesen.
+    "var vsav=rfsh;"
+    "document.addEventListener('visibilitychange',function(){"
+      "if(document.hidden){vsav=rfsh;clearTimeout(lt);rfsh=0;}"
+      "else if(vsav){rfsh=1;la();}});"
     "window.onload=la;"
     "</script>"
   ), page);
@@ -7121,6 +7383,27 @@ bool Xdrv124(uint32_t function) {
           if (_a >= 8) {
             AddLog(LOG_LEVEL_INFO, PSTR("TCC: lwIP TCP PCBs active=%u (pool=16, time_wait=%u) - connections not closing?"), _a, _tw);
           }
+#ifdef USE_HTTP_KEEPALIVE
+          // How often a kept-alive connection had to be given up. The counters
+          // live in TasmotaWebServer and are reported only here — that header
+          // must not depend on anything from the Tasmota core.
+          //
+          // ⚠️ This is the line that was MISSING during ottelo9/tasmota-sml-images#52.
+          // A single held connection takes down the entire web server (the
+          // Arduino WebServer serves one client at a time), and the log said
+          // nothing about it for weeks.
+          //   idle  > 0   peer went away without closing
+          //   other > 0   peer polls so tightly that nobody else would get in;
+          //               without that bound port 80 stays shut for the browser
+          if (Webserver) {
+            static uint16_t _ka_i = 0, _ka_o = 0;
+            uint16_t i = Webserver->kaDropIdle(), o = Webserver->kaDropOther();
+            if (i != _ka_i || o != _ka_o) {
+              AddLog(LOG_LEVEL_DEBUG, PSTR("TCC: http keep-alive dropped idle=%u other=%u"), i, o);
+              _ka_i = i; _ka_o = o;
+            }
+          }
+#endif
         }
       }
 #endif
@@ -7265,12 +7548,23 @@ bool Xdrv124(uint32_t function) {
       if ((tc_cam_stream.server || tc_cam_stream.pending) && tc_cam_slot[0].len > 0) {
         // Use onload script to set src AFTER page is fully rendered
         // This prevents the stream request from blocking page load
+        // ⚠️ SAFARI BEKOMMT EINZELBILDER, alle anderen den Multipart-Strom.
+        // Warum, steht bei HandleTinyCCamJpg(). Die Bilder werden VERKETTET
+        // geholt -- das nächste erst, wenn das vorige da ist -- statt mit
+        // einem festen setInterval: bei einer langsamen Verbindung stapeln
+        // sich sonst die Anfragen, und der ESP beantwortet sie alle.
         WSContentSend_P(PSTR("<p></p><center>"
-          "<img id='tccam' onerror='setTimeout(()=>{this.src=\"http://%_I:%d/stream\";},2000)' "
-          "alt='TinyC Camera' style='width:99%%;'>"
+          "<img id='tccam' alt='TinyC Camera' style='width:99%%;'>"
           "</center><p></p>"
-          "<script>window.addEventListener('load',()=>{document.getElementById('tccam').src="
-          "'http://%_I:%d/stream';});</script>"),
+          "<script>window.addEventListener('load',function(){"
+          "var c=document.getElementById('tccam');"
+          "if(/^((?!chrome|android).)*safari/i.test(navigator.userAgent)){"
+          "var n=function(){c.src='/tc_cam.jpg?'+Date.now();};"
+          "c.onload=function(){setTimeout(n,80);};"
+          "c.onerror=function(){setTimeout(n,1000);};n();"
+          "}else{"
+          "c.onerror=function(){setTimeout(function(){c.src='http://%_I:%d/stream';},2000);};"
+          "c.src='http://%_I:%d/stream';}});</script>"),
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT);
       }
@@ -7310,6 +7604,14 @@ bool Xdrv124(uint32_t function) {
               "function siva(v,i,r){la('&sv='+i+'_S_'+r+'_'+v);}"
               "function sivat(v,i){la('&sv='+i+'_t_'+v);}"
               "function pr(f){if(f){lt=setTimeout(la,%d);}else{clearTimeout(lt);clearTimeout(ft);}}"
+              // Dieselbe Sache wie auf /tc_ui -- siehe die Anmerkung dort.
+              // ⚠️ Hier gibt es kein `rfsh`; ob abgefragt wird, steckt allein
+              // darin, ob `lt` scharf ist. Deshalb ein eigener Merker, und
+              // fortgesetzt wird NUR, was wir selbst angehalten haben.
+              "var vsav=1;"
+              "document.addEventListener('visibilitychange',function(){"
+                "if(document.hidden){vsav=lt?1:0;pr(0);}"
+                "else if(vsav){la();pr(1);}});"
               "</script>"
             ), Settings->web_refresh);
             js_sent = true;
@@ -7351,6 +7653,9 @@ bool Xdrv124(uint32_t function) {
       break;
     case FUNC_WEB_ADD_HANDLER:
       WebServer_on(PSTR("/tc"), HandleTinyCPage);
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA))
+      WebServer_on(PSTR("/tc_cam.jpg"), HandleTinyCCamJpg);
+#endif
 #ifdef USE_TINYC_REPO_IDE
       WebServer_on(PSTR("/tcrepo"), HandleTinyCRepoIde);
 #endif

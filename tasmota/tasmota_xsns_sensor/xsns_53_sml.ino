@@ -796,6 +796,25 @@ int8_t index;
 };
 
 #define SML_OPTIONS_JSON_ENABLE 1
+// bit 1 (2) = obis_line_mode (see the `smlj` variable docs)
+#define SML_OPTIONS_NO_WEB      4   // suppress the SML driver's own web (FUNC_WEB_SENSOR) rendering. A TinyC/Scripter program can
+                                    // then read the descriptor and render the values inside its OWN card (one card, no duplicate).
+                                    // Set from a script via `smlj |= 4` (Scripter) or `tasm_smlj = tasm_smlj | 4` (TinyC).
+#define SML_OPTIONS_MATH_NOWAIT 16  // compute `=m` lines as before: once per second, with whatever the variables happen to hold.
+                                    // Default (bit clear) is the freshness gate: a `=m` line waits until every operand it reads has
+                                    // been updated since that line last computed. That removes both the one-telegram lag and the
+                                    // mixed state where one operand is new and another still holds the previous burst's value.
+                                    // Set this bit only to restore the old timing (`smlj |= 16` / `tasm_smlj = tasm_smlj | 16`).
+                                    // NB "since THAT LINE last computed": the bookkeeping is per line. The first implementation
+                                    // cleared a shared per-variable flag instead -- see the `mseen` comment in SML_GLOBS.
+#define SML_MATH_OPERANDS 9         // first operand + up to 8 more, matching the `=m` parser below
+#define SML_OPTIONS_JSON_ALL    8   // publish EVERY descriptor line on TelePeriod, including entries the meter has not sent yet.
+                                    // Upstream PR #24587 made SML_Show skip values whose `dvalid` flag is still 0, so a meter that
+                                    // reports a register only occasionally (or not at all, e.g. unused tariff registers) makes its
+                                    // JSON keys appear and disappear between TelePeriods. Consumers that expect a stable key set
+                                    // (databases, Node-RED flows, Grafana) break on that. With this bit the pre-#24587 behaviour
+                                    // is restored: never-received entries are published with their initial value.
+                                    // Set from a script via `smlj |= 8` (Scripter) or `tasm_smlj = tasm_smlj | 8` (TinyC).
 
 struct SML_GLOBS {
   uint8_t sml_send_blocks;
@@ -806,6 +825,20 @@ struct SML_GLOBS {
   uint8_t *meter_p;
   double *meter_vars;
   uint8_t *dvalid;
+  // Per variable: a generation counter, bumped every time the variable receives a fresh value --
+  // from the meter, or as the result of a `=m` line. Deliberately NOT a spare bit of dvalid: the
+  // `=d` path uses that byte as a counter (`+= 1`, valid from 2), and sml_getv() hands it to scripts
+  // unmasked -- a high bit would make the first delta publish early and change a documented script
+  // value. maxvars is a uint8_t, so this costs at most 255 bytes. 0 means "never updated", so the
+  // counter skips 0 when it wraps.
+  uint8_t *mgen;
+  // Per `=m` line (indexed by that line's own vindex): the generation each of its operands had when
+  // this line last computed. THE POINT IS THAT IT IS PER LINE. The first version cleared a shared
+  // per-variable "is fresh" flag on the operands instead, so of two `=m` lines reading the same
+  // variable the first consumed it and the second was blocked -- on every telegram, for good. And it
+  // failed silently: a line that never computes never sets dvalid, so its value did not go stale, it
+  // vanished from the JSON altogether. Costs maxvars * SML_MATH_OPERANDS bytes.
+  uint8_t *mseen;
   double dvalues[MAX_DVARS];
   uint32_t dtimes[MAX_DVARS];
   char sml_start;
@@ -2167,6 +2200,7 @@ void sml_shift_in(uint32_t meters, uint32_t shard) {
 					len = mp->sbsiz;
 				}
 				memmove(mp->sbuff, payload, len);
+				mp->spos = len;   // expose the decrypted block to the script (sml(-1,2)/SML_Read); SML_Decode/OBIS ignore spos
 				AddLog(LOG_LEVEL_DEBUG, PSTR("SML: decrypted block: %d bytes"), len);
 				SML_Decode(meters);
 			}
@@ -2663,14 +2697,35 @@ void SML_Decode(uint8_t index) {
         uint8_t opr;
         uint8_t mind;
         int32_t ind;
+        // FRESHNESS GATE (see SML_OPTIONS_MATH_NOWAIT). A `=m` line computes only once every
+        // operand it reads has been updated since this line last computed. Without it the result
+        // is at best one telegram old, and on meters whose exchange takes longer than the one-second
+        // math tick it can mix a NEW value with the PREVIOUS burst's -- which on a meter that reports
+        // import and export in separate registers is wrong by the whole export power.
+        // An operand the meter has never sent (dvalid still 0) is NOT required to be fresh, so a
+        // descriptor referencing an unused register keeps computing exactly as before.
+        uint8_t fresh_ok = 1;
+        uint8_t used[SML_MATH_OPERANDS];   // first operand + up to 8 more
+        uint8_t used_cnt = 0;
+        uint8_t gate = sml_globs.mgen && sml_globs.mseen && !(sml_globs.sml_options & SML_OPTIONS_MATH_NOWAIT);
+        // This line's own record of what it last consumed. The operands parse in a fixed order, so
+        // slot k always refers to the same variable and can be compared from pass to pass.
+        uint8_t *seen = gate ? &sml_globs.mseen[(uint32_t)vindex * SML_MATH_OPERANDS] : NULL;
+        double result;
         mind = strtol((char*)mp, (char**)&mp, 10);
         if (mind < 1 || mind > sml_globs.maxvars) mind = 1;
+        if (gate) {
+          used[used_cnt] = mind - 1;
+          if (sml_globs.dvalid[mind - 1] && sml_globs.mgen[mind - 1] == seen[used_cnt]) fresh_ok = 0;
+          used_cnt++;
+        }
         dvar = sml_globs.meter_vars[mind - 1];
+        result = dvar;
         while (*mp==' ') mp++;
         for (uint8_t p = 0; p < 8; p++) {
           if (*mp == '@') {
-            // store result
-            sml_globs.meter_vars[vindex] = dvar;
+            // store result (committed after the loop, once the freshness gate has passed)
+            result = dvar;
             mp++;
             break;
           }
@@ -2684,6 +2739,11 @@ void SML_Decode(uint8_t index) {
           ind = strtol((char*)mp, (char**)&mp, 10);
           mind = ind;
           if (mind < 1 || mind > sml_globs.maxvars) mind = 1;
+          if (gate && !iflg && used_cnt < SML_MATH_OPERANDS) {
+            used[used_cnt] = mind - 1;
+            if (sml_globs.dvalid[mind - 1] && sml_globs.mgen[mind - 1] == seen[used_cnt]) fresh_ok = 0;
+            used_cnt++;
+          }
           switch (opr) {
               case '+':
                 if (iflg) dvar += ind;
@@ -2704,16 +2764,26 @@ void SML_Decode(uint8_t index) {
           }
           while (*mp==' ') mp++;
           if (*mp == '@') {
-            // store result
-            sml_globs.meter_vars[vindex] = dvar;
+            // store result (committed after the loop, once the freshness gate has passed)
+            result = dvar;
             mp++;
             break;
           }
         }
         double fac = CharToDouble((char*)mp);
-        sml_globs.meter_vars[vindex] /= fac;
-        SML_Immediate_MQTT((const char*)mp, vindex, mindex);
-        sml_globs.dvalid[vindex] = 1;
+        if (fresh_ok) {
+          sml_globs.meter_vars[vindex] = result / fac;
+          SML_Immediate_MQTT((const char*)mp, vindex, mindex);
+          sml_globs.dvalid[vindex] = 1;
+          if (gate) {
+            // Record what we consumed IN THIS LINE'S OWN SLOTS. Nothing global is cleared, so a
+            // second `=m` line may read the same operand. Bump the result's generation so a chained
+            // `=m` reading it still sees a change.
+            for (uint8_t u = 0; u < used_cnt; u++) seen[u] = sml_globs.mgen[used[u]];
+            uint8_t g = sml_globs.mgen[vindex] + 1;
+            sml_globs.mgen[vindex] = g ? g : 1;
+          }
+        }
         // get sfac
       } else if (*mp == 'd') {
         // calc deltas d ind 10 (eg every 10 secs)
@@ -3223,6 +3293,10 @@ void SML_Decode(uint8_t index) {
       if (found) {
         // matches, get value
         sml_globs.dvalid[vindex] = 1;
+        if (sml_globs.mgen) {
+          uint8_t g = sml_globs.mgen[vindex] + 1;
+          sml_globs.mgen[vindex] = g ? g : 1;   // 0 is reserved for "never updated"
+        }
         mp++;
 #if defined(ED300L) || defined(AS2020) || defined(DTZ541) || defined(USE_SML_SPECOPT)
         sml_globs.g_mindex = mindex;
@@ -3615,8 +3689,8 @@ void SML_Show(boolean json) {
             }
 
             if (json) {
-              if (!sml_globs.dvalid[index]) {
-                // skip values not yet received from meter
+              if (!sml_globs.dvalid[index] && !(sml_globs.sml_options & SML_OPTIONS_JSON_ALL)) {
+                // skip values not yet received from meter (SML_OPTIONS_JSON_ALL keeps them, see above)
                 lastmind = mindex;
               } else {
                 // json export
@@ -3998,6 +4072,17 @@ int SML_print(const char *format, ...) {
 
 void reset_sml_vars(uint16_t maxmeters) {
 
+  // Defensive: meter_desc[] ist ein festes MAX_METERS-Array. Der erste
+  // reset_sml_vars()-Aufruf (Re-Init-Pfad in SML_Init) läuft VOR dem
+  // meters_used-Clamp — bei maxmeters > MAX_METERS liest die Schleife über das
+  // Array hinaus und gibt Müll-Pointer frei (Heap-Korruption / Bootloop; auf einem
+  // C3 mit neuerem esp32-Framework reproduziert: free() eines 0xa5a5a5a5-Stack-
+  // Musters). Hart begrenzen, egal woher maxmeters kommt.
+  if (maxmeters > MAX_METERS) {
+    AddLog(LOG_LEVEL_INFO, PSTR("SML: reset_sml_vars maxmeters %d > %d geklemmt (OOB verhindert)"), maxmeters, MAX_METERS);
+    maxmeters = MAX_METERS;
+  }
+
   for (uint32_t meters = 0; meters < maxmeters; meters++) {
 
 		struct METER_DESC *mp = &meter_desc[meters];
@@ -4191,6 +4276,35 @@ void SML_Init(void) {
       ef.read((uint8_t*)file_md, fsiz);
       ef.close();
       file_md[fsiz] = 0;
+      // Strip ';' comment lines and blank lines in-place so a hand-written
+      // /sml_meter.def can carry comments and blank spacers. The SML descriptor
+      // parser itself has no comment syntax — Scripter's >M section is pre-stripped
+      // before we see it, but a raw file is not. A line is a comment when its first
+      // non-blank char is ';'. Also drops '\r' so CRLF-saved files parse. (No-op for
+      // the Scripter path below, which never reaches this file branch.)
+      {
+        // LÄNGEN-begrenzt iterieren, NICHT null-terminiert (while(*rd)): endet die
+        // Datei ohne '\n' und wurde bis dahin nichts gestrippt (wr==rd — genau der
+        // Fall einer vom ext. Editor "komprimierten" .def ohne Kommentare/CR), dann
+        // überschrieb das angehängte '\n' die NUL bei file_md[fsiz] → die Schleife
+        // las UND schrieb hinter den Puffer → Heap-Korruption, C3-Bootloop (Ottelo,
+        // reproduziert + bisektiert 2026-07-23). Mit fester end-Grenze ist das
+        // Schreiben beweisbar ≤ file_md[fsiz+1] (Puffer hat fsiz+16).
+        char *end = file_md + strlen(file_md);
+        char *rd = file_md, *wr = file_md;
+        while (rd < end) {
+          char *le = rd;
+          while (le < end && *le != '\n') le++;            // end of physical line
+          char *fc = rd;
+          while (fc < le && (*fc == ' ' || *fc == '\t' || *fc == '\r')) fc++;
+          if (fc < le && *fc != ';') {                     // keep: non-blank, non-comment
+            for (char *c = rd; c < le; c++) { if (*c != '\r') *wr++ = *c; }
+            *wr++ = '\n';
+          }
+          rd = (le < end) ? le + 1 : end;
+        }
+        *wr = 0;
+      }
       lp = strstr_P(file_md, PSTR(">M"));
       if (!lp) {
         goto nfd;
@@ -4234,6 +4348,14 @@ void SML_Init(void) {
     if (sml_globs.dvalid) {
       free(sml_globs.dvalid);
       sml_globs.dvalid = 0;
+    }
+    if (sml_globs.mgen) {
+      free(sml_globs.mgen);
+      sml_globs.mgen = 0;
+    }
+    if (sml_globs.mseen) {
+      free(sml_globs.mseen);
+      sml_globs.mseen = 0;
     }
 #ifdef USE_SML_MEDIAN_FILTER
     if (sml_globs.sml_mf) {
@@ -4907,6 +5029,8 @@ next_line:
 
   sml_globs.meter_vars = (double*)calloc(sml_globs.maxvars, sizeof(double));
   sml_globs.dvalid = (uint8_t*)calloc(sml_globs.maxvars, sizeof(uint8_t));
+  sml_globs.mgen = (uint8_t*)calloc(sml_globs.maxvars, sizeof(uint8_t));
+  sml_globs.mseen = (uint8_t*)calloc((uint32_t)sml_globs.maxvars * SML_MATH_OPERANDS, sizeof(uint8_t));
 
 #ifdef USE_SML_MEDIAN_FILTER
   sml_globs.sml_mf = (struct SML_MEDIAN_FILTER*)calloc(sml_globs.maxvars, sizeof(struct SML_MEDIAN_FILTER));
@@ -5557,8 +5681,9 @@ MODBUS_TCP_HEADER tcph;
 }
 
 #ifdef USE_SML_TCP
-int32_t sml_tcp_init(struct METER_DESC *mp) {  
-  if (!TasmotaGlobal.global_state.wifi_down) {
+int32_t sml_tcp_init(struct METER_DESC *mp) {
+  //if (!TasmotaGlobal.global_state.wifi_down) {
+  if (!TasmotaGlobal.global_state.wifi_down || !TasmotaGlobal.global_state.eth_down) {
     if (!mp->client) {
       // tcp mode
 #ifdef USE_SML_TCP_SECURE
@@ -5583,6 +5708,11 @@ int32_t sml_tcp_init(struct METER_DESC *mp) {
     }
   } else {
     AddLog(LOG_LEVEL_INFO, PSTR("SML: could not connect TCP since wifi is down"));
+    // Free an existing client instead of just dropping the pointer — otherwise every
+    // wifi/eth-down pass through here (sml_tcp_check re-inits a disconnected meter)
+    // leaks the WiFiClient and its lwIP resources, slowly exhausting the TCP PCB pool
+    // (port-80 web + new Modbus connects then fail while established MQTT survives).
+    if (mp->client) { mp->client->stop(); delete mp->client; }
     mp->client = nullptr;
     return -1;
   }
@@ -6029,7 +6159,11 @@ bool Xsns53(uint32_t function) {
         break;
 #ifdef USE_WEBSERVER
       case FUNC_WEB_SENSOR:
-        if (sml_globs.ready) {
+        // The smlj/tasm_smlj bit SML_OPTIONS_NO_WEB suppresses the driver's own web
+        // rendering, so a TinyC/Scripter program can read the descriptor and render the
+        // values inside its OWN card -- avoids a duplicate SML block next to the script's
+        // card on the main page. (gemu 2026-06-23)
+        if (sml_globs.ready && !(sml_globs.sml_options & SML_OPTIONS_NO_WEB)) {
           SML_Show(0);
         }
         break;

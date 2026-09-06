@@ -344,13 +344,13 @@ extern uint16_t tc_vm_stack_bytes;
 // appends don't need it). The loader warns (still loads) on a .tcb abi_rev mismatch.
 #include "xdrv_124_tinyc_spp.h"
 
-#define TC_SYSCALL_ABI     27    // V27: NO new syscall -- twelve new OPCODES (0xB6..0xC1) for packed 16-bit arrays, `int16[]` and `uint16[]`. Two bytes per element instead of four: (n+1)/2 slots, element i at ((int16*)base)[i]. Same purpose as byte[], one step finer -- byte[] saves four times the RAM but costs resolution, which is the whole reason WebChartQ's scale and offset exist; an int16 carries a temperature in hundredths of a kelvin, a raw ADC word or a Modbus register with NO decoding, at half the RAM of an int[]. Measured on a 1441-sample ring: float 5.6 KB, int16 2.8 KB, byte 1.4 KB. ⚠️ Signedness lives in the LOAD, not in the storage: STORE_*_I16 writes the same sixteen bits for int16 and uint16 alike, while the compiler picks the sign-extending (0xB6/0xB8/0xBA/0xBC) or zero-extending load (0xBE..0xC1) from the declared type. That is why uint16 costs four opcodes rather than eight. ⚠️ The byte flag in a ref grew into a TWO-BIT field (heap 8-9, global 16-17, local 24-25): 00 = int32, 01 = byte, 10 = int16, 11 = uint16. The 01 is the old byte bit unchanged, so every .tcb in the field still means exactly what it meant -- the ABI step hangs on the new opcodes alone, and the compiler stamps it precisely when it emits one (hook in emit()). An older device refuses the .tcb instead of dying on BAD_OPCODE mid-loop. || PREVIOUS V26: NO new syscall — a BUG FIX that changes what existing ones accept. httpGet, httpPost, smlGetStr and tasmCmd filled their destination buffer with int32 SLOTS while tc_ref_maxlen() already answered in BYTES for a packed byte[]. Handing any of them a byte[] therefore wrote four times the array's size and trampled the neighbouring heap -- silently, and only once a response was long enough to reach past the buffer. All four now go through tc_chr_put(), like the sprintf/strcat family has since 1.6.58. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 26 whenever a byte[] is passed to one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. This is what made the SML family's text buffers convertible: on sml_chart_ct002 they were 18.7 KB of the 26.9 KB contiguous block. || PREVIOUS V25: + SYS_WEB_CHART_Q (545) -- WebChartQ(scale, offset), an affine decode applied to the NEXT WebChart's samples. It exists so a chart can be fed from a PACKED byte[] instead of a float[]: one byte per sample plus a scale/offset carries a temperature at 0.5 K over -40..87.5 degC, a humidity or an SOC at 0.4 %, for a QUARTER of the RAM. That matters because chart ring buffers are the largest single heap consumer on a C3 -- the shipped examples hold three float[1441] rings (5.7 KB each) out of a 64 KB TC_MAX_HEAP, and the heap is claimed as ONE contiguous block at load time. ⚠️ The byte[] side is NOT a pure append even though the syscall is: WebChart (166) is unchanged in number and signature, but the compiler now marks a byte[] array argument with the packed-ref flag bit, and OLDER firmware would strip that bit and read the array as float slots -- garbage, silently, with no missing-syscall complaint to point at it. The compiler therefore stamps abi_rev 25 on any WebChart whose array argument is a byte[] (CodeGenerator._istBytesVar), so an old device refuses the .tcb instead of drawing nonsense. A WebChart on a float[] still compiles byte-identically and keeps its old abi_rev. Also in this release, and needing no ABI at all because it is pure server-side HTML: the per-sample wire form changed from _tcA's [x,y] pairs to _tcAy's bare y-list plus x0/step, since the x axis was always the arithmetic sequence -(count-1-i)*interval + timebase. About 14 bytes per point became about 6 -- a 1441-point series went from ~20 KB of response body to ~8 KB. _tcA stays defined alongside it. || PREVIOUS V24: + SYS_MQTT_PUBLISH_REF (544) -- mqttPublish with RUNTIME strings and a log level. The const-only form could not build a topic at runtime (Hans' carries the device name, so he went through the `Publish` COMMAND to reach a function two frames down) and always logged: two console lines every 5 s from a regulator, at the default weblog 2. MqttPublishPayload() has taken a level and skipped the log at LOG_LEVEL_NONE all along; only TinyC called it with the default. Purely additive -- two literals stay on syscall 297 and compile byte-identically (checked against dyson_tp02 and power_meter). || PREVIOUS V23: + LK32_OP_ST (0xB3, wide-constant twin of 0xB1) and the loop head LL_CMP_JZ / LK32_CMP_JZ (0xB4/0xB5), which branch on FALSE exactly like the JZ they replace. The compare-and-branch runs once per iteration of EVERY loop, so it is the broadest of the fusions. || PREVIOUS V22: + LK_OP_ST/LL_OP_ST (0xB1/0xB2) -- `x = y OP z` and `x = y OP const` on plain int locals in ONE opcode instead of four (load, load-or-push, operate, store). Exactly where a stack VM loses to a register VM: the operands live IN the instruction. || PREVIOUS V21: + superinstructions (0xB0+). First: INC_LOCAL (0xB0) for `i++` AS A STATEMENT -- replaces LOAD_LOCAL/DUP/PUSH_I8/ADD/STORE_LOCAL/POP, six opcodes for one. A pure fusion, NO new expressiveness: the unfused form stays valid and a program means the same either way. ⚠️ First ABI step where NEWER bytecode on OLDER firmware no longer merely reports a missing syscall but dies with BAD_OPCODE mid-loop -- so the loader now REFUSES a .tcb whose abi_rev is higher than its own instead of warning and loading anyway. || PREVIOUS V20: + BLE "SPP" (535-543) -- bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump. The existing GATT client (SYS_BLE_TARGET..RESULT, V-something-earlier) connects, does ONE read/write/notify-wait, and DISCONNECTS -- confirmed by reading BLETaskRunTaskDoneOperation() in xdrv_79_esp32_ble.ino, which calls pClient->disconnect() unconditionally after every operation. That is correct for a device that wakes, reports, and sleeps (a scale), but wrong for a continuous stream: a BlueRadios/Nordic-UART-style peripheral streaming an EKG would lose the link before a second sample could ever notify. So this is a SECOND, independent NimBLEClient (own connect/subscribe/write/close, own notify ring buffer), added entirely in the TinyC-owned glue file (xdrv_79_tinyc_ble_glue.ino) -- it never touches xdrv_79_esp32_ble.ino's op queue, so MI32/EQ3/the existing one-shot client are unaffected. It also takes service/characteristic UUIDs as STRING literals (16-bit or full 128-bit), unlike the one-shot family's int16-only svc/chr -- proprietary UART-style services are essentially always 128-bit, which int16 cannot address at all. bleGattDump() is the one-shot companion: connect, enumerate every service+characteristic+property, disconnect -- needed BEFORE any of the above, because a proprietary UUID has no datasheet lookup; the device has to be asked. ⭐ VERIFIED on real hardware 2026-08-05 (.39, ESP32-S3) against a BlueRadios dual module on gemu's ECG device: connect -> subscribe BRSP_TX -> write BRSP_MODE=1 (data mode) -> write "VS\r" -> the reply arrived as 48 bytes in four notification chunks, and bleSppState() still returned 1 AFTERWARDS -- the whole point, since the one-shot client disconnects after every operation. A second simultaneous NimBLE connection alongside BLE_ESP32's own background scan caused no trouble. ⚠️ Connecting needs a much better link than passive advert reception: a peer at -88..-94 dBm refused every attempt (rc reported via getLastError) while the one at -63 dBm connected first try. Pure append, no .tcb format change. || PREVIOUS V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || PREVIOUS V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || PREVIOUS V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || PREVIOUS V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
+#define TC_SYSCALL_ABI     29    // V29: NO new syscall -- ONE new OPCODE, LLK_OP2_ST (0xC2), the fusion for `x = y OP (z OP k)`. It closes the last gap of the fusion run: after the six fusions of 2026-08-08 the bench_int loop still spent 13 opcodes per iteration, and SIX of them were this one unfused line, `sum = sum - (i / 2)` -- load, load, push, operate, operate, store. It is EIGHT now: one instruction per source statement plus the loop head and the jump back, which is the floor for a stack VM. ⚠️ THE SHAPE WAS COUNTED, NOT GUESSED: across the 224 shipped examples it occurs ten times, and every time with an i8 constant on the inside -- never with three locals, never with a wide constant. Hence exactly one opcode and no family, and no LLK32 twin: it would not have fired in a single example. A pure fusion, NO new expressiveness -- the unfused form stays valid and a program means the same either way. ⭐ EQUIVALENCE CHECKED: 5600 cases (all 100 operator pairs x 8 constants x 7 start values, including INT_MIN, division by zero and shifts) fused against unfused in the JS VM -- ZERO differences, error messages included (scripts/check_fusion.mjs). ⚠️ As with V21, newer bytecode on older firmware dies with BAD_OPCODE mid-loop, so the loader refuses a .tcb whose abi_rev is higher than its own. The compiler stamps 29 exactly when it emits the opcode (hook in emit()). || PREVIOUS V28: NO new syscall -- a BUG FIX that changes what eleven existing ones accept, the same shape as V26 and found the same way. tc_ref_maxlen() has long answered in BYTES for a packed byte[], but webArg, webParse, jsonStr, fileReadDir, fileGetStr, smlRead, pluginQuery, tlsReadLine, tlsRead, pwlStr and sppScan still wrote one int32 SLOT per character: handing any of them a byte[] wrote four times the array's size straight over the neighbouring heap. Reported by Hans against webArg() into a `byte a[96]` -- the mail address came back as "o", first character right and string over, which is the harmless half of the same write. All eleven now go through tc_chr_put(). ⚠️ webParse was wrong in BOTH directions: it also READ its source as int32 slots, so a byte[] source yielded one character; it goes through tc_ref_to_cstr() now, which knows both packings. jsonStr had the same reading problem on its source argument. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 28 whenever a byte[] reaches one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. Measured on an ESP32-C3 with a byte[] and a char[] in one handler on one request: before byte[16]="o" / char[16]="otto@example.org", after both "otto@example.org", and UTF-8 survives. || PREVIOUS V27: NO new syscall -- twelve new OPCODES (0xB6..0xC1) for packed 16-bit arrays, `int16[]` and `uint16[]`. Two bytes per element instead of four: (n+1)/2 slots, element i at ((int16*)base)[i]. Same purpose as byte[], one step finer -- byte[] saves four times the RAM but costs resolution, which is the whole reason WebChartQ's scale and offset exist; an int16 carries a temperature in hundredths of a kelvin, a raw ADC word or a Modbus register with NO decoding, at half the RAM of an int[]. Measured on a 1441-sample ring: float 5.6 KB, int16 2.8 KB, byte 1.4 KB. ⚠️ Signedness lives in the LOAD, not in the storage: STORE_*_I16 writes the same sixteen bits for int16 and uint16 alike, while the compiler picks the sign-extending (0xB6/0xB8/0xBA/0xBC) or zero-extending load (0xBE..0xC1) from the declared type. That is why uint16 costs four opcodes rather than eight. ⚠️ The byte flag in a ref grew into a TWO-BIT field (heap 8-9, global 16-17, local 24-25): 00 = int32, 01 = byte, 10 = int16, 11 = uint16. The 01 is the old byte bit unchanged, so every .tcb in the field still means exactly what it meant -- the ABI step hangs on the new opcodes alone, and the compiler stamps it precisely when it emits one (hook in emit()). An older device refuses the .tcb instead of dying on BAD_OPCODE mid-loop. || PREVIOUS V26: NO new syscall — a BUG FIX that changes what existing ones accept. httpGet, httpPost, smlGetStr and tasmCmd filled their destination buffer with int32 SLOTS while tc_ref_maxlen() already answered in BYTES for a packed byte[]. Handing any of them a byte[] therefore wrote four times the array's size and trampled the neighbouring heap -- silently, and only once a response was long enough to reach past the buffer. All four now go through tc_chr_put(), like the sprintf/strcat family has since 1.6.58. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 26 whenever a byte[] is passed to one of those arguments (BUILTINS[].byteAbi in codegen.js) -- an older device refuses the .tcb instead of corrupting its heap. A char[] argument is unaffected and keeps its old abi_rev. This is what made the SML family's text buffers convertible: on sml_chart_ct002 they were 18.7 KB of the 26.9 KB contiguous block. || PREVIOUS V25: + SYS_WEB_CHART_Q (545) -- WebChartQ(scale, offset), an affine decode applied to the NEXT WebChart's samples. It exists so a chart can be fed from a PACKED byte[] instead of a float[]: one byte per sample plus a scale/offset carries a temperature at 0.5 K over -40..87.5 degC, a humidity or an SOC at 0.4 %, for a QUARTER of the RAM. That matters because chart ring buffers are the largest single heap consumer on a C3 -- the shipped examples hold three float[1441] rings (5.7 KB each) out of a 64 KB TC_MAX_HEAP, and the heap is claimed as ONE contiguous block at load time. ⚠️ The byte[] side is NOT a pure append even though the syscall is: WebChart (166) is unchanged in number and signature, but the compiler now marks a byte[] array argument with the packed-ref flag bit, and OLDER firmware would strip that bit and read the array as float slots -- garbage, silently, with no missing-syscall complaint to point at it. The compiler therefore stamps abi_rev 25 on any WebChart whose array argument is a byte[] (CodeGenerator._istBytesVar), so an old device refuses the .tcb instead of drawing nonsense. A WebChart on a float[] still compiles byte-identically and keeps its old abi_rev. Also in this release, and needing no ABI at all because it is pure server-side HTML: the per-sample wire form changed from _tcA's [x,y] pairs to _tcAy's bare y-list plus x0/step, since the x axis was always the arithmetic sequence -(count-1-i)*interval + timebase. About 14 bytes per point became about 6 -- a 1441-point series went from ~20 KB of response body to ~8 KB. _tcA stays defined alongside it. || PREVIOUS V24: + SYS_MQTT_PUBLISH_REF (544) -- mqttPublish with RUNTIME strings and a log level. The const-only form could not build a topic at runtime (Hans' carries the device name, so he went through the `Publish` COMMAND to reach a function two frames down) and always logged: two console lines every 5 s from a regulator, at the default weblog 2. MqttPublishPayload() has taken a level and skipped the log at LOG_LEVEL_NONE all along; only TinyC called it with the default. Purely additive -- two literals stay on syscall 297 and compile byte-identically (checked against dyson_tp02 and power_meter). || PREVIOUS V23: + LK32_OP_ST (0xB3, wide-constant twin of 0xB1) and the loop head LL_CMP_JZ / LK32_CMP_JZ (0xB4/0xB5), which branch on FALSE exactly like the JZ they replace. The compare-and-branch runs once per iteration of EVERY loop, so it is the broadest of the fusions. || PREVIOUS V22: + LK_OP_ST/LL_OP_ST (0xB1/0xB2) -- `x = y OP z` and `x = y OP const` on plain int locals in ONE opcode instead of four (load, load-or-push, operate, store). Exactly where a stack VM loses to a register VM: the operands live IN the instruction. || PREVIOUS V21: + superinstructions (0xB0+). First: INC_LOCAL (0xB0) for `i++` AS A STATEMENT -- replaces LOAD_LOCAL/DUP/PUSH_I8/ADD/STORE_LOCAL/POP, six opcodes for one. A pure fusion, NO new expressiveness: the unfused form stays valid and a program means the same either way. ⚠️ First ABI step where NEWER bytecode on OLDER firmware no longer merely reports a missing syscall but dies with BAD_OPCODE mid-loop -- so the loader now REFUSES a .tcb whose abi_rev is higher than its own instead of warning and loading anyway. || PREVIOUS V20: + BLE "SPP" (535-543) -- bleSppTarget/Connect/State/Sub/Available/Read/Write/Close + bleGattDump. The existing GATT client (SYS_BLE_TARGET..RESULT, V-something-earlier) connects, does ONE read/write/notify-wait, and DISCONNECTS -- confirmed by reading BLETaskRunTaskDoneOperation() in xdrv_79_esp32_ble.ino, which calls pClient->disconnect() unconditionally after every operation. That is correct for a device that wakes, reports, and sleeps (a scale), but wrong for a continuous stream: a BlueRadios/Nordic-UART-style peripheral streaming an EKG would lose the link before a second sample could ever notify. So this is a SECOND, independent NimBLEClient (own connect/subscribe/write/close, own notify ring buffer), added entirely in the TinyC-owned glue file (xdrv_79_tinyc_ble_glue.ino) -- it never touches xdrv_79_esp32_ble.ino's op queue, so MI32/EQ3/the existing one-shot client are unaffected. It also takes service/characteristic UUIDs as STRING literals (16-bit or full 128-bit), unlike the one-shot family's int16-only svc/chr -- proprietary UART-style services are essentially always 128-bit, which int16 cannot address at all. bleGattDump() is the one-shot companion: connect, enumerate every service+characteristic+property, disconnect -- needed BEFORE any of the above, because a proprietary UUID has no datasheet lookup; the device has to be asked. ⭐ VERIFIED on real hardware 2026-08-05 (.39, ESP32-S3) against a BlueRadios dual module on gemu's ECG device: connect -> subscribe BRSP_TX -> write BRSP_MODE=1 (data mode) -> write "VS\r" -> the reply arrived as 48 bytes in four notification chunks, and bleSppState() still returned 1 AFTERWARDS -- the whole point, since the one-shot client disconnects after every operation. A second simultaneous NimBLE connection alongside BLE_ESP32's own background scan caused no trouble. ⚠️ Connecting needs a much better link than passive advert reception: a peer at -88..-94 dBm refused every attempt (rc reported via getLastError) while the one at -63 dBm connected first try. Pure append, no .tcb format change. || PREVIOUS V19: + lvglChartUpdateMode (534) -- exposes lv_chart_set_update_mode. LVGL defaults to SHIFT, which moves EVERY point on every new value and therefore invalidates the WHOLE chart area; CIRCULAR overwrites the oldest point in place (a sweeping cursor like a hospital monitor) and invalidates one narrow column. On an 800x1280 DSI panel with a 760x300 chart that is 228000 pixels per value against about 900 -- roughly a factor of 250, and the difference between a 250 Hz live ECG trace being impossible and being unremarkable. Pure append, no .tcb format change. || PREVIOUS V18: + sppDeinit (533) -- tears the Bluetooth Classic stack down and RETURNS ITS MEMORY (~85 KB measured on an ESP32-D0WD-V3: 114 KB free after boot, 29 KB with Bluedroid up). Without it a script that reads a device every few minutes pays for the stack around the clock, and the next slot restart cannot allocate -- which surfaces as "Stack overflow", because the loader's OOM paths return TC_ERR_STACK_OVERFLOW. Nothing in that message points at Bluetooth. sppInit() brings it back up; the teardown deliberately does NOT call esp_bt_controller_mem_release(), which would be one-way. Pure append, no .tcb format change. || PREVIOUS V17: + Bluetooth Classic / SPP (524-532) — sppInit, sppConnect (525 Literal / 526 char[]), sppState, sppAvailable, sppRead, sppWrite, sppClose, sppScan. Serial link to ANY Classic device; the protocol lives in the SCRIPT, not in the firmware, so the same primitive serves SMA inverters, OBD adapters, scales and anything else that speaks SPP -- and it can be changed without reflashing. ORIGINAL ESP32 ONLY (BR/EDR); S3/C3/C6/P4 are BLE-only. Needs USE_TINYC_SPP AND an environment that rebuilds the framework with Bluedroid (Tasmota ships NimBLE and has NO Classic headers) -- details in the header of xdrv_124_tinyc_spp.h. sppRead does NOT block: the script waits itself, otherwise the VM hangs on the peer's timeouts. Arrays are int32 per element, uint8 on the wire -- same as tcpWriteArray. Pure append, no .tcb format change. || PREVIOUS V16: + webCard (521, per-slot main-page card-frame toggle; webCard(0) renders bare like pre-card). Pure append. V15: + lvglLinePoly (517, one lv_line draws a whole N-point polyline) / lvglArcBgAngles (518, arc background sweep, e.g. 135,45 = 270° dial) / lvglArcStyle (519, arc part colour+width — unlocks zoned gauges + coloured value arcs) / lvglRotate (520, rotate any object, for vertical y-axis titles). Pure append. V14: + lvglCanvas (514) / lvglCanvasSetImgSlot (515) / dspFreeImage (516) — a PSRAM RGB565 image slot (e.g. a HW-decoded camera frame from dspLoadImageFromCam) becomes an lv_canvas (an lv_image, so lvglImageAngle/Scale rotate+size it); dspFreeImage frees a slot so a live cam loop doesn't exhaust the 4. Pure append. V13: + audioMicGain (513) — set mic gain 1-100 via the audio plugin (Plugin_Query 42 / sel 11), mirror of audioVol for the ES7210 mic ADC. Pure append. V12: + rsaEncrypt (512) — RSA PKCS#1 v1.5 type-2 encrypt via BearSSL br_rsa_public, for IDPConnect-style logins (RSA-encrypted password → new refresh token). Pure append. V11: + utcSecs (511) — current UTC unix epoch (UtcTime()), for request signing/stamps that need true UTC (timeToSecs(timeStamp()) is local-as-UTC). Pure append. V10: + raw TLS client (503-509: tlsConnect/tlsWrite/tlsReadLine/tlsRead/tlsAvailable/tlsConnected/tlsStop) + base64Enc (510) — a TinyC app can now speak raw HTTPS (OAuth redirect/cookie flows, request signing) without firmware, hot-reloadable. Pure append. V9: + SYS_I2S_DUPLEX_BEGIN (502, i2sDuplexBegin — full-duplex I2S TX+RX in one channel pair; combined codecs like the WM8960 clock their ADC from the I2S TX, so the mic only works while TX runs) — pure append. V8: SYS_I2S_BEGIN (271) gained a leading mclk arg (i2sBegin(mclk,bclk,lrclk,dout,rate)) for codec DACs — NOT a pure append (existing syscall's arg count changed), so the bump is mandatory to flag a 5-arg .tcb on 4-arg firmware. V7: + SYS_I2S_MIC_BEGIN/READ/LEVEL/STOP (498-501, mic RX / loudness) — pure append. V6: + SYS_LVGL_LINE/LINE_POINTS/LINE_STYLE (495-497, radial/vector bars) — pure append. V5: + SYS_LVGL_IMAGE_SCALE (494, lvglImageScale(h,sx,sy)) — pure append. V4: + SYS_LVGL_SET_FONT (493, lvglSetFont(h,size)) — pure append; bumped so the IDE flags a lvglSetFont .tcb on pre-font firmware. V3: + SYS_TOUCH_GET (492, touchGet(sel) -> Touch_Status) — pure append; bumped to flag a touchGet .tcb built against pre-touch firmware. V2: + SYS_BLIB_CALL_F (371, fcall float blib call)
 extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y, -1/-2=raw (SYS_TOUCH_GET); declared even on no-touch builds (call is guarded)
 // REMINDER: when bumping TC_RELEASE, also update the visible <h1> label
 // in tinyc_ide.html (gunzip → edit → gzip back). The header is hand-
 // maintained; got stuck at "v1.3.20" through 5 releases until Andreas's
 // Claude flagged it during the v1.5.2 review.
-#define TC_RELEASE         "1.6.63"     // **TinyC 1.6.63: webText() FINALLY WRITES BACK. Found while converting lcd_i2c.tc to byte[] -- the question was whether packing survives the web round trip, and the answer was that nothing survived it. A char[]/byte[] over HEAP_THRESHOLD (16 elements) is HEAP-allocated, but the ?sv= write-back stored the typed text one character per int32 GLOBAL slot at `gref & 0x0FFF` -- which for a heap array is the HANDLE, not an index. Handle 0 meant globals[0]. Every webText on a buffer larger than 16 threw the entry away and overwrote the first scalars of the running script instead: `char devname[32]` in webui_demo, webcall_demo and multipage_demo, both custom lines in lcd_i2c. Only matter_bridge_ui's ip_in[16], exactly on the threshold and therefore inline, ever worked. ⚠️ Invisible because ONLY the write-back was wrong -- rendering goes through tc_ref_to_cstr(), which resolves heap refs correctly, so the field always showed the right text and merely refused to keep a new one. ⭐ The fix hands the JavaScript the whole REF (siva(value,id,ref) -> sv=id_S_ref_text) and writes through tc_cstr_to_ref(), the VM's own writer, which knows heap from global AND knows the element packing -- so the byte[] question that started the search is answered on the way past. The ref arrives from a URL and is bounded like the index was: tag 2 (global) or tag 3 without the const-pool bit (heap), nothing else, then tc_ref_maxlen() caps the length. The old s_ form stays for a page still open in a browser. Also: a string LITERAL may now be passed to a byte[] PARAMETER (it was restricted to char[], which made the packing warning's own advice -- move the parameter too -- impossible to follow wherever literals were passed); examples/lcd_i2c.tc converted to byte[] as the proof, 1884 -> 984 B of RAM for 216 B more bytecode; and both syntax highlighters caught up with the language -- do/struct/enum/typedef/const/static/persist/watch/global were drawn as plain identifiers, and byte, int16, short, uint16 and ushort had no colour at all.**
+#define TC_RELEASE         "1.6.66"     // **TinyC 1.6.66: THE LAST GAP OF THE FUSION RUN -- one opcode, LLK_OP2_ST (0xC2), for `x = y OP (z OP k)`. After the six fusions of 2026-08-08 the bench_int loop still spent 13 opcodes per iteration, and SIX of them were this one unfused line: load, load, push, operate, operate, store for `sum = sum - (i / 2)`. It is EIGHT now -- one instruction per source statement plus the loop head and the jump back, which is the floor for a stack VM. ⚠️ THE SHAPE WAS COUNTED, NOT GUESSED: across the 224 shipped examples it occurs ten times, and EVERY time with an i8 constant on the inside -- never with three locals, never with a wide constant. Hence exactly one opcode and no LLK32 twin; it would not have fired in a single example. ⭐ EQUIVALENCE CHECK: 5600 cases (all 100 operator pairs x 8 constants x 7 start values, including INT_MIN, division by zero and shifts) fused against unfused in the JS VM -- ZERO differences, error messages included (scripts/check_fusion.mjs). It turned up two diagnostic defects OLDER than this release that affected every superinstruction since 2026-08-08: the superinstruction path did not pass the error position (`PC=undefined`) and reported a `% 0` as "Division by zero" instead of "Modulo by zero". Both fixed, and because the arithmetic moved into ONE method `_superBinop` on the way, the correction holds for all fusions at once. ⚠️ As with V21, newer bytecode on older firmware dies with BAD_OPCODE mid-loop, so the loader refuses a .tcb whose abi_rev is higher than its own.** || PREVIOUS 1.6.65: TWO SILENT FAILURES, BOTH REPORTED BY HANS, BOTH FIXED AS DIAGNOSTICS RATHER THAN AS BEHAVIOUR. (1) THE SPRINTF "%s" FAMILY CUTS AT 255 CHARACTERS AND SAID NOTHING. A Shelly emulator wrapped a ~310-character RPC body with sprintf(w, "{...result:%s}", body) and put 296 bytes of INVALID JSON on the wire -- 40 bytes of prefix, then exactly 256. The app dropped the device and never spoke to that port again, which reads like a discovery fault and not a formatting one; the two paths that DO work look identical from outside (UDP EM.GetStatus with an 80-byte body: fine; the same body over HTTP without the %s: fine). TWO buffers cut, and both log now: the SOURCE on its way into the 256-byte scratch -- new helper tc_ref_str_len() reads the true length WITHOUT copying, so an exactly-full buffer is not mistaken for a truncated one -- and the RESULT on its way out of snprintf, where the return value already says how much was needed. ⚠️ All FOUR opcodes are covered, not just the two in the report: SYS_SPRINTF_STR and _STR_CAT plus their _CONST twins, which have the same tmp buffer and the same silence. The cap itself STAYS -- the buffers are per-worker stack, and raising TC_SPRINTF_TMP_SIZE only moves the next quiet cut -- and the message names the way around it: "TCC: sprintf: %s cut at 255 of 310 chars -- use strcat() for long strings". strcat() copies through tc_chr_get/tc_chr_put element by element and is bounded only by the destination. (2) mdnsRegister() ONLY EVER ADDED SERVICES. A script that switches what it emulates (EcoTracker _everhome._tcp <-> Shelly _shelly._tcp) answered as BOTH at once under one hostname; measured with a PTR query after switching, both TXT sets live. Only a DEVICE restart cleared it -- a slot restart takes the same path, so this was never about the once-flag. It removes first now: ESP32 mdns_service_remove_all(), ESP8266 MDNS.end(), which is exactly what Tasmota's own StartMdns() does before begin(). ⚠️ A PLAIN remove-all would have taken TASMOTA's own _http._tcp advert with it, silently and for good: MdnsAddServiceHttp() latches (Mdns.begun 1 -> 2) and never runs again, so nothing would ever put it back. The http advert is therefore re-registered afterwards wherever this call does not supply one of its own -- the shelly branch does, the everhome and generic branches do not. ⚠️ NO ABI STEP: no new syscall, no new opcode, no changed signature; a .tcb built before and after this release is byte-identical, and both directions of the version check are unaffected.** || PREVIOUS 1.6.64: ELEVEN MORE SYSCALLS WROTE int32 SLOTS INTO A PACKED byte[]. Reported by Hans against webArg(): a `byte a[96]` taking the registration form came back as "o" -- first character right, next three bytes zero, string over -- and the write ran four times the array's length past its end, straight over the neighbouring heap. tc_ref_maxlen() has answered in BYTES for a packed byte[] since 1.6.57; the 1.6.58/1.6.61 rounds fixed the sprintf family, httpGet/httpPost/smlGetStr/tasmCmd and udp(1,buf), but a sweep for the same shape -- every site that resolves a ref and writes without tc_ref_is_bytes -- turned up eleven that were missed: webArg, webParse, jsonStr, fileReadDir, fileGetStr, smlRead, pluginQuery, tlsReadLine, tlsRead, pwlStr, sppScan. All go through tc_chr_put() now. ⚠️ webParse was wrong in BOTH directions: it also READ its source as int32 slots, so a byte[] source yielded a single character; it goes through tc_ref_to_cstr() now, which knows both packings, and jsonStr had the same problem on its source argument. ⚠️ Nothing about such a call LOOKS different, so the compiler stamps abi_rev 28 whenever a byte[] reaches one of those arguments -- an older device refuses the .tcb instead of corrupting its heap. Both directions measured on an ESP32-C3: an abi_rev-28 file on ABI-27 firmware is refused at load with the ABI message, and on ABI-28 firmware a byte[] and a char[] in one handler on one request now agree, UTF-8 included. A char[] argument is untouched and keeps its old abi_rev. Also in this release: a plain name and info link for the program pickers (`// @name:` / `// @info:` in the .tc, carried in the self-describing V6 header, so every device in the field still loads such a .tcb), and two bounds on a kept-alive HTTP connection -- one held socket used to take down the whole web server on port 80 until lwIP's two-hour TCP keepalive reaped it (ottelo9/tasmota-sml-images#52).** || PREVIOUS 1.6.63: webText() FINALLY WRITES BACK. Found while converting lcd_i2c.tc to byte[] -- the question was whether packing survives the web round trip, and the answer was that nothing survived it. A char[]/byte[] over HEAP_THRESHOLD (16 elements) is HEAP-allocated, but the ?sv= write-back stored the typed text one character per int32 GLOBAL slot at `gref & 0x0FFF` -- which for a heap array is the HANDLE, not an index. Handle 0 meant globals[0]. Every webText on a buffer larger than 16 threw the entry away and overwrote the first scalars of the running script instead: `char devname[32]` in webui_demo, webcall_demo and multipage_demo, both custom lines in lcd_i2c. Only matter_bridge_ui's ip_in[16], exactly on the threshold and therefore inline, ever worked. ⚠️ Invisible because ONLY the write-back was wrong -- rendering goes through tc_ref_to_cstr(), which resolves heap refs correctly, so the field always showed the right text and merely refused to keep a new one. ⭐ The fix hands the JavaScript the whole REF (siva(value,id,ref) -> sv=id_S_ref_text) and writes through tc_cstr_to_ref(), the VM's own writer, which knows heap from global AND knows the element packing -- so the byte[] question that started the search is answered on the way past. The ref arrives from a URL and is bounded like the index was: tag 2 (global) or tag 3 without the const-pool bit (heap), nothing else, then tc_ref_maxlen() caps the length. The old s_ form stays for a page still open in a browser. Also: a string LITERAL may now be passed to a byte[] PARAMETER (it was restricted to char[], which made the packing warning's own advice -- move the parameter too -- impossible to follow wherever literals were passed); examples/lcd_i2c.tc converted to byte[] as the proof, 1884 -> 984 B of RAM for 216 B more bytecode; and both syntax highlighters caught up with the language -- do/struct/enum/typedef/const/static/persist/watch/global were drawn as plain identifiers, and byte, int16, short, uint16 and ushort had no colour at all.**
 #define TC_FILE_NAME       "/autoexec.tcb"
 #ifdef ESP8266
 #define TC_MAX_PERSIST     64          // ESP8266: keep the table small (simple programs, tight RAM)
@@ -555,6 +555,16 @@ enum TcOp {
                              // The loop head. Runs once per iteration of EVERY loop, so this is the
                              // broadest of the fusions even though it saves the same three opcodes
                              // as the others. Branch-on-FALSE, matching the JZ it replaces.
+  // ⚠️ `x = y OP_OUT (z OP_IN k)` -- the nested shape, ONE opcode.
+  // Replaces LOAD_LOCAL·LOAD_LOCAL·PUSH_I8·<op>·<op>·STORE_LOCAL: six opcodes in
+  // 10 bytes by one in 7. After the six fusions of 2026-08-08 the bench_int loop
+  // still spent 13 opcodes per iteration, and SIX of them were this one line
+  // (`sum = sum - (i / 2)`). It is eight now.
+  // ⚠️ The shape was COUNTED, not guessed: across the 224 shipped examples it
+  // occurs ten times, every time with an i8 constant on the inside -- never with
+  // three locals, never with a wide constant (2026-09-03). Hence exactly one.
+  OP_LLK_OP2_ST     = 0xC2,  // (y u8, z u8, k i8, op_in u8, op_out u8, dst u8)
+                             // locals[dst] = locals[y] OP_OUT (locals[z] OP_IN k)
   OP_INC_LOCAL      = 0xB0,  // (idx u8, delta i8) locals[idx] += delta, no stack effect.
                              // Replaces LOAD_LOCAL·DUP·PUSH_I8·ADD·STORE_LOCAL·POP,
                              // i.e. `i++` USED AS A STATEMENT: six opcodes, of which
@@ -4830,6 +4840,40 @@ static inline int32_t tc_str_write_b(int32_t *base, bool ib, int32_t cap,
   return len;
 }
 
+// True length of the string behind a ref, WITHOUT copying it anywhere.
+// Only used to tell a full buffer apart from a truncated one below.
+static int tc_ref_str_len(TcVM *vm, int32_t ref) {
+  if (tc_is_const_ref(ref)) {
+    uint16_t idx = (uint16_t)(((uint32_t)ref) & 0x7FFF);
+    if (idx < vm->const_count && vm->constants[idx].type == 1 && vm->constants[idx].str.ptr) {
+      return (int)strlen(vm->constants[idx].str.ptr);
+    }
+    return 0;
+  }
+  int32_t *buf = tc_resolve_ref(vm, ref);
+  if (!buf) return 0;
+  return (int)tc_str_len_b(buf, tc_ref_is_bytes(ref), tc_ref_maxlen(vm, ref));
+}
+
+// ⚠️ THE SPRINTF "%s" CAP, AND WHY IT NEEDS A LOG LINE.
+// The sprintf-string family runs its source through a 256-byte scratch buffer
+// and its result through a second one. Both cut SILENTLY. Reported by Hans
+// 2026-08-30: a Shelly emulator wrapped a ~310-char RPC body with
+// sprintf(w, "{...\"result\":%s}", body) and put 296 bytes of INVALID JSON on
+// the wire -- 40 bytes of prefix, then exactly 256. The app dropped the device
+// and stopped talking to it, which reads like a discovery fault, not a
+// formatting one. Nothing pointed at the cap: no message, and the return value
+// counts what WAS written, which a caller has no reason to compare against.
+// The cap itself is defensible (the buffers are per-worker stack, and raising
+// them only moves the next silent cut); being silent is not.
+// The way around it in a script is strcat(), which copies element by element
+// through tc_chr_get/tc_chr_put and is bounded only by the destination.
+static void tc_sprintf_cap_warn(const char *op, int have, int cap) {
+  AddLog(LOG_LEVEL_INFO,
+         PSTR("TCC: %s: %%s cut at %d of %d chars -- use strcat() for long strings"),
+         op, cap - 1, have);
+}
+
 // Find null terminator in VM int32 array, returns offset (capped at maxSlots)
 static int32_t tc_strlen_ref(int32_t *p, int32_t maxSlots) {
   int32_t i = 0;
@@ -7409,8 +7453,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // tc_ref_to_cstr handles both transparently.
       TC_BUF(srcbuf, 256);
       tc_ref_to_cstr(vm, src_ref, srcbuf, sizeof(srcbuf));
+      int _slen = tc_ref_str_len(vm, src_ref);
+      if (_slen >= (int)sizeof(srcbuf)) tc_sprintf_cap_warn("sprintf", _slen, sizeof(srcbuf));
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintf", _need, sizeof(tmp));
       TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
@@ -7461,8 +7508,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // Const-ref-aware source extraction (same fix as SPRINTF_STR).
       TC_BUF(srcbuf, 256);
       tc_ref_to_cstr(vm, src_ref, srcbuf, sizeof(srcbuf));
+      int _slen = tc_ref_str_len(vm, src_ref);
+      if (_slen >= (int)sizeof(srcbuf)) tc_sprintf_cap_warn("sprintfCat", _slen, sizeof(srcbuf));
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcbuf);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintfCat", _need, sizeof(tmp));
       int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
       TC_PUSH(vm, ofs + _w);
       break;
@@ -7479,7 +7529,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (!dst || !fmt || !srcStr) { TC_PUSH(vm, -1); break; }
       int32_t maxSlots = tc_ref_maxlen(vm, dst_ref);
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintf", _need, sizeof(tmp));
       TC_PUSH(vm, tc_str_write_b(dst, tc_ref_is_bytes(dst_ref), maxSlots, 0, tmp));
       break;
     }
@@ -7495,7 +7546,8 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       const bool _dib = tc_ref_is_bytes(dst_ref);
       int32_t ofs = tc_str_len_b(dst, _dib, maxSlots);
       TC_BUF(tmp, 256);
-      snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      int _need = snprintf(tmp, sizeof(tmp), fmt, srcStr);
+      if (_need >= (int)sizeof(tmp)) tc_sprintf_cap_warn("sprintfCat", _need, sizeof(tmp));
       int32_t _w = tc_str_write_b(dst, _dib, maxSlots, ofs, tmp);
       TC_PUSH(vm, ofs + _w);
       break;
@@ -7751,7 +7803,12 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (n > 512) { n = 512; }
       TC_BUF(txt, 512);
       int32_t anz = TcSppScan(txt, (uint16_t)n, sek);
-      for (int32_t i = 0; i < n; i++) { buf[i] = (int32_t)(uint8_t)txt[i]; if (!txt[i]) break; }
+      // see SYS_WEB_ARG -- `kap` counts bytes for a byte[]
+      { const bool ist_bytes = tc_ref_is_bytes(ref);
+        for (int32_t i = 0; i < n; i++) {
+          tc_chr_put(buf, ist_bytes, i, (int32_t)(uint8_t)txt[i]);
+          if (!txt[i]) break;
+        } }
       TC_PUSH(vm, anz);
 #else
       TC_POP(vm); TC_POP(vm); TC_POP(vm);
@@ -7974,12 +8031,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // Write filename to name buffer
       int32_t *dst = tc_resolve_ref(vm, name_ref);
       int32_t maxLen = tc_ref_maxlen(vm, name_ref);
-      int32_t slen = strlen(ep);
-      if (slen >= maxLen) slen = maxLen - 1;
-      for (int32_t i = 0; i < slen; i++) {
-        dst[i] = (int32_t)(uint8_t)ep[i];
+      if (dst && maxLen > 0) {
+        tc_str_write_b(dst, tc_ref_is_bytes(name_ref), maxLen, 0, ep);
       }
-      dst[slen] = 0;
       entry.close();
       TC_PUSH(vm, 1);  // entry found
 #else
@@ -8302,10 +8356,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         }
       }
       fstr[clen] = 0;
-      // Copy to dst (int32 per char)
-      for (int32_t i = 0; i <= clen && i < maxLen; i++) {
-        dst[i] = (int32_t)(uint8_t)fstr[i];
-      }
+      { const bool ist_bytes = tc_ref_is_bytes(dstRef);
+        for (int32_t i = 0; i <= clen && i < maxLen; i++)
+          tc_chr_put(dst, ist_bytes, i, (int32_t)(uint8_t)fstr[i]); }
       TC_PUSH(vm, clen);
 #else
       TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_POP(vm);
@@ -9960,10 +10013,11 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // Copy result into TinyC char array
       int32_t *buf = tc_resolve_ref(vm, ref);
       if (buf && got > 0) {
+        const bool ist_bytes = tc_ref_is_bytes(ref);
         for (uint32_t i = 0; i < got && (int32_t)i < maxLen; i++) {
-          buf[i] = (int32_t)(uint8_t)tmp[i];
+          tc_chr_put(buf, ist_bytes, i, (int32_t)(uint8_t)tmp[i]);
         }
-        if ((int32_t)got < maxLen) buf[got] = 0;
+        if ((int32_t)got < maxLen) tc_chr_put(buf, ist_bytes, got, 0);
       }
       TC_PUSH(vm, (int32_t)got);
 #else
@@ -10953,7 +11007,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t result = -1;
       if (dst) {
         int32_t dmax = tc_ref_maxlen(vm, dst_ref);
-        dst[0] = 0;
+        // ⚠️ dmax counts BYTES for a packed byte[]. See SYS_WEB_ARG.
+        const bool ist_bytes = tc_ref_is_bytes(dst_ref);
+        tc_chr_put(dst, ist_bytes, 0, 0);
         JsonParser parser(jbuf);
         JsonParserObject obj = parser.getRootObject();
         char *seg = jpath; char *next; bool valid = true; const char *sval = nullptr;
@@ -10967,8 +11023,10 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         }
         if (sval) {
           int32_t len = 0;
-          while (sval[len] != 0 && len < dmax - 1) { dst[len] = (int32_t)(uint8_t)sval[len]; len++; }
-          dst[len] = 0;
+          while (sval[len] != 0 && len < dmax - 1) {
+            tc_chr_put(dst, ist_bytes, len, (int32_t)(uint8_t)sval[len]); len++;
+          }
+          tc_chr_put(dst, ist_bytes, len, 0);
           result = len;
         }
       }
@@ -11289,21 +11347,21 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t dstMax = tc_ref_maxlen(vm, dstRef) - 1;
       int32_t dlen = strlen(delim);
 
+      // ⚠️ BOTH directions were wrong here, read as well as write: srcMax and
+      // dstMax count BYTES for a packed byte[], while the code read and wrote
+      // int32 slots. See SYS_WEB_ARG.
+      const bool dst_bytes = tc_ref_is_bytes(dstRef);
+
       if (dlen == 0 || index == 0) {
-        dst[0] = 0;
+        tc_chr_put(dst, dst_bytes, 0, 0);
         TC_PUSH(vm, 0);
         break;
       }
 
-      // Convert source int32 array to C string
+      // Source as a C string -- tc_ref_to_cstr knows both packings.
       TC_BUF(sbuf, 512);
-      int32_t slen = 0;
-      for (int32_t i = 0; i < srcMax && i < (int32_t)sizeof(sbuf) - 1; i++) {
-        if (src[i] == 0) break;
-        sbuf[i] = (char)(src[i] & 0xFF);
-        slen++;
-      }
-      sbuf[slen] = 0;
+      (void)srcMax; (void)src;
+      int32_t slen = tc_ref_to_cstr(vm, srcRef, sbuf, sizeof(sbuf));
 
       TC_BUF(rbuf, 256);
       rbuf[0] = 0;
@@ -11354,9 +11412,9 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       // Copy result to VM destination buffer
       if (rlen > dstMax) rlen = dstMax;
       for (int32_t i = 0; i < rlen; i++) {
-        dst[i] = (int32_t)(uint8_t)rbuf[i];
+        tc_chr_put(dst, dst_bytes, i, (int32_t)(uint8_t)rbuf[i]);
       }
-      dst[rlen] = 0;
+      tc_chr_put(dst, dst_bytes, rlen, 0);
 
       TC_PUSH(vm, rlen);
       break;
@@ -12045,10 +12103,16 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         int32_t *buf = tc_resolve_ref(vm, buf_ref);
         int32_t maxLen = tc_ref_maxlen(vm, buf_ref);
         if (buf && maxLen > 0) {
+          // ⚠️ tc_ref_maxlen() answers in BYTES for a packed byte[]. Writing
+          // int32 slots here runs four times past the end -- and the reader
+          // sees "o\0\0\0": first character right, string over.
+          // Reported against a byte a[96] in ctWebOn(), Hans 2026-08-27.
+          const bool ist_bytes = tc_ref_is_bytes(buf_ref);
           int slen = val.length();
           if (slen >= maxLen) slen = maxLen - 1;
-          for (int i = 0; i < slen; i++) buf[i] = (int32_t)(uint8_t)val[i];
-          buf[slen] = 0;
+          for (int i = 0; i < slen; i++)
+            tc_chr_put(buf, ist_bytes, i, (int32_t)(uint8_t)val[i]);
+          tc_chr_put(buf, ist_bytes, slen, 0);
           result = slen;
         }
       }
@@ -12122,7 +12186,58 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         // Start mDNS responder
         const char *cMac = (const char*)mdns_mac;
         String ipStr = NetworkAddress().toString();
+        // ⚠️ EVERY REGISTRATION USED TO LEAVE THE PREVIOUS ONE STANDING.
+        // MDNS.begin() + addService() only ever ADD. A script that switches
+        // what it emulates (EcoTracker _everhome._tcp <-> Shelly _shelly._tcp)
+        // therefore answered as BOTH at once under one hostname, and only a
+        // DEVICE restart cleared it -- reported by Hans 2026-08-30 with a PTR
+        // query showing both records live. A slot restart took the same path
+        // and left the same leftover, so this was never about the once-flag.
+        //
+        // ⚠️ AND WHY NOT A PLAIN mdns_service_remove_all() AND DONE: Tasmota
+        // advertises its own _http._tcp from MdnsAddServiceHttp(), which
+        // latches (Mdns.begun 1 -> 2) and never runs again. Wiping every
+        // service would take that advert with it silently and for good. So it
+        // is put back below, wherever this call does not register an http
+        // service of its own.
+        bool eigenes_http = (0 == strcmp(xtype, "shelly"));
+        // ⚠️ THE REMOVE ONLY RUNS FROM THE SECOND CALL ON, and that is not a
+        // nicety -- it is a crash fix. On ESP32 mdns_service_remove_all()
+        // dereferences the IDF's _mdns_server, which is NULL until something
+        // has called mdns_init(). The only thing that does so here is
+        // MDNS.begin() itself, one line further down, so on the very first
+        // registration the load faulted at 0x38 and the device rebooted a
+        // few seconds after the script started.
+        //
+        // ⚠️ IT NEEDS SetOption55 OFF TO SHOW, WHICH IS THE DEFAULT: with
+        // Tasmota's own mDNS on, StartMdns() has already initialised the
+        // responder and the same code is harmless -- presumably the
+        // configuration 1.6.65 was written and tested on. Reported by Hans
+        // 2026-09-04 against the Shelly/EcoTracker emulator on an
+        // ESP32-C3, with both directions verified on the device
+        // (SetOption55 1 + restart made it run again).
+        //
+        // ⚠️ AND THE 1.6.65 COMMENT WAS WRONG ABOUT THE PRECEDENT: Tasmota's
+        // StartMdns() calls MDNS.end() on ESP8266 ONLY, with its own note
+        // that it "does not seem necessary for ESP32" and "will break Matter
+        // support". There is no ESP32 precedent for wiping every service --
+        // one more reason not to do it on the first call, when there is
+        // nothing of ours to clear anyway and Tasmota's or Matter's records
+        // are all that could be hit.
+        //
+        // The duplicate-service fix stays intact: switching
+        // _everhome._tcp <-> _shelly._tcp still removes the previous set,
+        // because by then this call HAS started the responder.
+        static bool tc_mdns_started = false;
+        if (tc_mdns_started) {
+#ifdef ESP32
+          mdns_service_remove_all();
+#else
+          MDNS.end();
+#endif
+        }
         if (MDNS.begin(mdns_name)) {
+          tc_mdns_started = true;
           if (!strcmp(xtype, "everhome")) {
             MDNS.addService("everhome", "tcp", 80);
             MDNS.addServiceTxt("everhome", "tcp", "ip", ipStr.c_str());
@@ -12144,7 +12259,15 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             MDNS.addServiceTxt(xtype, "tcp", "ip", ipStr.c_str());
             MDNS.addServiceTxt(xtype, "tcp", "serial", cMac);
           }
-          AddLog(LOG_LEVEL_INFO, PSTR("TCC: mDNS started, service=%s hostname=%s"), xtype, mdns_name);
+#if defined(USE_DISCOVERY) && defined(WEBSERVER_ADVERTISE)
+          if (!eigenes_http) {
+            MDNS.addService("http", "tcp", WEB_PORT);
+            MDNS.addServiceTxt("http", "tcp", "devicetype", "tasmota");
+          }
+#else
+          (void)eigenes_http;
+#endif
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: mDNS (re)started, service=%s hostname=%s"), xtype, mdns_name);
           result = 0;
         } else {
           AddLog(LOG_LEVEL_INFO, PSTR("TCC: mDNS failed to start"));
@@ -12623,12 +12746,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       if (rbuff) {
         int32_t rlen = strlen(rbuff);
         if (rlen > maxSlots) rlen = maxSlots;
-        for (int32_t i = 0; i < rlen; i++) dst[i] = (int32_t)(uint8_t)rbuff[i];
-        dst[rlen] = 0;
+        const bool ist_bytes = tc_ref_is_bytes(dst_ref);   // see SYS_WEB_ARG
+        for (int32_t i = 0; i < rlen; i++)
+          tc_chr_put(dst, ist_bytes, i, (int32_t)(uint8_t)rbuff[i]);
+        tc_chr_put(dst, ist_bytes, rlen, 0);
         free(rbuff);
         TC_PUSH(vm, rlen);
       } else {
-        dst[0] = 0;
+        tc_chr_put(dst, tc_ref_is_bytes(dst_ref), 0, 0);
         TC_PUSH(vm, 0);
       }
 #else
@@ -15010,6 +15135,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *buf = tc_resolve_ref(vm, ref);
       int32_t maxLen = tc_ref_maxlen(vm, ref);
       if (tc_tls && buf && maxLen > 0) {
+        const bool ist_bytes = tc_ref_is_bytes(ref);       // see SYS_WEB_ARG
         int i = 0; uint32_t last = millis(); bool got = false;
         while (i < maxLen - 1) {
           if (tc_tls->available()) {
@@ -15017,14 +15143,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
             if (c < 0) break;
             last = millis();
             if (c == '\n') { got = true; break; }
-            if (c != '\r') buf[i++] = (int32_t)(uint8_t)c;
+            if (c != '\r') tc_chr_put(buf, ist_bytes, i++, (int32_t)(uint8_t)c);
           } else if (!tc_tls->connected()) {
             break;
           } else if (millis() - last > TC_TLS_IDLE_MS) {
             break;
           } else { delay(1); }
         }
-        buf[i] = 0;
+        tc_chr_put(buf, ist_bytes, i, 0);
         if (got || i > 0) n = i;
       }
       TC_PUSH(vm, n);
@@ -15041,6 +15167,7 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
       int32_t *buf = tc_resolve_ref(vm, ref);
       int32_t maxLen = tc_ref_maxlen(vm, ref);
       if (tc_tls && buf && maxLen > 0) {
+        const bool ist_bytes = tc_ref_is_bytes(ref);       // see SYS_WEB_ARG
         int cap = maxLen - 1;
         if (maxb > 0 && maxb < cap) cap = maxb;
         int i = 0; uint32_t last = millis();
@@ -15048,14 +15175,14 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
           if (tc_tls->available()) {
             int c = tc_tls->read();
             if (c < 0) break;
-            buf[i++] = (int32_t)(uint8_t)c; last = millis();
+            tc_chr_put(buf, ist_bytes, i++, (int32_t)(uint8_t)c); last = millis();
           } else if (!tc_tls->connected()) {
             break;
           } else if (millis() - last > TC_TLS_IDLE_MS) {
             break;
           } else { delay(1); }
         }
-        buf[i] = 0; cnt = i;
+        tc_chr_put(buf, ist_bytes, i, 0); cnt = i;
       }
       TC_PUSH(vm, cnt);
 #else
@@ -16791,8 +16918,10 @@ static int tc_syscall(TcVM *vm, uint16_t id) {
         TC_BUF(tmp, 256);
         int32_t slen = tc_pwl_scan_str(Tinyc->pwl_json, strlen(Tinyc->pwl_json), path, tmp, sizeof(tmp));
         if (slen > maxLen) slen = maxLen;
-        for (int32_t i = 0; i < slen; i++) buf[i] = (int32_t)(uint8_t)tmp[i];
-        buf[slen] = 0;
+        const bool ist_bytes = tc_ref_is_bytes(buf_ref);   // see SYS_WEB_ARG
+        for (int32_t i = 0; i < slen; i++)
+          tc_chr_put(buf, ist_bytes, i, (int32_t)(uint8_t)tmp[i]);
+        tc_chr_put(buf, ist_bytes, slen, 0);
         TC_PUSH(vm, slen);
       } else {
         TC_PUSH(vm, 0);
@@ -18031,6 +18160,7 @@ static void tc_scan_watch_indices(TcVM *vm) {
         case OP_LK_OP_ST: case OP_LL_OP_ST:
           skip = 4; break;
         case OP_LL_CMP_JZ:   skip = 5; break;
+        case OP_LLK_OP2_ST:  skip = 6; break;
         case OP_LK32_OP_ST:  skip = 7; break;
         case OP_LK32_CMP_JZ: skip = 8; break;
         // 0-byte operand — all the rest (NOP/HALT/POP/DUP/arith/cmp/logic/RET/conv)
@@ -19350,6 +19480,28 @@ static int tc_vm_step(TcVM *vm) {
       vm->frames[vm->fp].locals[dst] = r;
       break;
     }
+    // ── Superinstruction: locals[dst] = locals[y] OP_OUT (locals[z] OP_IN k) ──
+    //
+    // ⚠️ INNER FIRST, then outer -- exactly the order of the unfused form. On a
+    // division by zero the INNER error has to surface; starting outside would
+    // report the wrong one for `y / (z - z)`.
+    case OP_LLK_OP2_ST: {
+      uint8_t y  = tc_read_u8(vm);
+      uint8_t z  = tc_read_u8(vm);
+      int32_t k  = (int32_t)(int8_t)tc_read_u8(vm);
+      uint8_t oi = tc_read_u8(vm);
+      uint8_t oo = tc_read_u8(vm);
+      uint8_t dst = tc_read_u8(vm);
+      if (y >= TC_MAX_LOCALS || z >= TC_MAX_LOCALS || dst >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
+      if (!vm->frames[vm->fp].locals) return TC_ERR_FRAME_INVALID;
+      int e2 = TC_OK;
+      int32_t inner = tc_binop_i(oi, vm->frames[vm->fp].locals[z], k, &e2);
+      if (e2 != TC_OK) return e2;
+      int32_t outer = tc_binop_i(oo, vm->frames[vm->fp].locals[y], inner, &e2);
+      if (e2 != TC_OK) return e2;
+      vm->frames[vm->fp].locals[dst] = outer;
+      break;
+    }
     // ── Superinstruction: locals[idx] += delta, kein Stapeleffekt ──
     case OP_INC_LOCAL: {
       idx = tc_read_u8(vm);
@@ -19521,6 +19673,7 @@ static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
     _dispatch[0xBC] = &&_op_load_ref_i16;    _dispatch[0xBD] = &&_op_store_ref_i16;
     _dispatch[0xBE] = &&_op_load_local_u16;  _dispatch[0xBF] = &&_op_load_global_u16;
     _dispatch[0xC0] = &&_op_load_heap_u16;   _dispatch[0xC1] = &&_op_load_ref_u16;
+    _dispatch[0xC2] = &&_op_llk_op2_st;
     _dispatch_init = true;
   }
 
@@ -20194,6 +20347,35 @@ static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
     int32_t _r = tc_binop_i(_bop, vm->frames[vm->fp].locals[_s1], _rhs, &_berr);
     if (_berr != TC_OK) { _err = _berr; goto _vm_exit; }
     vm->frames[vm->fp].locals[_dst] = _r;
+    NEXT();
+  }
+  // ── Superinstruction: locals[dst] = locals[y] OP_OUT (locals[z] OP_IN k) ──
+  //
+  // ⚠️ THIS is the interpreter that RUNS programs. `tc_vm_step()` further up has
+  // a `switch` over the same opcodes, but that one only single-steps; the fast
+  // path dispatches through `_dispatch[]` to these labels. A superinstruction
+  // added ONLY to the switch compiles, links and boots -- and then the device
+  // answers "Unknown opcode" the first time the loop reaches it. Measured on
+  // .39 on 2026-09-03, after the switch alone had looked complete.
+  //
+  // ⚠️ INNER FIRST, then outer -- exactly the order of the unfused form. On a
+  // division by zero the INNER error has to surface, not the outer one.
+  _op_llk_op2_st: {
+    uint8_t _y  = _RD_U8();
+    uint8_t _z  = _RD_U8();
+    int32_t _k  = (int32_t)(int8_t)_RD_U8();
+    uint8_t _oi = _RD_U8();
+    uint8_t _oo = _RD_U8();
+    uint8_t _d2 = _RD_U8();
+    if (_y >= TC_MAX_LOCALS || _z >= TC_MAX_LOCALS || _d2 >= TC_MAX_LOCALS) {
+      _err = TC_ERR_BOUNDS; goto _vm_exit; }
+    if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
+    int _e2 = TC_OK;
+    int32_t _inner = tc_binop_i(_oi, vm->frames[vm->fp].locals[_z], _k, &_e2);
+    if (_e2 != TC_OK) { _err = _e2; goto _vm_exit; }
+    int32_t _outer = tc_binop_i(_oo, vm->frames[vm->fp].locals[_y], _inner, &_e2);
+    if (_e2 != TC_OK) { _err = _e2; goto _vm_exit; }
+    vm->frames[vm->fp].locals[_d2] = _outer;
     NEXT();
   }
   // ── Superinstruction: locals[idx] += delta, kein Stapeleffekt ──
