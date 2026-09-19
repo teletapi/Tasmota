@@ -150,6 +150,17 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 #include "include/xdrv_124_tinyc_camera.h"
 
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
+#ifdef USE_TINYC_ESPDL
+// ⚠️ The VM header is included HERE, while the detector class below is
+// defined much further down — so the camControl dispatch inside it cannot see
+// that class. These two plain functions are the seam.
+//   tc_dl_person_run(score_thr_x100) takes the current camera frame and
+//   returns the number of persons found, -1 on error.
+//   tc_dl_person_get(sel) reads the result: 0=count 1=best score x100
+//   2..5=box x,y,w,h  6=net ms  7=jpeg ms
+int32_t tc_dl_person_run(int32_t schwelle_x100);
+int32_t tc_dl_person_get(int32_t sel);
+#endif
 #include "include/xdrv_124_tinyc_vm.h"
 #include "include/xdrv_124_tinyc_repoide.h"   // /tcrepo page (USE_TINYC_REPO_IDE)
 
@@ -422,6 +433,12 @@ static void TinyCSaveSettings(void) {
   }
   // Extra line for show_info
   f.printf("_info,%d\n", Tinyc->show_info ? 1 : 0);
+#ifdef ESP32
+  // And the malloc() PSRAM limit (TinyCPsram) -- only when it differs from the
+  // build default; an explicit 0 (framework 4096) IS written, or the default
+  // would come back at the next boot.
+  if (Tinyc->psram_limit != TC_PSRAM_DEFAULT) f.printf("_psram,%d\n", Tinyc->psram_limit);
+#endif
   f.close();
   // Autoexec on again anywhere? Then the boot-loop explanation has served its purpose. Note this
   // runs on the load path too (stale entries), but there every autoexec is already 0 after a wipe.
@@ -703,6 +720,28 @@ static void TinyCLoadSettings(void) {
       Tinyc->show_info = (autoexec != 0);
       continue;
     }
+#ifdef ESP32
+    // _psram,<limit>: the malloc() PSRAM limit (TinyCPsram) -- applied right
+    // here, before any slot loads, so the slots' own allocations follow it too.
+    if (fname == "_psram") {
+      Tinyc->psram_limit = (uint16_t)((autoexec < 0) ? 0 : (autoexec > 65535 ? 65535 : autoexec));
+#ifdef CONFIG_SPIRAM_USE_MALLOC
+      // ⚠️ Compile-time guard, not just UsePSRAM(): a build without PSRAM
+      // (C3, C6) has neither CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL nor the
+      // heap_caps_malloc_extmem_enable() body -- the first C3 build after
+      // this command went in broke on the missing name (Hans, 17.09.2026).
+      // An explicit `_psram,0` means "framework default" and must UNDO the
+      // TC_PSRAM_DEFAULT applied at init -- hence the fallback to the Kconfig
+      // value instead of skipping the call.
+      if (UsePSRAM()) {
+        heap_caps_malloc_extmem_enable(Tinyc->psram_limit ? Tinyc->psram_limit : CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: malloc() goes to PSRAM from %u bytes (TinyCPsram, /tinyc.cfg)"),
+               (unsigned)(Tinyc->psram_limit ? Tinyc->psram_limit : CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL));
+      }
+#endif
+      continue;
+    }
+#endif
 
     if (slot >= TC_MAX_VMS) break;
 
@@ -876,6 +915,18 @@ static void TinyCInit(void) {
   if (!tc_file_handle_mutex) tc_file_handle_mutex = xSemaphoreCreateMutex();
   // Pick up the configured stack size BEFORE the first slot starts.
   TinyCLoadStackCfg();
+  // The malloc() PSRAM limit: TC_PSRAM_DEFAULT on every PSRAM build, applied
+  // before /tinyc.cfg is read so a `_psram,<n>` line there can still override
+  // it (see TinyCLoadSettings). Guarded like the command: a build without
+  // PSRAM has neither the setter nor the Kconfig name (C3/C6, Hans 17.09.).
+  Tinyc->psram_limit = TC_PSRAM_DEFAULT;
+#ifdef CONFIG_SPIRAM_USE_MALLOC
+  if (Tinyc->psram_limit && UsePSRAM()) {
+    heap_caps_malloc_extmem_enable(Tinyc->psram_limit);
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: malloc() goes to PSRAM from %u bytes (default, TinyCPsram)"),
+           (unsigned)Tinyc->psram_limit);
+  }
+#endif
 #endif
   // calloc() zeroes memory but doesn't call C++ constructors for embedded objects.
   // WiFiUDP (NetworkUDP) needs proper construction or begin() crashes (NULL deref).
@@ -1058,6 +1109,10 @@ void CmndCheckPartition(void);
 void CmndTinyCIde(void);
 #ifdef ESP32
 void CmndTinyCStack(void);
+#ifdef USE_TINYC_ESPDL
+void CmndTinyCDl(void);
+void CmndTinyCDlCam(void);
+#endif
 void CmndTinyCHttpRx(void);
 #endif
 void CmndTinyCUnload(void);
@@ -1071,7 +1126,7 @@ void CmndMatterCryptoTest(void);
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
   "|Run|Stop|Reset|Exec|Info|Ide|Unload"
 #ifdef ESP32
-  "|Chkpt|Stack|HttpRx"
+  "|Chkpt|Stack|HttpRx|Heap|Psram"
 #endif
 #ifdef USE_MATTER_C
   "|MtrReset"
@@ -1079,19 +1134,25 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
   "|MtrCrypto"
 #endif
 #endif
+#ifdef USE_TINYC_ESPDL
+  "|Dl|DlCam"
+#endif
   ;
 
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
   &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload
 #ifdef ESP32
-  , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx
+  , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx, &CmndTinyCHeap, &CmndTinyCPsram
 #endif
 #ifdef USE_MATTER_C
   , &CmndMatterReset
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
   , &CmndMatterCryptoTest
 #endif
+#endif
+#ifdef USE_TINYC_ESPDL
+  , &CmndTinyCDl, &CmndTinyCDlCam
 #endif
 };
 
@@ -1222,6 +1283,364 @@ void CmndMatterCryptoTest(void) {
 }
 #endif // TINYC_MTRC_CRYPTO_SELFTEST (Fork-B crypto-seam scaffold — off by default)
 #endif // USE_MATTER_C
+
+// --- TinyCDl: run an ESP-DL model straight off the filesystem -------------
+#ifdef USE_TINYC_ESPDL
+#include "dl_model_base.hpp"
+#include "dl_detect_base.hpp"
+#include "dl_detect_pico_postprocessor.hpp"
+#include "dl_image_preprocessor.hpp"
+
+// ── Personenerkenner ───────────────────────────────────────────────────────
+// Rebuilt from models/pedestrian_detect/pedestrian_detect.cpp, but WITHOUT its
+// Kconfig scaffolding: the original wrapper hangs off CONFIG_* symbols and a
+// model-packing step at build time. We load the very same .espdl from a file;
+// the three lines below it are identical (minimize + preprocessing + the Pico
+// postprocessor with the same strides).
+namespace {
+class TcPersonen : public dl::detect::DetectImpl {
+ public:
+  TcPersonen(const char *pfad, float score_thr, float nms_thr) {
+    m_model = new dl::Model(pfad, fbs::MODEL_LOCATION_IN_SDCARD);
+    if (m_model->get_fbs_model()) {
+      m_model->minimize();
+      m_image_preprocessor = new dl::image::ImagePreprocessor(m_model, {0, 0, 0}, {1, 1, 1});
+      m_postprocessor = new dl::detect::PicoPostprocessor(
+          m_model, m_image_preprocessor, score_thr, nms_thr, 10,
+          {{8, 8, 4, 4}, {16, 16, 8, 8}, {32, 32, 16, 16}});
+    }
+  }
+  bool geladen(void) { return m_model && m_model->get_fbs_model() && m_postprocessor; }
+};
+}  // namespace
+
+// Stays loaded: 1.1 s off the SD card is not affordable per frame.
+static TcPersonen *tc_dl_personen = nullptr;
+
+// Result of the last run — the command and the syscall share this one.
+static struct {
+  int32_t n;
+  int32_t best;            // bester Score x100
+  int32_t x, y, w, h;      // Kasten des besten Treffers
+  uint32_t ms_netz, ms_jpeg, ms_laden;
+} tc_dl_erg = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+#ifndef TC_DL_PERSON_MODEL
+#define TC_DL_PERSON_MODEL "/sd/ped.espdl"
+#endif
+
+// TinyCDl <path.espdl> [max_internal_bytes]
+//
+// ⚠️ THE MODEL IS A FILE, NOT PART OF THE FIRMWARE.
+// `fbs::MODEL_LOCATION_IN_SDCARD` is a misleading name: the loader simply does
+// fopen()/fread() on the path (esp-dl/fbs_loader/src/fbs_loader.cpp), so ANY
+// path on Tasmota's LittleFS works. That is the whole point of doing it this
+// way — the models stay out of the firmware image, an OTA stays small, and a
+// model is replaced with a file upload instead of a reflash. The price is
+// PSRAM: the entire file is read into it and stays there while the model
+// lives. On a board with 2 MB PSRAM this would be the wrong trade.
+//
+// Why each reported number is here:
+//   Test          the .espdl carries its own test input AND the expected
+//                 output, so correctness is provable with no camera and not a
+//                 single picture — this is what makes the measurement honest.
+//   Plan          from the library's own get_memory_info(), split the way the
+//                 memory manager really allocated: psram / internal / flash.
+//   Actual        heap deltas measured here, because Plan covers the tensors
+//                 and not everything the load costs.
+//   LoadMs/RunMs  measured here: Espressif's published latency does not say
+//                 which memory layout it was taken with, and that is exactly
+//                 the open question.
+void CmndTinyCDl(void) {
+  if (!XdrvMailbox.data_len) {
+    ResponseCmndChar_P(PSTR("usage: TinyCDl <path.espdl> [max_internal_bytes]"));
+    return;
+  }
+  char *cp = XdrvMailbox.data;
+  while (*cp == ' ') { cp++; }
+  int max_internal = 0;
+  char *sp = strchr(cp, ' ');
+  if (sp) { *sp = '\0'; max_internal = strtol(sp + 1, nullptr, 10); }
+  if (!*cp) { ResponseCmndChar_P(PSTR("no path")); return; }
+
+  // ⚠️ ESP-DL reports its own failures through ESP_LOGE, which on this board
+  // goes to the USB-CDC console and is invisible over HTTP — "load failed"
+  // alone says nothing. So check the two things that actually go wrong here
+  // first: can the C library open this path at all (Tasmota mounts LittleFS
+  // with an EMPTY base path, so the VFS name is the plain Tasmota name), and
+  // does the file start with a magic the loader knows.
+  char magie[5] = {0};
+  long groesse = -1;
+  FILE *f = fopen(cp, "rb");
+  if (f) {
+    if (fread(magie, 1, 4, f) != 4) { magie[0] = '\0'; }
+    fseek(f, 0, SEEK_END);
+    groesse = ftell(f);
+    fclose(f);
+  } else {
+    // ⚠️ WHY THIS MUCH DETAIL FOR A FAILED fopen:
+    // ESP-DL opens the model with plain fopen(), while Tasmota reaches its
+    // filesystem through the Arduino FS object (ffsp). Both are supposed to
+    // end up in the same LittleFS — it is mounted with an EMPTY base path, so
+    // it is the VFS fallback and a bare "/name" should reach it. If the two
+    // disagree, that is the whole bug, and errno says which way.
+    int fehler = errno;
+    bool arduino_kennt = (ffsp && ffsp->exists(cp));
+    size_t arduino_groesse = 0;
+    if (arduino_kennt) {
+      File pruefdatei = ffsp->open(cp, "r");
+      if (pruefdatei) { arduino_groesse = pruefdatei.size(); pruefdatei.close(); }
+    }
+    Response_P(PSTR("{\"TinyCDl\":{\"File\":\"%s\",\"Error\":\"fopen failed\","
+                    "\"Errno\":%d,\"ErrText\":\"%s\","
+                    "\"ArduinoSees\":%d,\"ArduinoBytes\":%u}}"),
+               cp, fehler, strerror(fehler),
+               arduino_kennt ? 1 : 0, (uint32_t)arduino_groesse);
+    return;
+  }
+
+  // ⚠️ THE max_internal_size KNOB HAS A HARD CLIFF, AND IT IS NOT A SOFT ONE.
+  // Measured on the DFR1154 on 16.09.2026 with pedestrian_detect: 0 and 64 kB
+  // are fine (195 ms / 152 ms), 128 kB REBOOTS THE DEVICE — the boot banner
+  // says LoadProhibited, EXCVADDR 00000000, i.e. esp-dl does not check the
+  // allocation it just failed to get and dereferences null. So the limit is
+  // clamped here; a number typed on the console must not cost a reboot.
+  // ⚠️⚠️ THE ARENA-IN-INTERNAL-RAM KNOB IS NOT SAFE ON THIS BOARD, AT ANY SIZE.
+  // Measured on the DFR1154 on 16.09.2026 with pedestrian_detect, camera
+  // running: 0 gives a steady 195 ms. 64 kB gave 152 ms — TWICE — and then
+  // rebooted the device on the very next identical call, and again after that.
+  // 128 kB and half the free heap (~90 kB) reboot it every time. The boot
+  // banner always says LoadProhibited with EXCVADDR 00000000: esp-dl does not
+  // check the allocation it failed to get and dereferences null. So the
+  // failure depends on how the internal heap happens to be fragmented at that
+  // instant — it is NOT a threshold we can compute, and a 22 % gain is not
+  // worth an unpredictable reboot on a camera that is meant to be watching.
+  // The knob is therefore clamped to 0 until esp-dl checks its own mallocs.
+  // Raise TC_DL_MAX_INTERNAL only for deliberate experiments on a spare board.
+  #define TC_DL_MAX_INTERNAL 0
+  uint32_t in_frei = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  int      in_deckel = TC_DL_MAX_INTERNAL;
+  int      gewuenscht = max_internal;
+  if (max_internal > in_deckel) { max_internal = in_deckel; }
+
+  uint32_t ps_vorher = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t in_vorher = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+
+  uint32_t t0 = millis();
+  dl::Model *model = new dl::Model(cp, fbs::MODEL_LOCATION_IN_SDCARD, max_internal);
+  uint32_t ms_laden = millis() - t0;
+
+  // ⚠️ On a bad path load() fails, the constructor SKIPS build() and
+  // m_fbs_model stays null — test()/run() would then dereference it and take
+  // the device down. get_fbs_model() is the only way to see that from here,
+  // so a typo must not cost a reboot.
+  if (!model->get_fbs_model()) {
+    delete model;
+    Response_P(PSTR("{\"TinyCDl\":{\"File\":\"%s\",\"Error\":\"load failed\","
+                    "\"Magic\":\"%s\",\"Bytes\":%ld}}"), cp, magie, groesse);
+    return;
+  }
+
+  uint32_t ps_nach_laden = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+  uint32_t in_nach_laden = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+
+  esp_err_t pruef = model->test();
+
+  // ⚠️ RUN REGARDLESS OF WHAT test() SAID.
+  // test() only works when the model was exported with export_test_values —
+  // the tutorial model has them, the model-zoo ones do not. Gating the timing
+  // on test() therefore reported RunMs 0 for exactly the models we care about.
+  // Without test vectors the input tensor holds whatever is in the arena: the
+  // result is numerically meaningless, but the same multiplications happen, so
+  // the LATENCY is valid. Three runs, because the first one warms the caches.
+  t0 = millis();
+  model->run();
+  uint32_t ms_erst = millis() - t0;
+  t0 = millis();
+  model->run();
+  model->run();
+  model->run();
+  uint32_t ms_lauf = (millis() - t0) / 3;
+
+  size_t ps = 0, in = 0, fl = 0;
+  for (auto &e : model->get_memory_info()) {
+    ps += e.second.psram;
+    in += e.second.internal;
+    fl += e.second.flash;
+  }
+
+  Response_P(PSTR("{\"TinyCDl\":{\"File\":\"%s\",\"Magic\":\"%s\",\"Bytes\":%ld,\"Test\":\"%s\","
+                  "\"LoadMs\":%u,\"RunFirstMs\":%u,\"RunMs\":%u,"
+                  "\"MaxInternal\":%d,\"MaxInternalAsked\":%d,\"InternalFree\":%u,"
+                  "\"Plan\":{\"PSRAM\":%u,\"Internal\":%u,\"Flash\":%u},"
+                  "\"Used\":{\"PSRAM\":%d,\"Internal\":%d}}}"),
+             cp, magie, groesse, (ESP_OK == pruef) ? "OK" : "FAIL",
+             ms_laden, ms_erst, ms_lauf, max_internal, gewuenscht, in_frei,
+             (uint32_t)ps, (uint32_t)in, (uint32_t)fl,
+             (int32_t)(ps_vorher - ps_nach_laden), (int32_t)(in_vorher - in_nach_laden));
+  delete model;
+}
+
+// ── Person detection on the current camera frame ──────────────────────────
+// One place, two callers: the console command TinyCDlCam and the syscall
+// camControl(21,…) that a script uses. The result lands in tc_dl_erg.
+//
+// ⚠️ The JPEG is decoded by jpg2rgb565() from esp32-camera, not by ESP-DL's
+// own path: dl_image_jpeg.cpp needs the esp_new_jpeg component, while
+// jpg2rgb565 is already in this firmware — and it is the only one of the two
+// that can decode SCALED DOWN.
+//
+// Scale 1/2: 640x480 becomes 320x240, still larger than the model's 224x224
+// input, so nothing is lost — but it is a quarter of the pixels and RGB565
+// instead of RGB888. Measured 252 ms instead of 305 ms.
+// Going smaller buys little (1/4: 225 ms) and 1/8 would be too coarse at
+// 80x60: the Huffman pass scales with the COMPRESSED data and cannot be
+// skipped, only the IDCT and the output do.
+static int tc_dl_skala = 2;   // 0 = voll ueber fmt2rgb888, sonst 2/4/8
+static int tc_dl_bo = 0;      // RGB565: 0 = little endian, 1 = big endian
+
+int32_t tc_dl_person_run(int32_t schwelle_x100) {
+  float schwelle = (schwelle_x100 > 0 && schwelle_x100 < 100)
+                       ? (float)schwelle_x100 / 100.0f
+                       : 0.7f;
+  tc_dl_erg.n = 0;
+  tc_dl_erg.best = 0;
+  tc_dl_erg.ms_laden = 0;
+
+  if (!tc_dl_personen) {
+    uint32_t t = millis();
+    tc_dl_personen = new TcPersonen(TC_DL_PERSON_MODEL, schwelle, 0.5f);
+    tc_dl_erg.ms_laden = millis() - t;
+    if (!tc_dl_personen->geladen()) {
+      delete tc_dl_personen;
+      tc_dl_personen = nullptr;
+      return -1;
+    }
+  } else {
+    tc_dl_personen->set_score_thr(schwelle);
+  }
+
+  // ⚠️ THE JPEG MUST BE COPIED OUT FIRST.
+  // Decoding takes ~250 ms and the camera keeps rewriting that same slot in
+  // the meantime. Decoding straight out of the slot worked on the first call
+  // and failed on every one after it with "jpeg decode failed". So copy, then
+  // check AFTERWARDS whether it was written during the copy — the same
+  // pattern as TC_SendCamSlotAsJpeg.
+  uint32_t breite = 0, hoehe = 0, len = 0;
+  uint8_t *jpg = nullptr;
+  for (int versuch = 0; versuch < 5 && !jpg; versuch++) {
+    if (!tc_cam_slot[0].buf || tc_cam_slot[0].len == 0 || tc_cam_slot[0].writing ||
+        tc_cam_slot[0].width == 0) { delay(30); continue; }
+    len = tc_cam_slot[0].len;
+    breite = tc_cam_slot[0].width;
+    hoehe = tc_cam_slot[0].height;
+    uint8_t *k = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!k) { return -2; }
+    memcpy(k, tc_cam_slot[0].buf, len);
+    if (tc_cam_slot[0].writing || tc_cam_slot[0].len != len) { free(k); delay(30); continue; }
+    jpg = k;
+  }
+  if (!jpg) { return -3; }
+
+  uint32_t aus_b = breite, aus_h = hoehe;
+  uint8_t *rgb = nullptr;
+  bool ok = false;
+  uint32_t t0 = millis();
+  if (0 == tc_dl_skala) {
+    rgb = (uint8_t *)heap_caps_malloc(breite * hoehe * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (rgb) { ok = fmt2rgb888(jpg, len, PIXFORMAT_JPEG, rgb); }
+  } else {
+    aus_b = breite / tc_dl_skala;
+    aus_h = hoehe / tc_dl_skala;
+    rgb = (uint8_t *)heap_caps_malloc(aus_b * aus_h * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    // The scale enum is named differently by the two JPEG decoders Tasmota
+    // builds with (esp32-camera: esp_jpeg_image_scale_t, ESP32_JPDEC:
+    // jpg_scale_t); the JPG_SCALE_* constants exist in both, so pass them
+    // directly instead of naming the type.
+    if (rgb) {
+      if (2 == tc_dl_skala)      { ok = jpg2rgb565(jpg, len, rgb, JPG_SCALE_2X); }
+      else if (4 == tc_dl_skala) { ok = jpg2rgb565(jpg, len, rgb, JPG_SCALE_4X); }
+      else                       { ok = jpg2rgb565(jpg, len, rgb, JPG_SCALE_8X); }
+    }
+  }
+  tc_dl_erg.ms_jpeg = millis() - t0;
+  free(jpg);
+  if (!rgb) { return -2; }
+  if (!ok) { free(rgb); return -4; }
+
+  dl::image::img_t bild;
+  bild.data = rgb;
+  bild.width = (uint16_t)aus_b;
+  bild.height = (uint16_t)aus_h;
+  bild.pix_type = (0 == tc_dl_skala) ? dl::image::DL_IMAGE_PIX_TYPE_RGB888
+                : (0 == tc_dl_bo)    ? dl::image::DL_IMAGE_PIX_TYPE_RGB565LE
+                                     : dl::image::DL_IMAGE_PIX_TYPE_RGB565BE;
+
+  t0 = millis();
+  std::list<dl::detect::result_t> &treffer = tc_dl_personen->run(bild);
+  tc_dl_erg.ms_netz = millis() - t0;
+  free(rgb);
+
+  tc_dl_erg.n = (int32_t)treffer.size();
+  // ⚠️ The boxes are in the SCALED-DOWN image. They are scaled back to the
+  // original size for the script and the display, or a box drawn at scale 1/2
+  // would point at the wrong half of the picture.
+  int32_t f = (0 == tc_dl_skala) ? 1 : tc_dl_skala;
+  for (auto &r : treffer) {
+    int32_t sc100 = (int32_t)(r.score * 100.0f);
+    if (sc100 > tc_dl_erg.best) {
+      tc_dl_erg.best = sc100;
+      tc_dl_erg.x = r.box[0] * f;
+      tc_dl_erg.y = r.box[1] * f;
+      tc_dl_erg.w = (r.box[2] - r.box[0]) * f;
+      tc_dl_erg.h = (r.box[3] - r.box[1]) * f;
+    }
+  }
+  return tc_dl_erg.n;
+}
+
+int32_t tc_dl_person_get(int32_t sel) {
+  switch (sel) {
+    case 0: return tc_dl_erg.n;
+    case 1: return tc_dl_erg.best;
+    case 2: return tc_dl_erg.x;
+    case 3: return tc_dl_erg.y;
+    case 4: return tc_dl_erg.w;
+    case 5: return tc_dl_erg.h;
+    case 6: return (int32_t)tc_dl_erg.ms_netz;
+    case 7: return (int32_t)tc_dl_erg.ms_jpeg;
+    default: return -1;
+  }
+}
+
+// TinyCDlCam [schwelle] [skala] [byteordnung]
+void CmndTinyCDlCam(void) {
+  float schwelle = 0.7f;
+  if (XdrvMailbox.data_len) {
+    char *cp = XdrvMailbox.data;
+    float v = CharToFloat(cp);
+    if (v > 0.0f && v < 1.0f) { schwelle = v; }
+    char *sp = strchr(cp, ' ');
+    if (sp) {
+      int sk = strtol(sp + 1, &sp, 10);
+      if (0 == sk || 2 == sk || 4 == sk || 8 == sk) { tc_dl_skala = sk; }
+      if (sp && *sp) { tc_dl_bo = strtol(sp, nullptr, 10) ? 1 : 0; }
+    }
+  }
+
+  int32_t n = tc_dl_person_run((int32_t)(schwelle * 100.0f));
+  if (n < 0) {
+    Response_P(PSTR("{\"TinyCDlCam\":{\"Error\":%d,\"File\":\"%s\"}}"), (int)n, TC_DL_PERSON_MODEL);
+    return;
+  }
+  Response_P(PSTR("{\"TinyCDlCam\":{\"Scale\":%d,\"Thr\":%.2f,\"LoadMs\":%u,\"JpegMs\":%u,"
+                  "\"DetectMs\":%u,\"Found\":%d,\"Best\":%d,"
+                  "\"Box\":[%d,%d,%d,%d]}}"),
+             tc_dl_skala, schwelle, tc_dl_erg.ms_laden, tc_dl_erg.ms_jpeg,
+             tc_dl_erg.ms_netz, (int)n, (int)tc_dl_erg.best,
+             (int)tc_dl_erg.x, (int)tc_dl_erg.y, (int)tc_dl_erg.w, (int)tc_dl_erg.h);
+}
+
+#endif // USE_TINYC_ESPDL
 
 // --- TinyCChkpt: partition table manager (no USE_BINPLUGINS needed) ---
 #ifdef ESP32
@@ -1684,6 +2103,102 @@ void CmndTinyCInfo(void) {
   }
   ResponseCmndNumber(Tinyc->show_info ? 1 : 0);
 }
+
+#ifdef ESP32
+// ── Heap diagnostics: TinyCHeap ─────────────────────────────────────────────
+//
+// Free heap alone says nothing about fragmentation; the largest free block says
+// the effect but not the cause. This walks the INTERNAL heap (heap_caps_walk,
+// IDF 5.x) and bins every block by size, used and free separately, so the
+// shape of the damage becomes visible: hundreds of small used blocks with
+// small holes between them is a different disease from a few big transient
+// buffers punching through -- and the cure differs (see TinyCPsram).
+//
+// .102 (RA8876 dashboard, S3, 6 MB PSRAM): 198 kB free, largest block 31 kB,
+// frag 85 % after three days -- while 4.9 MB of PSRAM sat idle.
+struct TcHeapBins {
+  uint32_t used_n[7], used_b[7], free_n[7], free_b[7];
+  uint32_t used_total, free_total;
+};
+static const uint32_t tc_heap_bin_edges[6] = { 32, 128, 512, 2048, 8192, 32768 };
+static int tc_heap_bin(size_t sz) {
+  for (int i = 0; i < 6; i++) if (sz < tc_heap_bin_edges[i]) return i;
+  return 6;
+}
+static bool tc_heap_walker(walker_heap_into_t heap, walker_block_info_t blk, void *user) {
+  TcHeapBins *b = (TcHeapBins *)user;
+  int i = tc_heap_bin(blk.size);
+  if (blk.used) { b->used_n[i]++; b->used_b[i] += blk.size; b->used_total++; }
+  else          { b->free_n[i]++; b->free_b[i] += blk.size; b->free_total++; }
+  return true;
+}
+// Bin labels: <32, <128, <512, <2k, <8k, <32k, >=32k
+static void tc_heap_bins_json(const char *name, const uint32_t *n, const uint32_t *b) {
+  ResponseAppend_P(PSTR(",\"%s\":{\"n\":[%u,%u,%u,%u,%u,%u,%u],\"b\":[%u,%u,%u,%u,%u,%u,%u]}"), name,
+    n[0], n[1], n[2], n[3], n[4], n[5], n[6], b[0], b[1], b[2], b[3], b[4], b[5], b[6]);
+}
+void CmndTinyCHeap(void) {
+  multi_heap_info_t in;
+  heap_caps_get_info(&in, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+  TcHeapBins bins; memset(&bins, 0, sizeof(bins));
+  heap_caps_walk(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, tc_heap_walker, &bins);
+  Response_P(PSTR("{\"TinyCHeap\":{\"internal\":{\"free\":%u,\"largest\":%u,\"min_free\":%u,"
+                  "\"alloc_blocks\":%u,\"free_blocks\":%u,\"frag\":%u"),
+    (unsigned)in.total_free_bytes, (unsigned)in.largest_free_block, (unsigned)in.minimum_free_bytes,
+    (unsigned)in.allocated_blocks, (unsigned)in.free_blocks,
+    (unsigned)(in.total_free_bytes ? 100 - (uint64_t)in.largest_free_block * 100 / in.total_free_bytes : 0));
+  tc_heap_bins_json("used", bins.used_n, bins.used_b);
+  tc_heap_bins_json("holes", bins.free_n, bins.free_b);
+  ResponseAppend_P(PSTR(",\"bins\":\"<32,<128,<512,<2k,<8k,<32k,>=32k\"}"));
+  if (UsePSRAM()) {
+    multi_heap_info_t ps;
+    heap_caps_get_info(&ps, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ResponseAppend_P(PSTR(",\"psram\":{\"free\":%u,\"largest\":%u,\"alloc_blocks\":%u,\"free_blocks\":%u}"),
+      (unsigned)ps.total_free_bytes, (unsigned)ps.largest_free_block,
+      (unsigned)ps.allocated_blocks, (unsigned)ps.free_blocks);
+  }
+  ResponseAppend_P(PSTR(",\"psram_limit\":%u}}"), (unsigned)(Tinyc ? Tinyc->psram_limit : 0));
+}
+
+// ── TinyCPsram <limit>: where malloc() goes ─────────────────────────────────
+//
+// The framework is built with CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL = 4096: every
+// malloc() BELOW 4 kB lands in internal DRAM, everything at or above goes to
+// PSRAM first. That constant is baked into the prebuilt heap component, but
+// the SAME limit is settable at run time: heap_caps_malloc_extmem_enable()
+// (psramInit() calls it once with the Kconfig value). Lowering it moves the
+// mid-sized churn -- Strings, JSON, web responses, TLS records -- out of the
+// internal heap, whose free space then stops being carved into 31 kB islands.
+//
+// What it does NOT touch: DMA buffers (asked for with MALLOC_CAP_DMA / _INTERNAL
+// explicitly), FreeRTOS task stacks (the kernel allocates them internal), and
+// anything below the limit. Flash writes from a PSRAM buffer are bounced by
+// esp_flash. Since 18.09.2026 every PSRAM build starts with TC_PSRAM_DEFAULT
+// (512); /tinyc.cfg's `_psram,<limit>` overrides it, 0 = framework default.
+// Applied at init, at boot in TinyCLoadSettings() and immediately by the command.
+void CmndTinyCPsram(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+#ifdef CONFIG_SPIRAM_USE_MALLOC
+  // Only a PSRAM-capable build has the framework limit and the setter (see
+  // the guard in TinyCLoadSettings); everywhere else the command says so.
+  if (XdrvMailbox.data_len > 0) {
+    int32_t v = XdrvMailbox.payload;
+    if (v < 0) v = 0;
+    if (v > 65535) v = 65535;
+    Tinyc->psram_limit = (uint16_t)v;
+    if (UsePSRAM()) {
+      heap_caps_malloc_extmem_enable(Tinyc->psram_limit ? Tinyc->psram_limit : CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL);
+    }
+#ifdef USE_UFILESYS
+    TinyCSaveSettings();
+#endif
+  }
+  ResponseCmndNumber(Tinyc->psram_limit);
+#else
+  ResponseCmndChar_P(PSTR("no PSRAM in this build"));
+#endif
+}
+#endif // ESP32
 
 /*********************************************************************************************\
  * Tasmota: Web interface
@@ -3592,6 +4107,16 @@ static void HandleTinyCApi(void) {
       result += String(frag);
       result += F(",\"maxblk\":");               // absolute largest block; frag% is only maxblk/free, so this is what to watch
       result += String(maxblk);
+#ifdef ESP32
+      // Block counts of the INTERNAL heap: the shape of the fragmentation, not
+      // just its effect. TinyCHeap has the size histogram.
+      multi_heap_info_t in;
+      heap_caps_get_info(&in, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+      result += F(",\"blocks\":");
+      result += String((unsigned)in.allocated_blocks);
+      result += F(",\"holes\":");
+      result += String((unsigned)in.free_blocks);
+#endif
     }
     result += '}';
     Webserver->send(200, F("application/json"), result);
@@ -5588,12 +6113,25 @@ static void TC_CamMotionDetect(void) {
       tc_cam_slot[0].width == 0 || tc_cam_slot[0].height == 0 ||
       tc_cam_slot[0].writing) return;
 
-  uint32_t w = tc_cam_slot[0].width;
-  uint32_t h = tc_cam_slot[0].height;
+  // ⚠️ DECODE AT 1/8, NOT FULL SIZE.
+  // Measured on the DFR1154 on 16.09.2026: a 640x480 frame to RGB888 costs
+  // 289 ms and 0.88 MB of PSRAM — and this runs in the MAIN LOOP, which is
+  // why enabling motion detection multiplied Tasmota's LoadAvg by 19 (40 ->
+  // 760) and blocked the loop for ~0.75 s at a time.
+  // jpg2rgb565 with JPG_SCALE_8X does the same job in 43 ms into 9.4 kB.
+  // Halving or quartering barely helps (252 / 225 ms): the Huffman pass scales
+  // with the COMPRESSED data and cannot be skipped, only the IDCT and the
+  // output do. At 1/8 the decoder needs just the DC coefficient per block,
+  // and that is the whole win.
+  // 80x60 is plenty here: this measure is a mean over the entire frame, it has
+  // no notion of where anything is.
+  uint32_t w = tc_cam_slot[0].width / 8;
+  uint32_t h = tc_cam_slot[0].height / 8;
   uint32_t pixels = w * h;
+  if (!pixels) return;
 
-  // Decode JPEG to RGB888 in temp buffer
-  uint8_t *rgb = (uint8_t*)heap_caps_malloc(pixels * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  // RGB565, two bytes per pixel
+  uint8_t *rgb = (uint8_t*)heap_caps_malloc(pixels * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
   if (!rgb) return;
 
 #if defined(CONFIG_IDF_TARGET_ESP32P4)
@@ -5602,7 +6140,7 @@ static void TC_CamMotionDetect(void) {
   free(rgb);
   return;
 #else
-  if (!fmt2rgb888(tc_cam_slot[0].buf, tc_cam_slot[0].len, PIXFORMAT_JPEG, rgb)) {
+  if (!jpg2rgb565(tc_cam_slot[0].buf, tc_cam_slot[0].len, rgb, JPG_SCALE_8X)) {
     free(rgb);
     return;
   }
@@ -5615,10 +6153,13 @@ static void TC_CamMotionDetect(void) {
     tc_cam_motion.ref_size = pixels;
     if (tc_cam_motion.ref_buf) {
       // First frame — fill reference, no comparison
-      uint8_t *pxi = rgb;
+      // RGB565 -> grey. The exact weighting does not matter: this value is
+      // only ever compared against the SAME transform of the next frame.
+      uint16_t *pxi = (uint16_t *)rgb;
       for (uint32_t i = 0; i < pixels; i++) {
-        tc_cam_motion.ref_buf[i] = (pxi[0] + pxi[1] + pxi[2]) / 3;
-        pxi += 3;
+        uint16_t p = pxi[i];
+        tc_cam_motion.ref_buf[i] =
+            ((((p >> 11) & 0x1F) << 3) + (((p >> 5) & 0x3F) << 2) + ((p & 0x1F) << 3)) / 3;
       }
     }
     free(rgb);
@@ -5628,14 +6169,13 @@ static void TC_CamMotionDetect(void) {
   // Compare with reference
   uint64_t accu = 0;
   uint64_t bright = 0;
-  uint8_t *pxi = rgb;
+  uint16_t *pxi = (uint16_t *)rgb;
   uint8_t *pxr = tc_cam_motion.ref_buf;
   for (uint32_t i = 0; i < pixels; i++) {
-    int32_t gray = (pxi[0] + pxi[1] + pxi[2]) / 3;
-    int32_t lgray = pxr[0];
-    pxr[0] = gray;
-    pxi += 3;
-    pxr++;
+    uint16_t p = pxi[i];
+    int32_t gray = ((((p >> 11) & 0x1F) << 3) + (((p >> 5) & 0x3F) << 2) + ((p & 0x1F) << 3)) / 3;
+    int32_t lgray = pxr[i];
+    pxr[i] = gray;
     accu += abs(gray - lgray);
     bright += gray;
   }
