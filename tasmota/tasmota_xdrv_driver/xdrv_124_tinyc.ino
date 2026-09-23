@@ -1116,6 +1116,7 @@ void CmndTinyCDlCam(void);
 void CmndTinyCHttpRx(void);
 #endif
 void CmndTinyCUnload(void);
+void CmndTinyCUdp(void);
 #ifdef USE_MATTER_C
 void CmndMatterReset(void);
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
@@ -1124,7 +1125,7 @@ void CmndMatterCryptoTest(void);
 #endif
 
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
-  "|Run|Stop|Reset|Exec|Info|Ide|Unload"
+  "|Run|Stop|Reset|Exec|Info|Ide|Unload|Udp"
 #ifdef ESP32
   "|Chkpt|Stack|HttpRx|Heap|Psram"
 #endif
@@ -1141,7 +1142,7 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
 
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
-  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload
+  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload, &CmndTinyCUdp
 #ifdef ESP32
   , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx, &CmndTinyCHeap, &CmndTinyCPsram
 #endif
@@ -2085,6 +2086,67 @@ void CmndTinyCUnload(void) {
              slot_num, (unsigned)hatte, (unsigned)ESP_getMaxAllocHeap());
 }
 
+#include <lwip/netif.h>
+#include <lwip/igmp.h>       // igmp_lookfor_group() for TinyCUdp
+// TinyCUdp -- the UDP global table: every name a slot registered, its last
+// value, how many packets carried it (rx) and how many reached at least one VM
+// (inj); plus totals. Written for .118 (2026-09-23), where some values never
+// showed although the multicast group carried them several times a minute.
+// One log line per name (the list does not fit a command response).
+void CmndTinyCUdp(void) {
+  if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
+#ifdef ESP32
+  // TinyCUdp 1 / 0: receive through NetworkUDP (the path before 2026-09-23) or
+  // the plain lwIP socket -- an A/B switch for the next time reception looks
+  // wrong. Counters restart, the socket is rebuilt on the next poll.
+  if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 0 || XdrvMailbox.payload == 1)) {
+    tc_udp_legacy = (XdrvMailbox.payload == 1);
+    if (Tinyc->udp_connected) { Tinyc->udp.flush(); Tinyc->udp.stop(); tc_udp_rx_close(); Tinyc->udp_connected = false; }
+    Tinyc->udp_rx_total = Tinyc->udp_rx_unknown = Tinyc->udp_rx_skip = 0;
+    Tinyc->udp_polls = Tinyc->udp_pkts = Tinyc->udp_raw = 0;
+  }
+#endif
+  uint32_t n = 0;
+  if (Tinyc->udp_vars) {
+    for (int i = 0; i < TC_UDP_MAX_VARS; i++) {
+      TcUdpVar *v = &Tinyc->udp_vars[i];
+      if (!v->used) continue;
+      n++;
+      char val[24];
+      dtostrfd(v->value, 3, val);
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: UDP %-10s %14s  rx %5u  inj %5u"), v->name, val, v->rx, v->inj);
+    }
+  }
+  // Which interfaces are in the group? lwIP joins 239.255.255.250 on every
+  // IGMP-capable netif that exists AT JOIN TIME (INADDR_ANY). A device with
+  // Ethernet and WiFi on the same subnet may have joined on one only.
+  char nif[160]; nif[0] = 0;
+  {
+    ip4_addr_t grp; IP4_ADDR(&grp, 239, 255, 255, 250);
+    struct netif *ni;
+    NETIF_FOREACH(ni) {
+      char one[48];
+      snprintf_P(one, sizeof(one), PSTR("%s%c%c%d:%s/igmp%d/join%d"), nif[0] ? "," : "",
+                 ni->name[0], ni->name[1], ni->num, ip4addr_ntoa(netif_ip4_addr(ni)),
+                 (ni->flags & NETIF_FLAG_IGMP) ? 1 : 0, igmp_lookfor_group(ni, &grp) ? 1 : 0);
+      strlcat(nif, one, sizeof(nif));
+    }
+  }
+  int ethmc = 0;
+#if defined(ESP32) && defined(USE_ETHERNET)
+  ethmc = tc_udp_eth_mc;
+#endif
+  Response_P(PSTR("{\"" D_PRFX_TINYC "Udp\":{\"Vars\":%u,\"Max\":%d,\"Rx\":%u,\"Unknown\":%u,\"SlotSkip\":%u,\"Connected\":%d,\"EthAllMc\":%d,\"Legacy\":%d,\"Polls\":%u,\"Pkts\":%u,\"Raw\":%u,\"Uptime\":%u,\"Netif\":\"%s\"}}"),
+             (unsigned)n, TC_UDP_MAX_VARS, (unsigned)Tinyc->udp_rx_total, (unsigned)Tinyc->udp_rx_unknown,
+             (unsigned)Tinyc->udp_rx_skip, Tinyc->udp_connected ? 1 : 0, ethmc,
+#ifdef ESP32
+             tc_udp_legacy ? 1 : 0,
+#else
+             1,
+#endif
+             (unsigned)Tinyc->udp_polls, (unsigned)Tinyc->udp_pkts, (unsigned)Tinyc->udp_raw, (unsigned)TasmotaGlobal.uptime, nif);
+}
+
 void CmndTinyCExec(void) {
   if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
   if (XdrvMailbox.payload > 0) {
@@ -2125,13 +2187,20 @@ static int tc_heap_bin(size_t sz) {
   for (int i = 0; i < 6; i++) if (sz < tc_heap_bin_edges[i]) return i;
   return 6;
 }
-static bool tc_heap_walker(walker_heap_into_t heap, walker_block_info_t blk, void *user) {
+// ⚠️ A LAMBDA, NOT A FUNCTION -- on purpose. PlatformIO's .ino converter
+// generates a prototype for every function it finds, ignoring #ifdef: on the
+// ESP8266 that prototype named walker_heap_into_t / walker_block_info_t,
+// which only exist in ESP-IDF, and the whole build died in tasmota.ino.cpp
+// (the release of 22.09.2026, first ESP8266 build since this walker arrived
+// on 18.09.). A variable holding a captureless lambda converts to the same
+// heap_caps_walker_cb_t and gets no prototype.
+static auto tc_heap_walker = [](walker_heap_into_t heap, walker_block_info_t blk, void *user) -> bool {
   TcHeapBins *b = (TcHeapBins *)user;
   int i = tc_heap_bin(blk.size);
   if (blk.used) { b->used_n[i]++; b->used_b[i] += blk.size; b->used_total++; }
   else          { b->free_n[i]++; b->free_b[i] += blk.size; b->free_total++; }
   return true;
-}
+};
 // Bin labels: <32, <128, <512, <2k, <8k, <32k, >=32k
 static void tc_heap_bins_json(const char *name, const uint32_t *n, const uint32_t *b) {
   ResponseAppend_P(PSTR(",\"%s\":{\"n\":[%u,%u,%u,%u,%u,%u,%u],\"b\":[%u,%u,%u,%u,%u,%u,%u]}"), name,
