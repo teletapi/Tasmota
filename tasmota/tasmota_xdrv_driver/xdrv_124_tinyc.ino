@@ -125,6 +125,10 @@ static void (*const TinyCWebOnHandlers[])(void) = {
 // the USE_MATTER_C block (with the port wiring) a harmless no-op.
 #ifdef USE_MATTER_C
   #include "matter_c.h"
+  #ifdef USE_BINPLUGINS
+    // built-in lib or the MATTERF plugin, chosen at the first matter_init()
+    #include "include/xdrv_124_matter_dispatch.h"
+  #endif
   // Lazy start: Matter is compiled in but stays completely off (no mDNS, no UDP
   // socket, no fabric load, no advertising) until a TinyC script first uses an
   // mtr* syscall — same "off until enabled" model as HomeKit's hkStart(). These
@@ -140,6 +144,23 @@ static void (*const TinyCWebOnHandlers[])(void) = {
   // context so it lives in PSRAM on boards that have PSRAM, freeing
   // internal DRAM where it matters most.
   extern "C" void *matter_special_malloc(size_t n) { return special_malloc(n); }
+#endif
+
+#ifdef ESP32
+// Take a TinyC VM mutex. On the loop task with the Matter plugin hand-over
+// (MTRC_MARSHAL, boards with XIP from PSRAM) it waits in 5 ms steps and runs
+// the Matter call another task is waiting for: that task may be the one
+// holding this mutex (a script's main() in its VM task calling matterAdd()),
+// and it waits for the loop task. Everywhere else: a plain blocking take.
+static inline void tc_vm_lock(SemaphoreHandle_t m) {
+#ifdef MTRC_MARSHAL
+  if (xTaskGetCurrentTaskHandle() == loopTaskHandle) {
+    while (xSemaphoreTake(m, pdMS_TO_TICKS(5)) != pdTRUE) { mtrc_run_job(); }
+    return;
+  }
+#endif
+  xSemaphoreTake(m, portMAX_DELAY);
+}
 #endif
 
 // Fork-owned TinyC-controlled MIPI-CSI camera (ESP32-P4). Included BEFORE the VM
@@ -264,7 +285,7 @@ extern "C" {
     TcSlot *s = Tinyc->slots[0];
     if (!s || !s->loaded) return;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (!s->vm.halted || s->vm.error != TC_OK) {
 #ifdef ESP32
@@ -319,7 +340,7 @@ static void tc_all_callbacks_str(const char *name, const char *str) {
     TcSlot *s = Tinyc->slots[i];
     if (!s || !s->loaded) continue;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (!s->vm.halted || s->vm.error != TC_OK) {
 #ifdef ESP32
@@ -344,7 +365,7 @@ void tinyc_touch_button(uint8_t btn, int16_t val) {
     TcSlot *s = Tinyc->slots[i];
     if (!s || !s->loaded) continue;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (!s->vm.halted || s->vm.error != TC_OK) {
 #ifdef ESP32
@@ -856,7 +877,15 @@ static void TinyCStartAutoexec(void) {
         uint32_t t0 = millis();
         TcSlot *as = Tinyc->slots[i];
         while (as && !as->main_done && (millis() - t0) < TC_BOOT_MAIN_WAIT_MS) {
+#ifdef MTRC_MARSHAL
+          // main() may itself wait for the loop task (matterAdd() through the
+          // Matter plugin hand-over): run that call here, otherwise both wait
+          // TC_BOOT_MAIN_WAIT_MS and the call is lost (.39: 2x add_endpoint)
+          mtrc_run_job();
+          delay(2);
+#else
           delay(20);
+#endif
         }
 #endif
       }
@@ -1117,6 +1146,7 @@ void CmndTinyCHttpRx(void);
 #endif
 void CmndTinyCUnload(void);
 void CmndTinyCUdp(void);
+void CmndTinyCStrict(void);
 #ifdef USE_MATTER_C
 void CmndMatterReset(void);
 #ifdef TINYC_MTRC_CRYPTO_SELFTEST
@@ -1125,7 +1155,7 @@ void CmndMatterCryptoTest(void);
 #endif
 
 const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
-  "|Run|Stop|Reset|Exec|Info|Ide|Unload|Udp"
+  "|Run|Stop|Reset|Exec|Info|Ide|Unload|Udp|Strict"
 #ifdef ESP32
   "|Chkpt|Stack|HttpRx|Heap|Psram"
 #endif
@@ -1142,7 +1172,8 @@ const char kTinyCCommands[] PROGMEM = D_PRFX_TINYC "|"
 
 void (* const TinyCCommand[])(void) PROGMEM = {
   &CmndTinyC, &CmndTinyCRun, &CmndTinyCStop,
-  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload, &CmndTinyCUdp
+  &CmndTinyCReset, &CmndTinyCExec, &CmndTinyCInfo, &CmndTinyCIde, &CmndTinyCUnload, &CmndTinyCUdp,
+  &CmndTinyCStrict
 #ifdef ESP32
   , &CmndCheckPartition, &CmndTinyCStack, &CmndTinyCHttpRx, &CmndTinyCHeap, &CmndTinyCPsram
 #endif
@@ -1916,7 +1947,17 @@ void CmndTinyC(void) {
       tc_error_str(s->vm.error),
       s->filename[0] ? s->filename : "");
   }
-  ResponseAppend_P(PSTR("]}}"));
+  ResponseAppend_P(PSTR("]"));
+#ifdef MTRC_MARSHAL
+  // Matter plugin hand-over (XIP from PSRAM): losses since boot. The log line
+  // scrolls out of the buffer under Matter traffic; this one stays queryable.
+  {
+    const char *tn = mtrc_job_timeout_name;
+    ResponseAppend_P(PSTR(",\"MtrHandover\":{\"DgramDrops\":%u,\"UpdateDrops\":%u,\"CallTimeouts\":%u,\"LastTimeout\":\"%s\"}"),
+      (unsigned)mtrc_hq_drops, (unsigned)mtrc_dq_drops, (unsigned)mtrc_job_timeouts, tn ? tn : "");
+  }
+#endif
+  ResponseAppend_P(PSTR("}}"));
 }
 
 // Parse optional slot number from command payload: "TinyCRun [slot] [/file]"
@@ -2093,12 +2134,30 @@ void CmndTinyCUnload(void) {
 // (inj); plus totals. Written for .118 (2026-09-23), where some values never
 // showed although the multicast group carried them several times a minute.
 // One log line per name (the list does not fit a command response).
+// TinyCStrict 0 / 1: a string that has to be cut (strcpy/strcat into a
+// too-small array, a syscall's fixed buffer) only logs a line (0, default)
+// or halts the script with "String truncated" (1). Not saved: a restart
+// switches it off again, so a forgotten development setting cannot stop a
+// running installation. Build default: -DTINYC_STRICT=1.
+void CmndTinyCStrict(void) {
+  if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 0 || XdrvMailbox.payload == 1)) {
+    tc_strict = (XdrvMailbox.payload == 1);
+  }
+  ResponseCmndNumber(tc_strict ? 1 : 0);
+}
+
 void CmndTinyCUdp(void) {
   if (!Tinyc) { ResponseCmndChar_P(TC_NOT_INIT); return; }
 #ifdef ESP32
   // TinyCUdp 1 / 0: receive through NetworkUDP (the path before 2026-09-23) or
   // the plain lwIP socket -- an A/B switch for the next time reception looks
   // wrong. Counters restart, the socket is rebuilt on the next poll.
+  // TinyCUdp 2 / 3: keep receiving during a blocking TLS transaction (the
+  // behaviour before 2026-07-06, suspected to crash the Powerwall slot) / pause
+  // the receive socket again (default).
+  if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 2 || XdrvMailbox.payload == 3)) {
+    tc_udp_nopause = (XdrvMailbox.payload == 2);
+  }
   if (XdrvMailbox.data_len > 0 && (XdrvMailbox.payload == 0 || XdrvMailbox.payload == 1)) {
     tc_udp_legacy = (XdrvMailbox.payload == 1);
     if (Tinyc->udp_connected) { Tinyc->udp.flush(); Tinyc->udp.stop(); tc_udp_rx_close(); Tinyc->udp_connected = false; }
@@ -2136,13 +2195,13 @@ void CmndTinyCUdp(void) {
 #if defined(ESP32) && defined(USE_ETHERNET)
   ethmc = tc_udp_eth_mc;
 #endif
-  Response_P(PSTR("{\"" D_PRFX_TINYC "Udp\":{\"Vars\":%u,\"Max\":%d,\"Rx\":%u,\"Unknown\":%u,\"SlotSkip\":%u,\"Connected\":%d,\"EthAllMc\":%d,\"Legacy\":%d,\"Polls\":%u,\"Pkts\":%u,\"Raw\":%u,\"Uptime\":%u,\"Netif\":\"%s\"}}"),
+  Response_P(PSTR("{\"" D_PRFX_TINYC "Udp\":{\"Vars\":%u,\"Max\":%d,\"Rx\":%u,\"Unknown\":%u,\"SlotSkip\":%u,\"Connected\":%d,\"EthAllMc\":%d,\"Legacy\":%d,\"NoPause\":%d,\"Tx\":%u,\"TxDrop\":%u,\"Polls\":%u,\"Pkts\":%u,\"Raw\":%u,\"Uptime\":%u,\"Netif\":\"%s\"}}"),
              (unsigned)n, TC_UDP_MAX_VARS, (unsigned)Tinyc->udp_rx_total, (unsigned)Tinyc->udp_rx_unknown,
              (unsigned)Tinyc->udp_rx_skip, Tinyc->udp_connected ? 1 : 0, ethmc,
 #ifdef ESP32
-             tc_udp_legacy ? 1 : 0,
+             tc_udp_legacy ? 1 : 0, tc_udp_nopause ? 1 : 0, (unsigned)tc_udp_tx_ok, (unsigned)tc_udp_tx_drop,
 #else
-             1,
+             1, 0, 0u, 0u,
 #endif
              (unsigned)Tinyc->udp_polls, (unsigned)Tinyc->udp_pkts, (unsigned)Tinyc->udp_raw, (unsigned)TasmotaGlobal.uptime, nif);
 }
@@ -2468,11 +2527,19 @@ static bool tc_tcb_meta(FS *fs, const char *path,
 static void HandleTinyCPage(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
-  WSContentStart_P(PSTR("TinyC Console"));
-  WSContentSendStyle();
-
   // Handle button commands first (before displaying status)
   // Commands default to slot 0 unless otherwise specified
+  //
+  // ⚠️ The buttons are a GET form, so a click lands on /tc?slot=1&cmd=run and that
+  // address STAYS in the address bar and the history. Every reload of it ran the
+  // command again: a browser that reloads a background tab when it is switched to
+  // (Chrome's memory saver) restarted the slot on every window change, back/forward
+  // did it too (mi-hol, #123: weather.tcb on slot 1 restarted each time he came
+  // back to the console). So a command is answered with a redirect to a plain /tc
+  // (POST/redirect/GET); the page itself is only rendered after that. The command
+  // block therefore has to run BEFORE WSContentStart_P() -- the headers are gone
+  // once that is called -- and must not write any page content (it does not).
+  const bool tc_had_cmd = (Tinyc && Webserver->hasArg(F("cmd")));
   if (Tinyc && Webserver->hasArg(F("cmd"))) {
     String cmd = Webserver->arg(F("cmd"));
     uint8_t cmd_slot = 0;
@@ -2606,6 +2673,17 @@ static void HandleTinyCPage(void) {
 #endif
     }
   }
+
+  if (tc_had_cmd) {
+    // Location "/tc" is relative to the device root, so it also works behind a
+    // reverse proxy that keeps the path. `true` = replace, do not add a second one.
+    Webserver->sendHeader(F("Location"), F("/tc"), true);
+    Webserver->send(303);
+    return;
+  }
+
+  WSContentStart_P(PSTR("TinyC Console"));
+  WSContentSendStyle();
 
   // Custom styles for this page
   WSContentSend_P(PSTR(
@@ -4642,7 +4720,7 @@ static bool MatterC_DispatchInvoke(uint16_t ep, uint32_t cluster, uint32_t cmd) 
       if (strcmp(s->vm.callbacks[c].name, "MatterInvoke") == 0) { has = true; break; }
     if (!has) continue;
 #ifdef ESP32
-    if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+    if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
     if (s->vm.halted && s->vm.error == TC_OK) {
       tc_current_slot = s;
@@ -5092,8 +5170,17 @@ static void HandleMatterQR(void) {
     WSContentStop();
     return;
   }
-  if (Webserver->hasArg(F("bind")))   mtrc_bind();      // open the pairing window
-  if (Webserver->hasArg(F("unbind"))) mtrc_unbind();    // leave all fabrics
+  // ⚠️ Bind / Unbind are GET forms, so /mt?unbind=1 stayed in the address bar and
+  // every reload of it ran matter_factory_reset() again (same trap as /tc?cmd=,
+  // #123); /mt?bind=1 reopened the pairing window. Do the action, then redirect
+  // to a plain /mt (POST/redirect/GET) -- before any page content is started.
+  if (Webserver->hasArg(F("bind")) || Webserver->hasArg(F("unbind"))) {
+    if (Webserver->hasArg(F("bind")))   mtrc_bind();      // open the pairing window
+    if (Webserver->hasArg(F("unbind"))) mtrc_unbind();    // leave all fabrics
+    Webserver->sendHeader(F("Location"), F("/mt"), true);
+    Webserver->send(303);
+    return;
+  }
 
   bool open = mtrc_window_open();
   uint32_t left = mtrc_window_left_s();
@@ -7294,7 +7381,7 @@ static bool tc_mqtt_data_handler(void) {
       if (slot->vm.cb_index[TC_CB_ON_MQTT_DATA] < 0) continue;
       tc_current_slot = slot;
 #ifdef ESP32
-      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
       // Re-check halted AFTER the lock (TOCTOU): the core-1 VM task can flip
       // halted=false between the pre-lock check above and here; running
       // OnMqttData on a non-halted VM corrupts its frame -> crash under MQTT
@@ -7507,7 +7594,7 @@ static void tc_spawn_task_body(void *param) {
 
     // Execute the user function under vm_mutex. The pattern follows TaskLoop:
     // release mutex during delay() so Tasmota callbacks can interleave.
-    if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+    if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
     tc_current_slot = slot;
 
     uint8_t  saved_frame_count      = vm->frame_count;
@@ -7568,7 +7655,7 @@ static void tc_spawn_task_body(void *param) {
           remaining = (int32_t)(vm->delay_until - millis());
         }
         vm->delayed = false;
-        if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+        if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
         tc_current_slot = slot;
         if (entry->stop_requested || !slot->loaded) break;
         vm->halted = false;
@@ -7583,7 +7670,7 @@ static void tc_spawn_task_body(void *param) {
       vm->halted = true; vm->running = false;
       if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
       vTaskDelay(1);
-      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
       tc_current_slot = slot;
       if (entry->stop_requested || !slot->loaded) break;
       vm->halted = false; vm->running = true;
@@ -7660,7 +7747,7 @@ static void tc_worker_vm_body(void *param) {
       break;
     }
 
-    if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+    if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
     tc_current_slot = slot;
 
     // Fresh frame on the worker VM (frame_count starts at 0 — its own stack).
@@ -7705,7 +7792,7 @@ static void tc_worker_vm_body(void *param) {
           remaining = (int32_t)(vm->delay_until - millis());
         }
         vm->delayed = false;
-        if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+        if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
         tc_current_slot = slot;
         if (entry->stop_requested || !slot->loaded) break;
         vm->halted = false; vm->running = true;
@@ -7717,7 +7804,7 @@ static void tc_worker_vm_body(void *param) {
       vm->halted = true; vm->running = false;
       if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
       vTaskDelay(1);
-      if (slot->vm_mutex) xSemaphoreTake(slot->vm_mutex, portMAX_DELAY);
+      if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
       tc_current_slot = slot;
       if (entry->stop_requested || !slot->loaded) break;
       vm->halted = false; vm->running = true;
@@ -8002,6 +8089,9 @@ bool Xdrv124(uint32_t function) {
   switch (function) {
     case FUNC_LOOP:
 #ifdef USE_MATTER_C
+#ifdef USE_BINPLUGINS
+      mtrc_main_pump();   // plugin: hand over datagrams/calls from other tasks first
+#endif
       matter_loop();   // process any queued Matter datagram (PASE responder)
       // Throttled aggregate log of UDP RX (every 5 s, only if traffic).
       // Runs on main task → safe stack for the format/log path.
@@ -8065,7 +8155,7 @@ bool Xdrv124(uint32_t function) {
           continue;
         }
 #ifdef ESP32
-        if (s->vm_mutex) xSemaphoreTake(s->vm_mutex, portMAX_DELAY);
+        if (s->vm_mutex) tc_vm_lock(s->vm_mutex);
 #endif
         if (s->vm.halted && s->vm.error == TC_OK) {
           tc_current_slot = s;
