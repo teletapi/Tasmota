@@ -170,6 +170,18 @@ static inline void tc_vm_lock(SemaphoreHandle_t m) {
 // stays untouched and Tasmota initializes the camera at no point.
 #include "include/xdrv_124_tinyc_camera.h"
 
+#if defined(ESP32) && (defined(USE_WEBCAM) || defined(USE_TINYC_CAMERA)) && !defined(CONFIG_IDF_TARGET_ESP32P4)
+// ⚠️ ONE JPEG DECODE AT A TIME (gemu 03.10.2026, DFR1154). The motion detector decodes the slot in
+// the MAIN LOOP every 500 ms (TC_CamMotionDetect), the person detector decodes it in the VM task
+// (tc_dl_person_run, ~250 ms). Run together, jpg2rgb565() failed in the person check about every
+// second time: error -4, "person detect error -4" in the log. Measured with a script that did
+// nothing but camControl(21) in a loop: motion on 27 of 50 failed, motion off 0 of 50, and the
+// same check from the main loop (where it cannot overlap) 0 of 60. The two now take turns: the
+// person check waits (it runs in the VM task), the motion sample is skipped when the decoder is
+// busy (it runs in the main loop and must not block it for 250 ms).
+static SemaphoreHandle_t tc_jpg_mutex = xSemaphoreCreateMutex();
+#endif
+
 // VM engine is in a separate .h to avoid Arduino IDE auto-prototype issues
 #ifdef USE_TINYC_ESPDL
 // ⚠️ The VM header is included HERE, while the detector class below is
@@ -181,6 +193,14 @@ static inline void tc_vm_lock(SemaphoreHandle_t m) {
 //   2..5=box x,y,w,h  6=net ms  7=jpeg ms
 int32_t tc_dl_person_run(int32_t schwelle_x100);
 int32_t tc_dl_person_get(int32_t sel);
+#endif
+// /tcrepo ("Run IDE from repo": the full IDE pulled from the repository into the browser, nothing but a ~6 KB
+// page on the device) is ON by default in every TinyC build -- the "Run IDE from repo" button of the console page
+// and the way to use TinyC without the 265 KB IDE file on the device. Before 1.6.73 it needed -DUSE_TINYC_REPO_IDE,
+// which only some of our own environments set (in a git-ignored platformio_override.ini), so a build from the
+// repository did not have it. -DTINYC_NO_REPO_IDE leaves it out (about 6 KB of flash).
+#if !defined(USE_TINYC_REPO_IDE) && !defined(TINYC_NO_REPO_IDE)
+#define USE_TINYC_REPO_IDE
 #endif
 #include "include/xdrv_124_tinyc_vm.h"
 #include "include/xdrv_124_tinyc_repoide.h"   // /tcrepo page (USE_TINYC_REPO_IDE)
@@ -1576,6 +1596,8 @@ int32_t tc_dl_person_run(int32_t schwelle_x100) {
   uint32_t aus_b = breite, aus_h = hoehe;
   uint8_t *rgb = nullptr;
   bool ok = false;
+  // take turns with the motion detector's decode (see tc_jpg_mutex)
+  bool jm = tc_jpg_mutex && (xSemaphoreTake(tc_jpg_mutex, pdMS_TO_TICKS(1500)) == pdTRUE);
   uint32_t t0 = millis();
   if (0 == tc_dl_skala) {
     rgb = (uint8_t *)heap_caps_malloc(breite * hoehe * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1595,6 +1617,7 @@ int32_t tc_dl_person_run(int32_t schwelle_x100) {
     }
   }
   tc_dl_erg.ms_jpeg = millis() - t0;
+  if (jm) { xSemaphoreGive(tc_jpg_mutex); }
   free(jpg);
   if (!rgb) { return -2; }
   if (!ok) { free(rgb); return -4; }
@@ -2966,8 +2989,15 @@ static void HandleTinyCPage(void) {
             // build.html keeps writing), new firmware against an old repo falls
             // back here. Entries are {file,name,info}; anything missing degrades
             // to exactly the old behaviour, the bare filename.
-            "function tcOpt(s,f,n,u){var o=document.createElement('option');"
-            "o.value=f;o.textContent=n?n+' ('+f+')':f;if(u)o.dataset.u=u;s.appendChild(o)}"
+            // ⚠️ GLEICHES ETIKETT WIE DIE IDE (gemu2015/Sonoff-Tasmota#128, mi-hol): „Name (datei)" OHNE
+            // „.tcb", und die Liste nach DIESEM Etikett sortiert — nicht nach Dateiname, sonst steht
+            // „Etekcity ESF37 Scale" scheinbar zufaellig zwischen den e-Dateien. Die IDE-Liste
+            // „Repo Examples" bildet dasselbe Etikett aus index.json.
+            "function tcLb(e){var n=e.name||e.n||'',f=e.file||e.f||'';"
+            "if(f.slice(-4)=='.tcb')f=f.slice(0,-4);return n?n+' ('+f+')':f}"
+            "function tcOpt(s,f,n,u){var o=document.createElement('option'),"
+            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f;"
+            "o.value=f;o.textContent=n?n+' ('+b+')':b;if(u)o.dataset.u=u;s.appendChild(o)}"
             "function tcrU(){var s=document.getElementById('tcrf');"
             "return s&&s.selectedIndex>=0?(s.options[s.selectedIndex].dataset.u||''):''}"
             "function tcrI(){var u=tcrU();if(u)window.open(u,'_blank','noopener')}"
@@ -3000,7 +3030,8 @@ static void HandleTinyCPage(void) {
             "function tcTxt(s,f){return fetch(tcB()+'/index.txt',{cache:f?'reload':'default'})"
             ".then(function(r){if(!r.ok)throw r.status;return r.text()}).then(function(t){"
             "var ls=t.split(String.fromCharCode(10)).map(function(x){return x.trim()})"
-            ".filter(function(x){return x.slice(-4)=='.tcb'});s.innerHTML='';"
+            ".filter(function(x){return x.slice(-4)=='.tcb'})"
+            ".sort(function(a,b){a=a.toLowerCase();b=b.toLowerCase();return a<b?-1:a>b?1:0});s.innerHTML='';"
             "if(!ls.length){s.innerHTML='<option>(empty)</option>';return}"
             "ls.forEach(function(n){tcOpt(s,n,'','')})})}"
             // ⚠️ DIE ALTE MELDUNG ZUERST WEG. Sie wird nur im Fehlerfall
@@ -3014,7 +3045,9 @@ static void HandleTinyCPage(void) {
             "var m0=document.getElementById('tcrmsg');if(m0)m0.textContent='';"
             "fetch(tcB()+'/index.json',{cache:f?'reload':'default'}).then(function(r){"
             "if(!r.ok)throw r.status;return r.json()}).then(function(j){"
-            "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';s.innerHTML='';"
+            "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';"
+            "ls=ls.slice().sort(function(a,b){return tcLb(a).localeCompare(tcLb(b),undefined,{sensitivity:'base'})});"
+            "s.innerHTML='';"
             "ls.forEach(function(e){var u=e.info||'';"
             "if(u&&u.slice(0,7)!='http://'&&u.slice(0,8)!='https://')u='';"
             "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u)});tcrL()})"
@@ -4984,8 +5017,10 @@ extern "C" {
                                           uint64_t *out) {
     (void)ctx;
     // Only endpoint 1 (the plug) mirrors relay 1; other endpoints (e.g. an RGB
-    // light) keep their own OnOff in the data-model registry.
-    if (endpoint == 1 && cluster == 0x0006 && attr == 0x0000) {
+    // light) keep their own OnOff in the data-model registry. A script can make endpoint 1 something else (the bridge
+    // script's colour light): then the script owns OnOff too, not the relay of this device.
+    if (endpoint == 1 && cluster == 0x0006 && attr == 0x0000 &&
+        (mtrc_ep_dt[1] == 0 || mtrc_ep_dt[1] == 0x010A)) {
       *out = bitRead(TasmotaGlobal.power, 0) ? 1 : 0;
       return MATTER_OK;
     }
@@ -6097,7 +6132,14 @@ static void HandleTinyCWebOn7(void) { HandleTinyCWebOn(7); }
 // memcpy an, ist die Kopie schon zerrissen. Dann lieber 503 und der Aufrufer
 // holt sich das naechste Bild -- ein Bild zu ueberspringen faellt bei 10 Bildern
 // je Sekunde niemandem auf, ein zerrissenes schon.
+//
+// ⚠️ NICHT SOFORT 503, WENN GERADE GESCHRIEBEN WIRD. Auf der klassischen ESP32-CAM (AI-Thinker,
+// VGA, ~8 Bilder/s) ist der Slot einen guten Teil der Zeit „writing"; Safari holt Einzelbilder und
+// wartete nach einem 503 eine volle Sekunde -- das waren die Aussetzer (gemu 02.10.2026,
+// Chrome mit dem Strom lief sauber). Der Schreiber braucht nur einige 10 ms: bis zu 100 ms
+// abwarten und dann liefern.
 static void TC_SendCamSlotAsJpeg(int idx) {
+  for (int w = 0; w < 20 && tc_cam_slot[idx].buf && tc_cam_slot[idx].writing; w++) { delay(5); }
   if (!tc_cam_slot[idx].buf || tc_cam_slot[idx].len == 0 || tc_cam_slot[idx].writing) {
     Webserver->send(503, "text/plain", "no image");
     return;
@@ -6180,7 +6222,9 @@ static void TC_CamStreamTask(void) {
     tc_cam_stream.client.flush();
     tc_cam_stream.client.setNoDelay(true);
     tc_cam_stream.client.setTimeout(1);
+    // CORS: the page (port 80) reads this stream with fetch() in Safari
     tc_cam_stream.client.print("HTTP/1.1 200 OK\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
       "Content-Type: multipart/x-mixed-replace;boundary=" TC_CAM_BOUNDARY "\r\n"
       "\r\n");
     tc_cam_stream.stream_active = 2;
@@ -6296,7 +6340,14 @@ static void TC_CamMotionDetect(void) {
   free(rgb);
   return;
 #else
-  if (!jpg2rgb565(tc_cam_slot[0].buf, tc_cam_slot[0].len, rgb, JPG_SCALE_8X)) {
+  // the person detector decodes too (VM task): skip this sample instead of waiting in the main loop
+  if (tc_jpg_mutex && xSemaphoreTake(tc_jpg_mutex, 0) != pdTRUE) {
+    free(rgb);
+    return;
+  }
+  bool dec_ok = jpg2rgb565(tc_cam_slot[0].buf, tc_cam_slot[0].len, rgb, JPG_SCALE_8X);
+  if (tc_jpg_mutex) { xSemaphoreGive(tc_jpg_mutex); }
+  if (!dec_ok) {
     free(rgb);
     return;
   }
@@ -8410,18 +8461,38 @@ bool Xdrv124(uint32_t function) {
         // geholt -- das nächste erst, wenn das vorige da ist -- statt mit
         // einem festen setInterval: bei einer langsamen Verbindung stapeln
         // sich sonst die Anfragen, und der ESP beantwortet sie alle.
+        // Safari liest den Strom selbst (fetch + Bild je Frame): EINE Verbindung, die volle
+        // Bildrate, kein Einzelbild-Anfragen je Bild (3,4-4,4 B/s, Aussetzer -- gemu 02.10.2026).
+        // Scheitert das dreimal hintereinander, faellt es auf die verketteten Einzelbilder zurueck.
         WSContentSend_P(PSTR("<p></p><center>"
           "<img id='tccam' alt='TinyC Camera' style='width:99%%;'>"
           "</center><p></p>"
           "<script>window.addEventListener('load',function(){"
           "var c=document.getElementById('tccam');"
+          "var P=function(){var e=0,n=function(){c.src='/tc_cam.jpg?'+Date.now();};"
+          "c.onload=function(){e=0;setTimeout(n,20);};"
+          "c.onerror=function(){e++;setTimeout(n,e<4?150:1000);};n();};"
           "if(/^((?!chrome|android).)*safari/i.test(navigator.userAgent)){"
-          "var n=function(){c.src='/tc_cam.jpg?'+Date.now();};"
-          "c.onload=function(){setTimeout(n,80);};"
-          "c.onerror=function(){setTimeout(n,1000);};n();"
+          "if(!window.fetch||!window.ReadableStream){P();return;}"
+          "var u=null,f=0,go=function(){"
+          "fetch('http://%_I:%d/stream').then(function(r){"
+          "var rd=r.body.getReader(),b=new Uint8Array(0);"
+          "var pump=function(){return rd.read().then(function(x){"
+          "if(x.done)throw 0;"
+          "var nb=new Uint8Array(b.length+x.value.length);nb.set(b);nb.set(x.value,b.length);b=nb;"
+          "var last=null;"
+          "for(;;){var s='',i=0,k=Math.min(b.length,160);for(;i<k;i++)s+=String.fromCharCode(b[i]);"
+          "var m=/Content-Length: (\\d+)\\r\\n\\r\\n/.exec(s);if(!m){if(b.length>300000)b=new Uint8Array(0);break;}"
+          "var st=m.index+m[0].length,l=+m[1];if(b.length<st+l)break;"
+          "last=b.slice(st,st+l);b=b.slice(st+l);}"
+          "if(last){var o=URL.createObjectURL(new Blob([last],{type:'image/jpeg'})),old=u;"
+          "u=o;c.src=o;f=0;if(old)setTimeout(function(){URL.revokeObjectURL(old);},500);}"
+          "return pump();});};return pump();"
+          "}).catch(function(){if(++f>2){P();}else{setTimeout(go,1000);}});};go();"
           "}else{"
           "c.onerror=function(){setTimeout(function(){c.src='http://%_I:%d/stream';},2000);};"
           "c.src='http://%_I:%d/stream';}});</script>"),
+          (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT,
           (uint32_t)WiFi.localIP(), TC_CAM_STREAM_PORT);
       }
