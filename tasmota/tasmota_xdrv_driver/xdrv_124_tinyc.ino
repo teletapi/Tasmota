@@ -72,8 +72,16 @@
 // so a freshly flashed image already has it; if /tinyc_repos.cfg exists on the
 // filesystem it REPLACES this list (Hans, 2026-09-14: having to upload a file
 // after flashing defeats the purpose).
+//
+// The default offers BOTH repositories: ours and ottelo's SmartMeter/PV/Emulator programs. Ottelo's images define the
+// same two entries in their user_config_override.h, so a device that switches between his image and ours keeps the
+// same choice -- with one entry only the page shows no source drop-down, and mi-hol (gemu2015/Sonoff-Tasmota#131,
+// 17.10.2026) found the "Repo selection box" gone after the switch. The entry whose <base>/bytecode equals
+// TINYC_DEFAULT_REPO is preselected, so our default stays ours.
 #ifndef TINYC_REPO_LIST
-#define TINYC_REPO_LIST "TinyC (gemu2015)|https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc"
+#define TINYC_REPO_LIST \
+  "TinyC Examples (gemu2015)|https://raw.githubusercontent.com/gemu2015/Sonoff-Tasmota/universal/tasmota/tinyc\n" \
+  "SmartMeter/PV/Emulator (ottelo)|https://raw.githubusercontent.com/ottelo9/tasmota-sml-script/main/tinyc"
 #endif
 
 // Cap for the list, whether compiled in or read from the file. Four entries of
@@ -787,6 +795,14 @@ static void TinyCLoadSettings(void) {
     if (slot >= TC_MAX_VMS) break;
 
     fname.trim();
+    if (fname.length() >= TC_FILENAME_MAX) {
+      // An entry from before the buffers were 64 bytes cannot exist (it was cut when it was written); anything
+      // else is a hand-edited file. A name that does not fit would be cut and no longer match its file.
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: Slot %d: file name too long (%d characters) — entry dropped"), slot, (int)fname.length());
+      cfg_stale = true;
+      slot++;
+      continue;
+    }
     if (fname.length() > 0) {
       // A slot whose file is gone keeps NOTHING. Deleting a .tcb (over /ufsd,
       // or after TinyCUnload) left the name standing in /tinyc.cfg, so the
@@ -2392,10 +2408,17 @@ static void WSSendJSON(int code, const char *json_buf) {
 
 // Helper: load a .tcb file from filesystem into a specified slot
 #ifdef USE_UFILESYS
+static void TinyCAdoptPersist(const char *prev_tcb, const char *new_tcb);   // defined behind tc_tcb_meta()
 static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
   if (!Tinyc) return false;
   if (slot_num >= TC_MAX_VMS) return false;
 
+  // A path that does not fit the slot's name buffer would be cut in the slot and in /tinyc.cfg and then no longer
+  // match the file (and its persist file). Refuse it instead of loading under a wrong name.
+  if (strlen(path) >= TC_FILENAME_MAX) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Load %s refused: file name too long (at most %d characters)"), path, TC_FILENAME_MAX - 1);
+    return false;
+  }
   // Allocate slot if needed
   if (!Tinyc->slots[slot_num]) {
     Tinyc->slots[slot_num] = tc_slot_alloc();
@@ -2406,6 +2429,10 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
   }
   TcSlot *s = Tinyc->slots[slot_num];
   TC_HEAPLOG("loadfile.in");
+  // The program this slot ran before (the name survives a TinyCUnload in the slot's config): needed to carry its persist values
+  // over to a new version of the same script, see TinyCAdoptPersist().
+  char prev_tcb[TC_FILENAME_MAX];
+  strlcpy(prev_tcb, s->filename[0] ? s->filename : Tinyc->slot_config[slot_num].filename, sizeof(prev_tcb));
 
   File file;
   if (ufsp) file = ufsp->open(path, "r");
@@ -2471,6 +2498,7 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
     strlcpy(s->filename, path, sizeof(s->filename));
     strlcpy(Tinyc->slot_config[slot_num].filename, path, sizeof(Tinyc->slot_config[slot_num].filename));
     TinyCSetPersistFile(s, path);
+    TinyCAdoptPersist(prev_tcb, path);
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Loaded %s (%d bytes) into slot %d"), path, fsize, slot_num);
     TC_HEAPLOG("loadfile.out");
     return true;
@@ -2484,7 +2512,7 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
 #endif
 
 #ifdef USE_UFILESYS
-// Read the optional plain name / info URL out of a .tcb header WITHOUT loading
+// Read the optional plain name / info URL / version out of a .tcb header WITHOUT loading
 // the program. Both are TLV records behind the fixed 40-byte V6 header; the
 // header is self-describing (header_size in B20-21), so this is just "read the
 // first header_size bytes and walk the records past byte 40".
@@ -2494,12 +2522,14 @@ static bool TinyCLoadFile(const char *path, uint8_t slot_num) {
 // in the loop task -- the mistake that made the repository box block the whole
 // device before it moved into the browser (see the Repository section below).
 //
-// Returns true if at least one field was found. Both buffers are always
-// NUL-terminated, empty when the field is absent.
+// Returns true if at least one field was found. The buffers are always
+// NUL-terminated, empty when the field is absent (ver, info: optional).
 static bool tc_tcb_meta(FS *fs, const char *path,
-                        char *name, size_t nsz, char *info, size_t isz) {
+                        char *name, size_t nsz, char *info, size_t isz,
+                        char *ver = nullptr, size_t vsz = 0) {
   if (name && nsz) name[0] = 0;
   if (info && isz) info[0] = 0;
+  if (ver && vsz) ver[0] = 0;
   if (!fs) return false;
   File f = fs->open(path, "r");
   if (!f) return false;
@@ -2523,6 +2553,7 @@ static bool tc_tcb_meta(FS *fs, const char *path,
           char *dst = nullptr; size_t dsz = 0;
           if      (tag == 1) { dst = name; dsz = nsz; }
           else if (tag == 2) { dst = info; dsz = isz; }
+          else if (tag == 3) { dst = ver;  dsz = vsz; }      // `// @version: YYYYMMDD_HHMM`
           if (dst && dsz) {
             size_t n = (len < dsz - 1) ? len : dsz - 1;
             memcpy(dst, meta + i + 2, n);
@@ -2545,7 +2576,64 @@ static bool tc_tcb_meta(FS *fs, const char *path,
   }
   return ok;
 }
+
+// A new VERSION of a script usually comes under a new file name (the IDE names a locally loaded file "slot<N>-<name>", so
+// slot0-steuve_v005.tcb -> slot0-steuve_v006.tcb) and with it a new, EMPTY .pvs: every saved setting seems to be gone, and the
+// user cannot know that the old values still lie in the old file (Andreas, 20.10.2026). The .pvs stores its values BY
+// VARIABLE NAME (PV3), so the old file can safely be the starting point of the new one: variables the new version has get
+// their old value, new ones keep their default, dropped ones are ignored.
+// Taken over only when ALL of this holds: the slot ran another file before, the new one has no .pvs yet, the old one has,
+// and both programs carry the same `// @name:` (so a different program is never fed foreign values). The old .pvs stays.
+static void TinyCAdoptPersist(const char *prev_tcb, const char *new_tcb) {
+  if (!ufsp || !prev_tcb || !prev_tcb[0] || !new_tcb || strcmp(prev_tcb, new_tcb) == 0) return;
+  char new_pvs[TC_FILENAME_MAX], old_pvs[TC_FILENAME_MAX];
+  tc_pvs_name(new_tcb, new_pvs, sizeof(new_pvs));
+  tc_pvs_name(prev_tcb, old_pvs, sizeof(old_pvs));
+  if (strcmp(new_pvs, old_pvs) == 0 || ufsp->exists(new_pvs) || !ufsp->exists(old_pvs)) return;
+  char n_new[52] = { 0 }, n_old[52] = { 0 };
+  if (!tc_tcb_meta(ufsp, new_tcb, n_new, sizeof(n_new), nullptr, 0) && ffsp && ffsp != ufsp) {
+    tc_tcb_meta(ffsp, new_tcb, n_new, sizeof(n_new), nullptr, 0);
+  }
+  if (!tc_tcb_meta(ufsp, prev_tcb, n_old, sizeof(n_old), nullptr, 0) && ffsp && ffsp != ufsp) {
+    tc_tcb_meta(ffsp, prev_tcb, n_old, sizeof(n_old), nullptr, 0);
+  }
+  if (!n_new[0] || strcmp(n_new, n_old) != 0) return;     // no name, or another program: nothing to carry over
+  File in = ufsp->open(old_pvs, "r");
+  if (!in) return;
+  File out = ufsp->open(new_pvs, "w");
+  if (!out) { in.close(); return; }
+  uint8_t buf[128];
+  size_t total = 0; bool ok = true;
+  while (true) {
+    int rd = in.read(buf, sizeof(buf));
+    if (rd <= 0) break;
+    if (out.write(buf, rd) != (size_t)rd) { ok = false; break; }
+    total += rd;
+  }
+  in.close(); out.close();
+  if (!ok || total == 0) { ufsp->remove(new_pvs); return; }       // a partial copy must not look like saved settings
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: persist values taken over from %s (%u B) for %s"), old_pvs, (unsigned)total, new_tcb);
+}
 #endif  // USE_UFILESYS
+
+// The index file next to a data file: "<path without extension>.ind". The extension is looked for only behind the LAST
+// slash (a dot in a folder name, /sd/v1.2/log, made it "/sd/v1.ind"), and the ".ind" is appended with strlcat, never
+// strcat (a path without a dot and 124+ characters overflowed the 128-byte buffer). Andreas, 17.10.2026.
+static void tc_ind_path(const char *path, char *out, size_t osz) {
+  strlcpy(out, path, osz);
+  char *slash = strrchr(out, '/');
+  char *dot = strrchr(slash ? slash : out, '.');
+  if (dot) *dot = 0;
+  strlcat(out, ".ind", osz);
+}
+
+// "20261017_1430" -> "17.10.26 14:30" for the slot row. Anything that is not in that form is shown as it is.
+static void tc_version_display(const char *v, char *out, size_t osz) {
+  bool form = strlen(v) == 13 && v[8] == '_';
+  for (int i = 0; form && i < 13; i++) { if (i != 8 && !isdigit((unsigned char)v[i])) form = false; }
+  if (form) snprintf_P(out, osz, PSTR("%c%c.%c%c.%c%c %c%c:%c%c"), v[6], v[7], v[4], v[5], v[2], v[3], v[9], v[10], v[11], v[12]);
+  else strlcpy(out, v, osz);
+}
 
 static void HandleTinyCPage(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
@@ -2644,7 +2732,14 @@ static void HandleTinyCPage(void) {
         if (!fss[fi]) continue;
         File dir = fss[fi]->open("/", "r");
         if (!dir) continue;
-        char names[16][40];
+        dir.close();
+        // At most 16 names are collected per pass (RAM), so repeat until a pass finds nothing: with more than 16
+        // programs the rest used to stay without a word (Andreas, 17.10.2026). The directory is reopened each pass
+        // because removing files while it is open can skip entries.
+        for (int pass = 0; pass < 64; pass++) {
+        dir = fss[fi]->open("/", "r");
+        if (!dir) break;
+        char names[16][TC_FILENAME_MAX];   // as long as a slot name can be (was 40: a longer file was "removed" under a cut name, i.e. not at all)
         int count = 0;
         dir.rewindDirectory();
         while (count < 16) {
@@ -2656,7 +2751,7 @@ static void HandleTinyCPage(void) {
             char *lcp = strrchr(ep, '/');
             if (lcp) ep = lcp + 1;
             uint16_t nlen = strlen(ep);
-            if (nlen > 4 && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
+            if (nlen > 4 && nlen + 1 < sizeof(names[0]) && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
               snprintf(names[count], sizeof(names[0]), "/%s", ep);
               count++;
             }
@@ -2664,10 +2759,13 @@ static void HandleTinyCPage(void) {
           entry.close();
         }
         dir.close();
+        int removed = 0;
         for (int i = 0; i < count; i++) {
-          fss[fi]->remove(names[i]);
+          if (fss[fi]->remove(names[i])) removed++;
         }
-        total += count;
+        total += removed;
+        if (removed == 0) break;        // nothing left (or nothing that can be removed: do not spin)
+        }
       }
       // The slot list must go with them. Deleting the files left every slot
       // still listed at the top of the page, because /tinyc.cfg was untouched:
@@ -2719,6 +2817,7 @@ static void HandleTinyCPage(void) {
     "select{min-width:0}"
     ".tc-run{color:#0a0}.tc-load{color:#fa0}.tc-empty{color:var(--c_txt);opacity:.5}"
     ".tc-err{color:#f44}"
+    ".tc-up{width:auto;padding:0 6px;margin-left:6px;line-height:1.4rem;font-size:.85em;background:#fa0;color:#000}"
     ".tc-row{display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid #333}"
     ".tc-row:last-child{border-bottom:none}"
     ".tc-info{flex:1;font-size:.9em}"
@@ -2751,14 +2850,30 @@ static void HandleTinyCPage(void) {
       // Determine filename: from loaded slot or from config
       const char *fname = (s && s->filename[0]) ? s->filename : Tinyc->slot_config[si].filename;
 
-      // Compact row: [dot status] filename (size) | buttons
+      // Slot row: the plain name out of the .tcb header instead of the file name (the name already says what
+      // it is, and "name (file)" plus version and size is too long on a phone). The file name moves into
+      // the tooltip, the state word into the dot's tooltip (the colour already says it), the size is whole kB.
+      // The version (`// @version: YYYYMMDD_HHMM`, header TLV 3) follows the name as "17.10.26 14:30".
+      // data-f / data-v / data-s let the page script offer an update when the repository's index.json has a
+      // newer version of the same file (tcUp/tcUpd). Idea and name-only row: ottelo (12.10.2026).
+      char mname[52] = { 0 }, mver[28] = { 0 }, vshow[28] = { 0 };
+#ifdef USE_UFILESYS
+      if (fname && fname[0]) {
+        if (!tc_tcb_meta(ufsp, fname, mname, sizeof(mname), nullptr, 0, mver, sizeof(mver)) && ffsp && ffsp != ufsp) {
+          tc_tcb_meta(ffsp, fname, mname, sizeof(mname), nullptr, 0, mver, sizeof(mver));
+        }
+      }
+#endif
+      tc_version_display(mver, vshow, sizeof(vshow));
+      const char *fbase = (fname && fname[0] == '/') ? fname + 1 : fname;
       WSContentSend_P(PSTR(
-        "<div class='tc-row'>"
-        "<span class='%s'>&#x25cf;</span>"
-        "<span class='tc-info'><b>%d</b> %s %s (%dB)"),
-        sc, si, state,
-        fname,
-        s ? s->program_size : 0);
+        "<div class='tc-row' data-f='%s' data-v='%s' data-s='%d'>"
+        "<span class='%s' title='%s'>&#x25cf;</span>"
+        "<span class='tc-info' title='%s'><b>%d</b> %s"),
+        fbase, HtmlEscape(String(mver)).c_str(), si, sc, state, fname, si,
+        mname[0] ? HtmlEscape(String(mname)).c_str() : fname);
+      if (mver[0]) { WSContentSend_P(PSTR(" <small style='opacity:.7'>%s</small>"), HtmlEscape(String(vshow)).c_str()); }
+      WSContentSend_P(PSTR(" (%dkB)"), s ? (int)((s->program_size + 512) / 1024) : 0);
 
       if (s && s->vm.error != 0) {
         WSContentSend_P(PSTR(" <span class='tc-err'>%s</span>"), tc_error_str(s->vm.error));
@@ -2812,7 +2927,7 @@ static void HandleTinyCPage(void) {
           if (lcp) ep = lcp + 1;
           uint16_t nlen = strlen(ep);
           if (nlen > 4 && strcasecmp(ep + nlen - 4, ".tcb") == 0) {
-            char fpath[40];
+            char fpath[TC_FILENAME_MAX];
             snprintf(fpath, sizeof(fpath), "/%s", ep);
             // Plain name and info link out of the .tcb header, if the program
             // carries them (`// @name:` / `// @info:` in the .tc). Without them
@@ -2989,16 +3104,41 @@ static void HandleTinyCPage(void) {
             // build.html keeps writing), new firmware against an old repo falls
             // back here. Entries are {file,name,info}; anything missing degrades
             // to exactly the old behaviour, the bare filename.
-            // ⚠️ GLEICHES ETIKETT WIE DIE IDE (gemu2015/Sonoff-Tasmota#128, mi-hol): „Name (datei)" OHNE
-            // „.tcb", und die Liste nach DIESEM Etikett sortiert — nicht nach Dateiname, sonst steht
-            // „Etekcity ESF37 Scale" scheinbar zufaellig zwischen den e-Dateien. Die IDE-Liste
-            // „Repo Examples" bildet dasselbe Etikett aus index.json.
+            // ⚠️ GLEICHES ETIKETT WIE DIE IDE (gemu2015/Sonoff-Tasmota#128, mi-hol): nur der NAME (seit 17.10.2026,
+            // Absprache mit ottelo: der Name sagt, was es ist, der Dateiname dahinter ist ueberfluessig; die Version
+            // steht in der Slot-Zeile; ohne Namen der Dateiname ohne „.tcb"), und die Liste nach DIESEM Etikett
+            // sortiert — nicht nach Dateiname, sonst steht „Etekcity ESF37 Scale" scheinbar zufaellig zwischen den
+            // e-Dateien. Die IDE-Liste „Repo Examples" bildet dasselbe Etikett aus index.json.
             "function tcLb(e){var n=e.name||e.n||'',f=e.file||e.f||'';"
-            "if(f.slice(-4)=='.tcb')f=f.slice(0,-4);return n?n+' ('+f+')':f}"
-            "function tcOpt(s,f,n,u){var o=document.createElement('option'),"
-            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f;"
-            "o.value=f;o.textContent=n?n+' ('+b+')':b;if(u)o.dataset.u=u;s.appendChild(o)}"
-            "function tcrU(){var s=document.getElementById('tcrf');"
+            "if(f.slice(-4)=='.tcb')f=f.slice(0,-4);return n?n:f}"
+            // ottelo's wish (18.10.2026): the version DATE behind the name, "SML Chart <middle dot> 14.10.26" (no time: the closed
+            // select is cut off on a phone; the full version is in the slot row). No version, or not in the
+            // YYYYMMDD_HHMM form: name only. tcLb (sorting) stays the plain name.
+            "function tcVd(x){var m=(x||'').match(/^(\\d\\d)(\\d\\d)(\\d\\d)(\\d\\d)_\\d{4}$/);return m?m[4]+'.'+m[3]+'.'+m[2]:''}"
+            "function tcOpt(s,f,n,u,v){var o=document.createElement('option'),"
+            "b=f.slice(-4)=='.tcb'?f.slice(0,-4):f,d=tcVd(v);"
+            "o.value=f;o.textContent=(n?n:b)+(d?' \\u00b7 '+d:'');if(u)o.dataset.u=u;s.appendChild(o)}"
+            // A slot whose program has a NEWER version in this repository's index.json ("version":"YYYYMMDD_HHMM",
+            // same file) gets a button "🔄 17.10.26 14:30": it loads that file into the same slot, the way
+            // "Download & Load" does (tcDl). Settings stay: the .pvs is name-keyed and saved by the firmware before
+            // the upload replaces the program. "Newer" is a plain string compare; when one of the two versions is
+            // not in that form (or the slot has none) it is "different" instead. No version in the repository: no
+            // button. Rule and format agreed with ottelo, 17.10.2026.
+            "function tcV(x){var m=x.match(/^(\\d\\d)(\\d\\d)(\\d\\d)(\\d\\d)_(\\d\\d)(\\d\\d)$/);"
+            "return m?m[4]+'.'+m[3]+'.'+m[2]+' '+m[5]+':'+m[6]:x}"
+            "function tcUp(ls){document.querySelectorAll('.tc-row[data-f]').forEach(function(r){"
+            "var o=r.querySelector('.tc-up');if(o)o.remove();"
+            "var e=ls.filter(function(x){return (x.file||x.f)==r.dataset.f})[0];if(!e||!e.version)return;"
+            "var nv=e.version,ov=r.dataset.v||'',re=/^\\d{8}_\\d{4}$/;"
+            "if(nv==ov||(re.test(nv)&&re.test(ov)&&nv<ov))return;"
+            "var s=document.createElement('button');s.type='button';s.className='button tc-up';"
+            "s.title='Update';s.innerHTML='&#x1F504; '+tcV(nv);"
+            "s.onclick=function(){tcUpd(r.dataset.f,r.dataset.s,e.name||e.n||r.dataset.f)};"
+            "r.querySelector('.tc-info').appendChild(s)})}"
+            "function tcUpd(f,sl,n){var a=document.getElementById('tcrf'),b=document.getElementById('tcrs');"
+            "a.value=f;b.value=sl;if(a.value!=f||b.value!=sl)return;"
+            "if(!confirm('Update: '+n+' -> Slot '+sl+'?'))return;tcDl()}"
+"function tcrU(){var s=document.getElementById('tcrf');"
             "return s&&s.selectedIndex>=0?(s.options[s.selectedIndex].dataset.u||''):''}"
             "function tcrI(){var u=tcrU();if(u)window.open(u,'_blank','noopener')}"
             // ⚠️ DIE AUSWAHL UEBERLEBT DAS NEULADEN SONST NICHT. Chromes eigene
@@ -3046,11 +3186,17 @@ static void HandleTinyCPage(void) {
             "fetch(tcB()+'/index.json',{cache:f?'reload':'default'}).then(function(r){"
             "if(!r.ok)throw r.status;return r.json()}).then(function(j){"
             "var ls=(j&&j.programs)||j;if(!ls||!ls.length)throw 'empty';"
-            "ls=ls.slice().sort(function(a,b){return tcLb(a).localeCompare(tcLb(b),undefined,{sensitivity:'base'})});"
+            // "ordered":true in index.json keeps the repository's OWN order (ottelo, 12.10.2026: his list
+            // follows `// @order: N`); {"sep":1} is a disabled separator line. Without "ordered" the list
+            // is sorted by its label as before and the separators are dropped (they have no label).
+            "if(!j.ordered)ls=ls.filter(function(e){return !e.sep}).sort(function(a,b){"
+            "return tcLb(a).localeCompare(tcLb(b),undefined,{sensitivity:'base'})});"
             "s.innerHTML='';"
-            "ls.forEach(function(e){var u=e.info||'';"
+            "ls.forEach(function(e){if(e.sep){var q=document.createElement('option');"
+            "q.disabled=1;q.textContent=Array(21).join('\\u2500');s.appendChild(q);return}"
+            "var u=e.info||'';"
             "if(u&&u.slice(0,7)!='http://'&&u.slice(0,8)!='https://')u='';"
-            "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u)});tcrL()})"
+            "tcOpt(s,e.file||e.f||'',e.name||e.n||'',u,e.version)});tcrL();tcUp(ls)})"
             ".catch(function(){return tcTxt(s,f).then(tcrL)}).catch(function(e){"
             "s.innerHTML='<option>(list failed)</option>';tcrS();"
             "document.getElementById('tcrmsg').textContent='Repo list fetch failed: '+e})}"
@@ -3182,9 +3328,9 @@ static void HandleTinyCPage(void) {
     // this string already carries a %s.
     "fetch('/cm?cmnd=TinyCIde'+(window.TCBASE?' '+encodeURIComponent(window.TCBASE+'/tinyc_ide.html.gz'):''))"
     ".then(r=>r.json()).then(j=>{var d=j.TinyCIde||{};"
-    "if(d.updated){b.textContent='Updated '+d.updated+' B';alert('IDE updated ('+d.updated+' bytes). Re-open the IDE.');}"
+    "if(d.updated){b.textContent='Updated '+d.updated+' B';alert('IDE updated ('+d.updated+' bytes)'+(d.flash?' and stored in the flash file system, because writing to the SD card was cut short':'')+'. Re-open the IDE.');}"
     "else{b.disabled=0;b.textContent='Update IDE';"
-    "alert('IDE update failed: '+(d.msg||('error '+d.error))+'\\n\\nThe old IDE was kept.');}})"
+    "alert('IDE update failed: '+(d.msg||('error '+d.error))+(d.kept?'\\n\\nThe old IDE was kept.':''));}})"
     ".catch(e=>{b.disabled=0;b.textContent='Update IDE';alert('IDE update request failed.');});\" "
     "class='button'>Update IDE</button>"
     "</p>"
@@ -3256,6 +3402,9 @@ static void HandleTinyCPage(void) {
   WSContentEnd();
 }
 
+// Set by HandleTinyCUpload when the file name is longer than a slot can carry; HandleTinyCUploadDone then says why.
+static bool tc_upload_name_error = false;
+
 static void HandleTinyCUploadDone(void) {
   if (!HttpCheckPriviledgedAccess()) { return; }
 
@@ -3273,6 +3422,13 @@ static void HandleTinyCUploadDone(void) {
     // authoritative signal for this request.
     TCSendCORS("POST, OPTIONS");
     if (Web.upload_error || !s || !s->loaded) {
+      if (tc_upload_name_error) {
+        char json[160];
+        snprintf_P(json, sizeof(json), PSTR("{\"ok\":false,\"error\":\"file name too long (at most %u characters including .tcb)\"}"),
+                   (unsigned)(TC_FILENAME_MAX - 2));
+        WSSendJSON(400, json);
+        return;
+      }
       WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"upload failed\"}"));
       return;
     }
@@ -3304,6 +3460,10 @@ static void HandleTinyCUploadDone(void) {
       "<fieldset><legend><b> Upload Result </b></legend>"
       "<p style='text-align:center;color:#f44'><b>&#x2718; Upload failed</b></p>"
       "</fieldset>"));
+    if (tc_upload_name_error) {
+      WSContentSend_P(PSTR("<p style='text-align:center'>File name too long: at most %d characters including .tcb.</p>"),
+                      (int)(TC_FILENAME_MAX - 2));
+    }
   }
   WSContentSend_P(HTTP_FORM_BUTTON, PSTR("tc"), PSTR("Back to TinyC"));
 
@@ -3557,16 +3717,20 @@ void TinyCPrefixReheal(void) {
 // reported as "not enough RAM" (measured 2026-08-17).
 static int tc_ide_http = 0;
 
-static int tc_fetch_ide(const char *url) {
-  if (!ufsp || !url || !url[0]) return -1;
+// What the last attempt looked like, for the message: the numbers (bytes on disk, kB free) used to exist only in the log.
+static struct { uint32_t on_disk; int written; uint32_t free_kb; bool short_write; bool in_flash; } tc_ide_diag;
+
+// Writes to `fs` (type 0 = the user file system, normally the SD card when there is one; type 1 = the flash file system).
+static int tc_fetch_ide_fs(FS *fs, uint32_t fstype, const char *url) {
+  if (!fs || !url || !url[0]) return -1;
   const char *dst = "/tinyc_ide.html.gz";
   const char *tmp = "/tinyc_ide.html.gz.tmp";
   // A crash during an in-place write leaves a 0-byte IDE behind, and the /ide
   // handler would serve that as if it were a page (Hans, 2026-08-17: reset
   // mid-write, file left at 0 bytes). Too small to be an IDE = not an IDE.
-  { File old = ufsp->open(dst, "r");
+  { File old = fs->open(dst, "r");
     if (old) { const uint32_t sz = (uint32_t)old.size(); old.close();
-      if (sz < 1000) ufsp->remove(dst); } }
+      if (sz < 1000) fs->remove(dst); } }
 #if defined(ESP32) && defined(USE_WEBCLIENT_HTTPS)
   HTTPClientLight http;
 #else
@@ -3680,7 +3844,7 @@ static int tc_fetch_ide(const char *url) {
   bool in_place = false;
   {
     const int32_t clen = http.getSize();          // -1 when the peer chunks
-    const uint32_t free_kb = UfsInfo(1, 0);       // kB
+    const uint32_t free_kb = UfsInfo(1, fstype);       // kB
     uint32_t need_kb = (clen > 0) ? (uint32_t)((clen + 1023) / 1024) : 0;
     const char *woher = "Content-Length";
     // NO Content-Length? Then estimate from the IDE ALREADY ON THE DISK: a new
@@ -3692,7 +3856,7 @@ static int tc_fetch_ide(const char *url) {
     // worked. raw.githubusercontent.com serves the .gz chunked, so clen was -1
     // and the one guard meant to prevent exactly this never ran.
     if (!need_kb) {
-      File alt = ufsp->open(dst, "r");
+      File alt = fs->open(dst, "r");
       if (alt) {
         const uint32_t sz = (uint32_t)alt.size();
         alt.close();
@@ -3702,14 +3866,14 @@ static int tc_fetch_ide(const char *url) {
     if (need_kb && free_kb < need_kb + 8) {
       target = dst;
       in_place = true;
-      ufsp->remove(dst);
+      fs->remove(dst);
       AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE replaced in place — %u kB free, %u kB needed (from %s); "
              "no room for a second copy, the served IDE is missing until this finishes"),
              (unsigned)free_kb, (unsigned)need_kb, woher);
     }
   }
   TinyCFsWritePause(0x40000);                       // big write: quiesce VM tasks
-  File f = ufsp->open(target, "w");
+  File f = fs->open(target, "w");
   int written = 0; bool magic = false; bool write_err = false;
   if (f) {
     WiFiClient *stream = http.getStreamPtr();
@@ -3759,7 +3923,7 @@ static int tc_fetch_ide(const char *url) {
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE fetch rejected (%d B, gzip=%d) — %s"),
            written, magic,
            in_place ? "no IDE on the filesystem now, retry or upload it" : "kept old");
-    ufsp->remove(target);
+    fs->remove(target);
     return -5;
   }
   // `written` counts what was DOWNLOADED, not what the FS actually persisted — an
@@ -3768,16 +3932,18 @@ static int tc_fetch_ide(const char *url) {
   // over the live IDE; a truncated-but-gzip-magic file would otherwise pass the
   // check above and brick the served IDE (Andreas, S3-ETH SD/FAT, cut at 12-37 KB).
   uint32_t on_disk = 0;
-  { File vf = ufsp->open(target, "r"); if (vf) { on_disk = (uint32_t)vf.size(); vf.close(); } }
+  { File vf = fs->open(target, "r"); if (vf) { on_disk = (uint32_t)vf.size(); vf.close(); } }
   if (write_err || on_disk != (uint32_t)written) {
+    tc_ide_diag.on_disk = on_disk; tc_ide_diag.written = written; tc_ide_diag.short_write = write_err;
+    tc_ide_diag.free_kb = (uint32_t)UfsInfo(1, fstype);
     // Name the filesystem, not just "short-write" -- that reads like a network
     // problem while it usually is a full partition.
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE write incomplete (%u/%d B on disk%s), %u kB free — %s"),
-           on_disk, written, write_err ? ", short-write" : "", (unsigned)UfsInfo(1, 0),
+           on_disk, written, write_err ? ", short-write" : "", (unsigned)UfsInfo(1, fstype),
            in_place ? "no IDE on the filesystem now, retry or upload it"
                     : "kept old. If the partition is full: delete /tinyc_ide.html.gz "
                       "(UfsDelete or the file manager) and run TinyCIde again");
-    ufsp->remove(target);
+    fs->remove(target);
     return -7;
   }
   if (in_place) {                                  // already at its place
@@ -3788,16 +3954,29 @@ static int tc_fetch_ide(const char *url) {
   // overwrites atomically, so there is no window where the served IDE is
   // missing. Only if that fails (e.g. a FAT/SD backend that can't rename over
   // an existing file) fall back to remove + retry.
-  if (!ufsp->rename(tmp, dst)) {
-    ufsp->remove(dst);
-    if (!ufsp->rename(tmp, dst)) {
+  if (!fs->rename(tmp, dst)) {
+    fs->remove(dst);
+    if (!fs->rename(tmp, dst)) {
       AddLog(LOG_LEVEL_ERROR, PSTR("TCC: IDE rename failed"));
-      ufsp->remove(tmp);
+      fs->remove(tmp);
       return -6;
     }
   }
   AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE updated %d bytes from %s"), written, url);
   return written;
+}
+// The IDE goes to the user file system (the SD card when there is one). When writing THERE is cut short — an SD/FAT backend
+// does that on a fresh ESP32-S3-ETH, although the card is almost empty (Andreas, 19.10.2026) — it is written to the flash file
+// system instead: the /ide handler looks there as well. A failed attempt removes its own partial file first.
+static int tc_fetch_ide(const char *url) {
+  tc_ide_diag = {};
+  int n = tc_fetch_ide_fs(ufsp, 0, url);
+  if (n == -7 && ffsp && ffsp != ufsp) {
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: IDE write to the SD card was cut short — trying the flash file system"));
+    n = tc_fetch_ide_fs(ffsp, 1, url);
+    if (n > 0) { tc_ide_diag.in_flash = true; }
+  }
+  return n;
 }
 #endif // USE_UFILESYS
 
@@ -3817,8 +3996,20 @@ static const char *tc_ide_fehler(int code) {
              "idle slots were freed automatically; TinyCUnload a running slot, or reboot";
     case -5: return "download rejected - too short, or not a .gz";
     case -6: return "cannot replace the old IDE (rename failed)";
-    case -7: return "write incomplete - the partition is probably full. "
-                    "Delete /tinyc_ide.html.gz and run TinyCIde again";
+    case -7: {
+      // The numbers decide what to say: "full" only when it really is (it was said every time before, although the SD card of
+      // a fresh device had 15 GB free: Andreas, 19.10.2026).
+      static char m[200];
+      if (tc_ide_diag.free_kb < (uint32_t)(tc_ide_diag.written / 1024) + 8) {
+        snprintf_P(m, sizeof(m), PSTR("the partition is full (%u kB free). Delete /tinyc_ide.html.gz and run TinyCIde again"),
+                   (unsigned)tc_ide_diag.free_kb);
+      } else {
+        snprintf_P(m, sizeof(m), PSTR("writing was cut short (%u of %d bytes on disk, %u kB free) - try again, "
+                   "or upload tinyc_ide.html.gz to port 83"), (unsigned)tc_ide_diag.on_disk, tc_ide_diag.written,
+                   (unsigned)tc_ide_diag.free_kb);
+      }
+      return m;
+    }
     default: return "unknown error";
   }
 }
@@ -3836,9 +4027,18 @@ void CmndTinyCIde(void) {
     strlcpy(url, TINYC_DEFAULT_IDE_URL, sizeof(url));
   }
   int n = tc_fetch_ide(url);
-  if (n > 0) { Response_P(PSTR("{\"TinyCIde\":{\"updated\":%d}}"), n); }
-  else       { Response_P(PSTR("{\"TinyCIde\":{\"error\":%d,\"msg\":\"%s\"}}"),
-                          n, tc_ide_fehler(n)); }
+  if (n > 0) { Response_P(PSTR("{\"TinyCIde\":{\"updated\":%d,\"flash\":%d}}"), n, tc_ide_diag.in_flash ? 1 : 0); }
+  else {
+    // "kept" = there is an IDE left that the failed update did not touch (the page used to claim that every time)
+    bool kept = false;
+    FS *fl[2] = { ufsp, (ffsp && ffsp != ufsp) ? ffsp : nullptr };
+    for (int i = 0; i < 2; i++) {
+      if (!fl[i]) continue;
+      File k = fl[i]->open("/tinyc_ide.html.gz", "r");
+      if (k) { if (k.size() >= 1000) { kept = true; } k.close(); }
+    }
+    Response_P(PSTR("{\"TinyCIde\":{\"error\":%d,\"kept\":%d,\"msg\":\"%s\"}}"), n, kept ? 1 : 0, tc_ide_fehler(n));
+  }
 #else
   ResponseCmndChar_P(PSTR("no filesystem"));
 #endif
@@ -3876,6 +4076,18 @@ static void HandleTinyCUpload(void) {
     uint8_t slot_num = Tinyc->upload_slot;
 
     AddLog(LOG_LEVEL_INFO, PSTR("TCC: Upload start: %s (slot %d)"), upload.filename.c_str(), slot_num);
+
+    // A name that does not fit is REFUSED, before anything is touched (the slot keeps its program): cutting it
+    // dropped the extension, two long names with the same start landed in the same file, and the persist file
+    // could collide with the program. The client gets a clear 400 with the limit.
+    tc_upload_name_error = false;
+    if (strlen(upload.filename.c_str()) + 1 >= sizeof(Tinyc->upload_filename)) {
+      Web.upload_error = 1;
+      tc_upload_name_error = true;
+      AddLog(LOG_LEVEL_ERROR, PSTR("TCC: Upload refused: file name %s is too long (%u characters, at most %u including the .tcb)"),
+             upload.filename.c_str(), (unsigned)strlen(upload.filename.c_str()), (unsigned)(sizeof(Tinyc->upload_filename) - 2));
+      return;
+    }
 
     // ⚠️ Web.upload_error is a GLOBAL and nobody clears it for us. One failed
     // upload (a malloc that could not be served, an oversize file) therefore
@@ -4438,13 +4650,7 @@ static void HandleTinyCApi(void) {
       uint32_t seek_pos = 0;
       {
         char indpath[128];
-        strlcpy(indpath, pathbuf, sizeof(indpath));
-        char *dot = strrchr(indpath, '.');
-        if (dot) {
-          strcpy(dot, ".ind");
-        } else {
-          strcat(indpath, ".ind");
-        }
+        tc_ind_path(pathbuf, indpath, sizeof(indpath));
         File ind = ufsp->open(indpath, "r");
         if (ind) {
           // Skip index header line
@@ -6768,10 +6974,7 @@ static void tc_download_task(void *param) {
       uint32_t seek_pos = 0;
       {
         char indpath[128];
-        strlcpy(indpath, path, sizeof(indpath));
-        char *dot = strrchr(indpath, '.');
-        if (dot) strcpy(dot, ".ind");
-        else strcat(indpath, ".ind");
+        tc_ind_path(path, indpath, sizeof(indpath));
 
         File ind = fsp->open(indpath, "r");   // same FS as the data file
         if (ind) {
@@ -7866,11 +8069,22 @@ static void tc_worker_vm_body(void *param) {
     }
     vm->halted = true; vm->running = false;
     tc_output_flush();
+    // Unlink from the primary's heap while still holding vm_mutex: the primary writes into this VM
+    // when its heap grows (tc_heap_alloc), which must not race the free below (ottelo, 12.10.2026).
+    tc_worker_heap_unlink(vm);
     tc_current_slot = nullptr;
     if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
   } while (0);
 
-  // Tear down the worker VM (private stack/frames/heap only; aliased arrays untouched).
+  // The early exits above (main never halted, function gone, no stack) leave without the mutex and
+  // still linked.
+  if (vm->heap_shared) {
+    if (slot->vm_mutex) tc_vm_lock(slot->vm_mutex);
+    tc_worker_heap_unlink(vm);
+    if (slot->vm_mutex) xSemaphoreGive(slot->vm_mutex);
+  }
+
+  // Tear down the worker VM (private stack/frames only; aliased globals/heap untouched).
   slot->has_worker_vm = false;
   tc_free_worker_vm(vm);
   entry->worker_vm = nullptr;

@@ -322,6 +322,15 @@ extern uint16_t tc_vm_stack_bytes;
 // subsides. Once per window we realloc the heap DOWN to the window's PEAK
 // heap_used + headroom: never below what the window actually used (so it can't
 // thrash against active polling), but it returns the peak once the load stops.
+// Longest file name a slot can carry, '/' and ".tcb" included, plus the terminating NUL. The name lives in four buffers
+// (slot, tinyc.cfg entry, upload, persist file) and every one must be this big: with 32 bytes a name of 27+ characters was
+// cut to 31, lost its extension, and the persist file ended up with the SAME path as the program -- the first save wrote
+// over the program ("Load failed: Invalid binary"; Andreas, 15.10.2026). ESP8266 keeps 32 to save RAM.
+#ifdef ESP32
+  #define TC_FILENAME_MAX 64
+#else
+  #define TC_FILENAME_MAX 32
+#endif
 #define TC_HEAP_MAINT_WINDOW    30    // seconds per measure/shrink window
 #define TC_HEAP_SHRINK_HEADROOM 64    // slots kept above the window peak
 #define TC_HEAP_SHRINK_GAP      256   // only shrink when >= this many slots (1 KB) would be freed
@@ -1757,6 +1766,13 @@ typedef struct {
   int16_t       cb_arg_handle2;  // 2nd reserved handle for 2-arg callbacks, e.g. OnMqttData
   uint16_t      heap_used_peak;  // high-water heap_used in the current window (idle-shrink)
   uint16_t      heap_maint_ticks;// seconds since the last idle-shrink window boundary
+  // spawnTask worker on its own VM (USE_TINYC_WORKER_VM): it works on the primary's heap, because
+  // every array > 16 elements -- locals included -- is compiled into the slot's heap at load time.
+  // heap_shared (worker): never allocate or free it. heap_peer (TcVM*): the other VM; the primary
+  // refreshes the worker's view when its heap grows (realloc may move it).
+  // Found and fixed by ottelo, 12.10.2026 (char cfg[240] in a spawnTask FTP upload).
+  bool          heap_shared;
+  void         *heap_peer;
   // Callback function table (V3)
   TcCallback    callbacks[TC_MAX_CALLBACKS];
   uint8_t       callback_count;
@@ -1769,7 +1785,7 @@ typedef struct {
   // 2 B/entry, not a per-slot name-copy.
   struct { uint16_t index; uint16_t count; uint16_t name_off; } persist[TC_MAX_PERSIST];
   uint8_t       persist_count;
-  char          persist_file[32];  // e.g. "/ecotracker.pvs" — derived from .tcb filename
+  char          persist_file[TC_FILENAME_MAX];  // e.g. "/ecotracker.pvs" — derived from .tcb filename
   // UDP globals table (V5: auto-update from UDP packets)
   // Dynamically allocated in tc_vm_load only when bytecode declares UDP globals
   struct TcUdpGlobalEntry {
@@ -1870,7 +1886,7 @@ struct TcSlot {
                                   //   (every script reload needs hardware
                                   //   re-init via BootInit). Set in
                                   //   tc_vm_load; cleared after dispatch.
-  char     filename[32];          // e.g. "/bresser.tcb"
+  char     filename[TC_FILENAME_MAX];  // e.g. "/bresser.tcb"
   char     cmd_prefix[17];       // registered command prefix, e.g. "MP3" — LIVE
                                   //   matcher field; cleared by TinyCStopVM teardown.
   char     cmd_prefix_saved[17];  // STICKY copy of the registered prefix. Set alongside
@@ -1943,7 +1959,7 @@ struct TINYC {
   TcSlot  *slots[TC_MAX_VMS];     // per-program VM slots (NULL = unused, malloc'd on demand)
   // Lightweight slot config — persists filename + autoexec without loading into RAM
   struct {
-    char filename[32];            // .tcb filename (empty = no file assigned)
+    char filename[TC_FILENAME_MAX];  // .tcb filename (empty = no file assigned)
     bool autoexec;                // auto-run on boot
     char cmd_prefix[17];          // DURABLE copy of the slot's registered command prefix
                                   //   (e.g. "BAT"). Learned from cmd_prefix_saved the first time
@@ -1963,7 +1979,7 @@ struct TINYC {
   uint32_t upload_alloc_size;       // size of upload_buf allocation (may be < TC_MAX_PROGRAM if client sent ?fsz=N)
   uint32_t upload_received;
   uint8_t  upload_slot;           // target slot for current upload
-  char     upload_filename[32];   // filename during upload (copied to slot on completion)
+  char     upload_filename[TC_FILENAME_MAX];   // filename during upload (copied to slot on completion)
   // File I/O state (File objects are stored separately as statics — see below)
   bool     file_used[TC_MAX_FILE_HANDLES];
   // UDP multicast (Scripter-compatible, 239.255.255.250:1999)
@@ -4501,7 +4517,11 @@ static String tc_command_response(const char *cmd) {
 }
 
 static void tc_defer_command(const char *cmd) {
-  if (!Tinyc || Tinyc->deferred_pending) return;  // drop if one is already pending
+  if (!Tinyc) return;
+  if (Tinyc->deferred_pending) {   // ONE waiting place for all slots: drop, but say so (it used to be silent; Andreas, 20.10.2026)
+    AddLog(LOG_LEVEL_INFO, PSTR("TCC: deferred command dropped (one is still waiting): %.40s"), cmd);
+    return;
+  }
   strlcpy(Tinyc->deferred_cmd, cmd, sizeof(Tinyc->deferred_cmd));
   Tinyc->deferred_since = millis();
   Tinyc->deferred_pending = true;
@@ -4712,7 +4732,7 @@ static void tc_heap_coalesce(TcVM *vm) {
 }
 
 // Allocate a heap block, returns handle index or -1 on failure
-static int tc_heap_alloc(TcVM *vm, uint16_t size) {
+static int tc_heap_alloc_raw(TcVM *vm, uint16_t size) {
   // Lazy-allocate heap buffer
   if (!vm->heap_data) {
     uint16_t init_cap = size > 256 ? size : 256;  // start small
@@ -4819,8 +4839,35 @@ static void tc_heap_free_handle(TcVM *vm, int handle) {
   }
 }
 
+// A worker sharing the primary's heap never allocates in it. When the primary allocates, its heap may
+// have grown and moved: the worker follows. Both run bytecode only under vm_mutex, and blocking syscalls
+// copy their arguments out before they release it, so the worker never holds a stale pointer.
+static int tc_heap_alloc(TcVM *vm, uint16_t size) {
+  if (vm->heap_shared) return -1;
+  int h = tc_heap_alloc_raw(vm, size);
+  TcVM *w = (TcVM *)vm->heap_peer;
+  if (w) {
+    w->heap_data = vm->heap_data;
+    w->heap_capacity = vm->heap_capacity;
+    w->heap_handles = vm->heap_handles;
+    w->heap_used = vm->heap_used;
+    w->heap_handle_count = vm->heap_handle_count;
+  }
+  return h;
+}
+
 // Free entire heap buffer (call on VM stop/reset/reload)
 static void tc_heap_free_all(TcVM *vm) {
+  if (vm->heap_shared) return;   // a worker never frees the primary's heap (the unlink drops its view first)
+  {
+    // A worker still linked (it outlived the 2 s wait on a slot stop) loses its view: its next array
+    // access is a BOUNDS error instead of a read of freed memory.
+    TcVM *w = (TcVM *)vm->heap_peer;
+    if (w) {
+      w->heap_data = nullptr; w->heap_handles = nullptr;
+      w->heap_used = 0; w->heap_capacity = 0; w->heap_handle_count = 0;
+    }
+  }
   if (vm->heap_data) {
     free(vm->heap_data);
     vm->heap_data = nullptr;
@@ -4848,9 +4895,10 @@ static void tc_heap_free_all(TcVM *vm) {
  * on the primary VM (during the worker's vm_mutex-release window) can no longer stack a
  * frame onto the worker's parked frame — which was the PC=0 corruption. vm_mutex still
  * serialises bytecode execution between the two; globals_mux guards the raw globals[]
- * writes against the async UDP-RX apply. Cross-context data must travel through scalar
- * globals / the share-store — NOT heap objects (each VM has its own heap; a heap handle
- * is meaningless in the other VM).
+ * writes against the async UDP-RX apply. The worker also works on the primary's HEAP:
+ * the compiler puts every array > 16 elements -- locals included -- into the slot's heap
+ * at load time, so a private heap made each such array a BOUNDS error in the worker
+ * (ottelo, 12.10.2026: char cfg[240] in a spawnTask FTP backup). See heap_shared.
 \*********************************************************************************************/
 
 // Allocate + initialise a worker VM for slot `s`. Returns nullptr on OOM (caller then
@@ -4875,6 +4923,12 @@ static TcVM *tc_alloc_worker_vm(TcSlot *s, int cb_idx) {
   memcpy(w->cb_index, p->cb_index, sizeof(w->cb_index));
   memcpy(w->watch_indices, p->watch_indices, sizeof(w->watch_indices));
   w->watch_count = p->watch_count;
+  w->heap_data = p->heap_data; w->heap_capacity = p->heap_capacity;   // SHARED HEAP
+  w->heap_handles = p->heap_handles; w->heap_used = p->heap_used;
+  w->heap_handle_count = p->heap_handle_count;
+  w->heap_shared = true;
+  w->heap_peer = p;
+  p->heap_peer = w;
   // --- PRIVATE execution state (calloc already zeroed frames[]/timers/flags) ---
   w->pc = 0; w->sp = 0; w->fp = 0; w->frame_count = 0;
   w->halted = true; w->running = false; w->error = TC_OK; w->delayed = false;
@@ -4891,8 +4945,18 @@ static TcVM *tc_alloc_worker_vm(TcSlot *s, int cb_idx) {
 // Free ONLY the worker's private state. Aliased globals/constants/code belong to the
 // primary VM and are left untouched. globals_mux is shared and intentionally kept for the
 // primary VM's lifetime (TODO: free on slot destroy).
+static void tc_worker_heap_unlink(TcVM *w) {
+  if (!w || !w->heap_shared) return;
+  TcVM *p = (TcVM *)w->heap_peer;
+  if (p && p->heap_peer == w) p->heap_peer = nullptr;
+  w->heap_data = nullptr; w->heap_handles = nullptr;   // the primary's - never freed here
+  w->heap_used = 0; w->heap_capacity = 0; w->heap_handle_count = 0;
+  w->heap_peer = nullptr; w->heap_shared = false;
+}
+
 static void tc_free_worker_vm(TcVM *w) {
   if (!w) return;
+  tc_worker_heap_unlink(w);   // before tc_heap_free_all below
   tc_close_vm_files(w);    // close any files THIS worker left open (owner-keyed, no leak)
   tc_free_all_frames(w);   // frame locals (private)
   // ⚠️ MUST follow free_all_frames, which parks the buffers in the cache rather
@@ -22114,22 +22178,30 @@ static void tc_all_callbacks_id(TcCallbackId cid) {
 
 // Helper: derive .pvs persist filename from .tcb filename
 // e.g. "/ecotracker.tcb" -> "/ecotracker.pvs", "/autoexec.tcb" -> "/autoexec.pvs"
+static void tc_pvs_name(const char *tcb_path, char *pf, size_t pfsz);
 static void TinyCSetPersistFile(TcSlot *s, const char *tcb_path) {
   if (!s) return;
-  char *pf = s->vm.persist_file;
-  const size_t pfsz = sizeof(s->vm.persist_file);
+  tc_pvs_name(tcb_path, s->vm.persist_file, sizeof(s->vm.persist_file));
+}
+
+// The persist file name of a program: the .tcb path with ".pvs" instead of the extension (also used to find the OLD program's
+// persist file when a new version of a script is loaded, see TinyCAdoptPersist).
+static void tc_pvs_name(const char *tcb_path, char *pf, size_t pfsz) {
   if (!tcb_path || tcb_path[0] == '\0') {
     strlcpy(pf, "/autoexec.pvs", pfsz);
     return;
   }
   strlcpy(pf, tcb_path, pfsz);
-  // Replace extension: find last '.' and replace with .pvs
-  char *dot = strrchr(pf, '.');
-  if (dot && (dot - pf) < (int)(pfsz - 4)) {
-    strcpy(dot, ".pvs");
-  } else {
-    strlcat(pf, ".pvs", pfsz);
-  }
+  // Replace the extension: the stem is everything before the last '.' AFTER the last '/', and it is cut so that
+  // ".pvs" always fits. The result therefore always ends in ".pvs" and can never be the program's own path -- before
+  // 1.6.74 a name that filled the buffer got no ".pvs" at all, the persist file WAS the program file, and the first
+  // saveVars() overwrote the program.
+  char *slash = strrchr(pf, '/');
+  char *dot = strrchr(slash ? slash : pf, '.');
+  size_t stem = dot ? (size_t)(dot - pf) : strlen(pf);
+  if (stem > pfsz - 5) stem = pfsz - 5;
+  pf[stem] = '\0';
+  strlcat(pf, ".pvs", pfsz);
 }
 
 // Helper: stop the VM in a specific slot
