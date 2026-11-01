@@ -355,7 +355,7 @@ extern uint16_t tc_vm_stack_bytes;
 #include "xdrv_124_tinyc_spp.h"
 #include "xdrv_124_tinyc_usb.h"
 
-#define TC_SYSCALL_ABI     32    // V32: FTP client (556-566). Every ABI step is listed in tasmota/tinyc/CHANGELOG.md
+#define TC_SYSCALL_ABI     33    // V33: sensorGetNaN/isNan (567-568). V32: FTP client (556-566). Every ABI step is listed in tasmota/tinyc/CHANGELOG.md
 extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y, -1/-2=raw (SYS_TOUCH_GET); declared even on no-touch builds (call is guarded)
 // When bumping TC_RELEASE or TC_SYSCALL_ABI, add the entry to tasmota/tinyc/CHANGELOG.md
 // (and to its ABI table) -- the release text is taken from there. Keep these comments short.
@@ -1445,6 +1445,8 @@ enum TcSyscall {
   SYS_FTP_DELETE       = 564, // (remote_ref)                  -> int 0 ok
   SYS_FTP_MKDIR        = 565, // (dir_ref)                     -> int 0 ok
   SYS_FTP_RENAME       = 566, // (from_ref, to_ref)            -> int 0 ok
+  SYS_SENSOR_GET_NAN   = 567, // (const_idx_path)              -> float, NaN when the path is absent (sensorGet gives 0)
+  SYS_IS_NAN           = 568, // (float)                       -> int 1 if NaN
   SYS_WEB_REPO_PULLDOWN = 280, // (gref, label_c, json_url_c, index_key_c, dest_path_c) -> void — Scripter smlpd()-style remote JSON directory picker
   SYS_SML_APPLY_PINS    = 281, // (path_c, rx, tx, smlf) -> int — idempotent SML descriptor pin substitution (%0?rxpin%/%0?txpin%/%0?smlf%, leading 0 optional). Inserts "; <template>" comment line above each active line on first call; rebuilds active line from template on subsequent calls. Values are substituted verbatim (e.g. tx=-1 becomes the literal "-1" which SML accepts as "no tx pin"); the original placeholder text is preserved only in the template comment. Returns # subs done, 0 = no change, -1 = err.
   SYS_SML_SCRIPTER_LOAD = 282, // (path_c) -> int — extract >F/>S sections from descriptor, compile to bytecode, run on EverySecond/Every100ms ticks. Subset: lnv0..lnv9, +=/-=/*=//=/=, +-*/% < <= > >= == !=, switch/case/ends, if/endif, sml(m,0,baud), sml(m,1,"HEX"). Returns # sections compiled (0..2), -1 = err.
@@ -1807,6 +1809,10 @@ typedef struct {
   // A string was cut during the running syscall; tc_syscall() turns it into
   // TC_ERR_STRING_CUT when TinyCStrict is on.
   bool          str_cut;
+  // Outgoing TCP client slot chosen with tcpSelect() -- PER VM. It used to be one pointer in `Tinyc`, shared
+  // by every slot: slot A's tcpSelect(0) + wait for the reply, slot B's tcpSelect(2) in between, and A read
+  // from (or wrote to) B's connection. Worker VMs (spawnTask) select on their own too.
+  uint8_t       tcp_sel;
 } TcVM;
 
 /*********************************************************************************************\
@@ -2053,7 +2059,6 @@ struct TINYC {
   // TC_TCP_CLI_SLOTS parallel slots so a script can talk to multiple endpoints
   // (e.g. BYD BMU + SMA HM2.0 + Wallbox) in parallel. Slot 0 is the default.
   WiFiClient tcp_cli_clients[TC_TCP_CLI_SLOTS];  // outgoing TCP client slots
-  uint8_t    tcp_cli_slot;                       // currently selected slot (0..TC_TCP_CLI_SLOTS-1)
   uint16_t   tcp_connect_timeout_ms;             // 0 = WiFiClient default (~unbounded); else bound the
                                                  // tcpConnect()/tcpProbe() connect (set via tcpConnectTimeout).
                                                  // Lets a script probe absent hosts fast instead of blocking
@@ -4326,7 +4331,9 @@ static void tc_udp_stop(void) {
       Tinyc->tcp_cli_clients[_s].stop();
     }
   }
-  Tinyc->tcp_cli_slot = 0;
+  for (uint8_t _v = 0; _v < TC_MAX_VMS; _v++) {   // every slot's selection back to client 0
+    if (Tinyc->slots[_v]) Tinyc->slots[_v]->vm.tcp_sel = 0;
+  }
   // ⚠️⚠️ THE TCP SERVER USED TO BE TORN DOWN HERE, AND IT COST A WORKING
   // BRIDGE. Two things were wrong with that: a TCP listener has nothing to do
   // with stopping UDP, and -- unlike the UDP part three lines up -- it was
@@ -11983,8 +11990,13 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     }
 
     // ── Sensor JSON parsing ─────────────────────────────
-    case SYS_SENSOR_GET: {
-      // sensorGet("SensorName#Key#SubKey") -> float value
+    case SYS_SENSOR_GET:
+    case SYS_SENSOR_GET_NAN: {
+      // sensorGet("SensorName#Key#SubKey") -> float value. sensorGetNaN() is the same
+      // lookup but answers NaN when the path is not in the JSON -- which is also what
+      // happens when the owning slot was busy and its JsonCall block was left out of the
+      // fan-out (sensorGet cannot wait). sensorGet itself keeps answering 0.
+      bool found = false;
       int32_t ci = TC_POP(vm);  // constant pool index with JSON path
       float fval = 0.0f;
       if (ci >= 0 && ci < vm->const_count && vm->constants[ci].type == 1) {
@@ -12015,14 +12027,22 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           } else {
             // leaf value — extract float
             fval = tok.getFloat();
+            found = true;
           }
           seg = next;
         }
       }
+      if (id == SYS_SENSOR_GET_NAN && !found) { fval = NAN; }
       // Push float as int32 bit pattern
       uint32_t fi;
       memcpy(&fi, &fval, 4);
       TC_PUSH(vm, (int32_t)fi);
+      break;
+    }
+    case SYS_IS_NAN: {                   // isNan(x) -> 1 if x is NaN
+      int32_t bits = TC_POP(vm);
+      float f; memcpy(&f, &bits, 4);
+      TC_PUSH(vm, (f != f) ? 1 : 0);
       break;
     }
 
@@ -16672,13 +16692,13 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     }
 
     // ── TCP: server-accepted or outgoing client (selected via tcpSelect) ──
-    // Outgoing client is selected via tcp_cli_slot (0..TC_TCP_CLI_SLOTS-1).
+    // Outgoing client is selected via vm->tcp_sel (0..TC_TCP_CLI_SLOTS-1), per VM (tcpSelect).
     // Slot 0 additionally falls back to server-accepted client for backward
     // compat with the Scripter ws* server-only API.
-    #define TC_TCP_OUT_CLIENT() (&Tinyc->tcp_cli_clients[Tinyc->tcp_cli_slot])
+    #define TC_TCP_OUT_CLIENT() (&Tinyc->tcp_cli_clients[vm->tcp_sel])
     #define TC_TCP_ACTIVE_CLIENT() \
       (TC_TCP_OUT_CLIENT()->connected() ? TC_TCP_OUT_CLIENT() : \
-       (Tinyc->tcp_cli_slot == 0 && Tinyc->tcp_server && Tinyc->tcp_client.connected()) ? &Tinyc->tcp_client : nullptr)
+       (vm->tcp_sel == 0 && Tinyc->tcp_server && Tinyc->tcp_client.connected()) ? &Tinyc->tcp_client : nullptr)
 
     // ── TCP server (Scripter-compatible ws* functions) ──
     case SYS_TCP_OPEN: {  // wso(port)
@@ -16876,12 +16896,12 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           }
           if (_cok) {
             _oc->setNoDelay(true);
-            Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 1;  // CONNECTED
-            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), Tinyc->tcp_cli_slot, ip, port);
+            Tinyc->tcp_cli_reason[vm->tcp_sel] = 1;  // CONNECTED
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), vm->tcp_sel, ip, port);
             TC_PUSH(vm, 0);
           } else {
-            Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 4;  // NETWORK
-            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connect failed %s:%d"), Tinyc->tcp_cli_slot, ip, port);
+            Tinyc->tcp_cli_reason[vm->tcp_sel] = 4;  // NETWORK
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connect failed %s:%d"), vm->tcp_sel, ip, port);
             TC_PUSH(vm, -1);
           }
         }
@@ -16920,12 +16940,12 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           }
           if (_cok) {
             _oc->setNoDelay(true);
-            Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 1;  // CONNECTED
-            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), Tinyc->tcp_cli_slot, ip_tmp, port);
+            Tinyc->tcp_cli_reason[vm->tcp_sel] = 1;  // CONNECTED
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connected to %s:%d"), vm->tcp_sel, ip_tmp, port);
             TC_PUSH(vm, 0);
           } else {
-            Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 4;  // NETWORK
-            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connect failed %s:%d"), Tinyc->tcp_cli_slot, ip_tmp, port);
+            Tinyc->tcp_cli_reason[vm->tcp_sel] = 4;  // NETWORK
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] connect failed %s:%d"), vm->tcp_sel, ip_tmp, port);
             TC_PUSH(vm, -1);
           }
         }
@@ -16939,9 +16959,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
         { int _lf = _oc->fd(); if (_lf >= 0) { struct linger _lg; _lg.l_onoff = 1; _lg.l_linger = 0; setsockopt(_lf, SOL_SOCKET, SO_LINGER, &_lg, sizeof(_lg)); } }  // abort-close: RST, free the PCB now (see SYS_TCP_CONNECT)
 #endif
         _oc->stop();
-        AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] disconnected"), Tinyc->tcp_cli_slot);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: TCP client[%d] disconnected"), vm->tcp_sel);
       }
-      Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 5;  // USER_CLOSED
+      Tinyc->tcp_cli_reason[vm->tcp_sel] = 5;  // USER_CLOSED
       break;
     }
     case SYS_TCP_CONNECT_TIMEOUT: {  // tcpConnectTimeout(ms) -> void
@@ -16959,9 +16979,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       // PEER_CLOSED (2). User-initiated disconnects already set reason=5
       // before we get here.
       bool conn = TC_TCP_OUT_CLIENT()->connected();
-      uint8_t r = Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot];
+      uint8_t r = Tinyc->tcp_cli_reason[vm->tcp_sel];
       if (!conn && r == 1) {
-        Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 2;  // PEER_CLOSED
+        Tinyc->tcp_cli_reason[vm->tcp_sel] = 2;  // PEER_CLOSED
       }
       // ⚠️ WHAT COMES BACK IS THE ACTIVE CLIENT, not just the outgoing one.
       // Reading, writing and tcpAvailable() have long fallen back on slot 0
@@ -16982,7 +17002,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t slot = TC_POP(vm);
       if (slot < 0) slot = 0;
       if (slot >= TC_TCP_CLI_SLOTS) slot = TC_TCP_CLI_SLOTS - 1;
-      Tinyc->tcp_cli_slot = (uint8_t)slot;
+      vm->tcp_sel = (uint8_t)slot;
       break;
     }
     case SYS_TCP_KEEPALIVE: {  // tcpKeepalive(idle_sec, intvl_sec, count) -> int 1=ok 0=err
@@ -17034,9 +17054,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       // (mirrors SYS_TCP_CONNECTED). Lets a script poll this without first
       // having to call tcpConnected().
       bool conn = TC_TCP_OUT_CLIENT()->connected();
-      uint8_t r = Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot];
+      uint8_t r = Tinyc->tcp_cli_reason[vm->tcp_sel];
       if (!conn && r == 1) {
-        Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 2;  // PEER_CLOSED
+        Tinyc->tcp_cli_reason[vm->tcp_sel] = 2;  // PEER_CLOSED
         r = 2;
       }
       TC_PUSH(vm, (int32_t)r);
@@ -17104,8 +17124,8 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           // Short write means the socket buffer's full or the peer's
           // already gone — treat as disconnect so the script reconnects
           // rather than retrying with a partially-sent request.
-          if (Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] == 1) {
-            Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 2;  // PEER_CLOSED
+          if (Tinyc->tcp_cli_reason[vm->tcp_sel] == 1) {
+            Tinyc->tcp_cli_reason[vm->tcp_sel] = 2;  // PEER_CLOSED
           }
           TC_PUSH(vm, -2);
           break;
@@ -17120,8 +17140,8 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       uint32_t deadline = millis() + (uint32_t)timeout_ms;
       while (1) {
         if (!_oc->connected()) {
-          if (Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] == 1) {
-            Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 2;
+          if (Tinyc->tcp_cli_reason[vm->tcp_sel] == 1) {
+            Tinyc->tcp_cli_reason[vm->tcp_sel] = 2;
           }
           result = -2;
           break;
@@ -17140,7 +17160,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           // True timeout — no data within the window. Update the
           // disconnect-reason field so the watchdog can distinguish a
           // dead-but-still-connected peer from a hard disconnect.
-          Tinyc->tcp_cli_reason[Tinyc->tcp_cli_slot] = 3;  // TIMEOUT
+          Tinyc->tcp_cli_reason[vm->tcp_sel] = 3;  // TIMEOUT
           result = -1;
           break;
         }
