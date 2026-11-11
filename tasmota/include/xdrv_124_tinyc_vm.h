@@ -177,14 +177,41 @@ uint32_t WcGetPicstore(int32_t num, uint8_t **buff) {
 #endif  // !USE_WEBCAM
 #endif
 
+#ifdef USE_USB_HOST_AUDIO
+// USB audio stick (xdrv_99_usb_host): i2sBegin with dout pin -2 sends the PCM there instead of to the I2S peripheral
+extern int UsbHostAudioOpen(int rate);
+extern int UsbHostAudioWrite(const int16_t *x, int n);
+extern void UsbHostAudioClose(void);
+static bool tc_i2s_usb = false;
+extern int UsbHostMicOpen(int rate);
+extern int UsbHostMicRead(int16_t *dst, int max, int timeout_ms);
+extern void UsbHostMicClose(void);
+static bool tc_mic_usb = false;                 // i2sMicBegin with din pin -2: the recording side of the USB audio stick
+#endif
 #ifdef USE_UFILESYS
 extern FS *ffsp;
 extern FS *ufsp;
+#ifdef USE_USB_HOST_MSC
+extern FS *usbfsp;   // USB flash drive mounted by xdrv_99_usb_host, nullptr while none is mounted
+extern FS *usb2fsp;  // second USB drive (/usb2), nullptr while none is mounted
+#endif
 // Resolve filesystem from path prefix (like Scripter's script_file_path):
 //   /ffs/xxx  → flash (ffsp), strip prefix
 //   /sdfs/xxx → SD card (ufsp), strip prefix
+//   /usb/xxx  → USB flash drive (usbfsp), strip prefix (nullptr when no stick is mounted)
+//   /usb2/xxx → second USB drive (usb2fsp), strip prefix
 //   default   → ufsp (SD preferred), ensure leading /
 static FS *tc_file_path(char *path) {
+#ifdef USE_USB_HOST_MSC
+  if (!strncmp_P(path, PSTR("/usb/"), 5)) {
+    memmove(path, path + 4, strlen(path) - 3);
+    return usbfsp;
+  }
+  if (!strncmp_P(path, PSTR("/usb2/"), 6)) {
+    memmove(path, path + 5, strlen(path) - 4);
+    return usb2fsp;
+  }
+#endif
   if (!strncmp_P(path, PSTR("/ffs/"), 5)) {
     memmove(path, path + 4, strlen(path) - 3);
     return ffsp;
@@ -354,14 +381,15 @@ extern uint16_t tc_vm_stack_bytes;
 // this firmware (since V21); an older abi_rev is normal and loads.
 #include "xdrv_124_tinyc_spp.h"
 #include "xdrv_124_tinyc_usb.h"
+#include "xdrv_124_tinyc_espnow.h"   // ESP-NOW (USE_TINYC_ESPNOW): espnowBegin/Key/Peer/Send/Available/Recv/Rssi/End
 
-#define TC_SYSCALL_ABI     33    // V33: sensorGetNaN/isNan (567-568). V32: FTP client (556-566). Every ABI step is listed in tasmota/tinyc/CHANGELOG.md
+#define TC_SYSCALL_ABI     34    // V34: ESP-NOW (569-576). V33: sensorGetNaN/isNan (567-568). V32: FTP client (556-566). Every ABI step is listed in tasmota/tinyc/CHANGELOG.md
 extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y, -1/-2=raw (SYS_TOUCH_GET); declared even on no-touch builds (call is guarded)
 // When bumping TC_RELEASE or TC_SYSCALL_ABI, add the entry to tasmota/tinyc/CHANGELOG.md
 // (and to its ABI table) -- the release text is taken from there. Keep these comments short.
 // The IDE banner takes TC_RELEASE automatically (idesrc/bundle.py fills
 // __TC_RELEASE__ in index.html) -- rebundle the IDE after a bump.
-#define TC_RELEASE         "1.6.76"     // release notes: tasmota/tinyc/CHANGELOG.md
+#define TC_RELEASE         "1.6.78"     // release notes: tasmota/tinyc/CHANGELOG.md
 
 // Default malloc() PSRAM limit on every PSRAM build (TinyCPsram). The framework
 // bakes CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL = 4096 into its heap: every malloc()
@@ -1447,6 +1475,14 @@ enum TcSyscall {
   SYS_FTP_RENAME       = 566, // (from_ref, to_ref)            -> int 0 ok
   SYS_SENSOR_GET_NAN   = 567, // (const_idx_path)              -> float, NaN when the path is absent (sensorGet gives 0)
   SYS_IS_NAN           = 568, // (float)                       -> int 1 if NaN
+  SYS_ESPNOW_BEGIN     = 569, // (channel)                     -> int 1 ok / 0  start ESP-NOW (0 = keep the channel of a connected WiFi)
+  SYS_ESPNOW_KEY       = 570, // (key16)                       -> int 1 ok / 0  key for the peers added afterwards ("" = none)
+  SYS_ESPNOW_PEER      = 571, // (mac)                         -> int 1 ok / 0  add / change a peer
+  SYS_ESPNOW_SEND      = 572, // (mac, data, len)              -> int 1 delivered / 0  waits up to 100 ms for the ACK
+  SYS_ESPNOW_AVAIL     = 573, // ()                            -> int           packets in the receive ring
+  SYS_ESPNOW_RECV      = 574, // (mac_out, data_out, max)      -> int len / 0   pops the oldest packet, mac as "AA:BB:CC:DD:EE:FF"
+  SYS_ESPNOW_RSSI      = 575, // ()                            -> int           RSSI of the last packet read (dBm)
+  SYS_ESPNOW_END       = 576, // ()                            -> int 1         stop ESP-NOW
   SYS_WEB_REPO_PULLDOWN = 280, // (gref, label_c, json_url_c, index_key_c, dest_path_c) -> void — Scripter smlpd()-style remote JSON directory picker
   SYS_SML_APPLY_PINS    = 281, // (path_c, rx, tx, smlf) -> int — idempotent SML descriptor pin substitution (%0?rxpin%/%0?txpin%/%0?smlf%, leading 0 optional). Inserts "; <template>" comment line above each active line on first call; rebuilds active line from template on subsequent calls. Values are substituted verbatim (e.g. tx=-1 becomes the literal "-1" which SML accepts as "no tx pin"); the original placeholder text is preserved only in the template comment. Returns # subs done, 0 = no change, -1 = err.
   SYS_SML_SCRIPTER_LOAD = 282, // (path_c) -> int — extract >F/>S sections from descriptor, compile to bytecode, run on EverySecond/Every100ms ticks. Subset: lnv0..lnv9, +=/-=/*=//=/=, +-*/% < <= > >= == !=, switch/case/ends, if/endif, sml(m,0,baud), sml(m,1,"HEX"). Returns # sections compiled (0..2), -1 = err.
@@ -1704,9 +1740,10 @@ static const char * const TC_CB_NAME[TC_CB_COUNT] = {
 
 typedef struct {
   // Program
-  const uint8_t *code;
+  const uint8_t *code;      // start of the CODE section (03.11.2026: no longer the file start, see tc_vm_load)
+  const uint8_t *bin;       // start of the whole .tcb (persist names are addressed from here)
   uint16_t code_size;
-  uint16_t code_offset;
+  uint16_t code_offset;     // 0 since 03.11.2026 (pc counts from the code start, jump targets already do)
   // Execution
   uint16_t pc;
   bool     running;
@@ -2013,6 +2050,7 @@ struct TINYC {
   WiFiUDP  udp_port;              // general-purpose UDP socket
   uint16_t udp_port_num;          // bound port number
   bool     udp_port_open;         // port is listening
+  void    *udp_port_owner;        // the TcSlot that opened it: only ITS stop closes it (gemu2015/Sonoff-Tasmota#142)
   uint32_t udp_port_last_rx;     // millis() of last received packet on general port
   uint16_t udp_port_timeout;     // inactivity timeout in seconds (0 = disabled)
   IPAddress udp_port_mcast;       // multicast group IP (0.0.0.0 = unicast)
@@ -2026,7 +2064,11 @@ struct TINYC {
 #define TC_MAX_WEB_HANDLERS 7
   char     web_handler_url[TC_MAX_WEB_HANDLERS][32];
   uint8_t  web_handler_count;
-  uint8_t  current_web_handler;   // handler number during WebOn callback
+  // webOn(n, url) belongs to the slot that called it, and n is that program's OWN number: the table index is
+  // the internal handler, web_handler_num[] the n the script sees from webHandler(), web_handler_slot[] who is called.
+  uint8_t  web_handler_slot[TC_MAX_WEB_HANDLERS];
+  uint8_t  web_handler_num[TC_MAX_WEB_HANDLERS];
+  uint8_t  current_web_handler;   // handler number (the script's own n) during WebOn callback
   // Per-request state for HandleTinyCWebOn. web_content_begun: set the first
   // time webSend() runs inside a WebOn callback — triggers lazy WSContentBegin
   // (so raw-mode handlers that skip webSend() entirely get to write the full
@@ -2265,6 +2307,7 @@ static inline void tc_chart_response_reset(void) {
 }
 #define TC_MAX_SERIAL_PORTS 3
 static TasmotaSerial *tc_serial_ports[TC_MAX_SERIAL_PORTS] = {}; // TinyC serial ports (up to 3, one per handle)
+static void *tc_serial_owner[TC_MAX_SERIAL_PORTS] = {};          // the TcSlot that opened a handle: only its unload closes it (#142)
 // ⚠️ Which pins each open port drives. TasmotaSerial does not expose them, and
 // patching a vendored library for a lookup would be the wrong place -- see the
 // pin check in SYS_SERIAL_BEGIN for why it has to be answerable at all.
@@ -2664,6 +2707,19 @@ static int32_t tc_ref_maxlen(TcVM *vm, int32_t ref) {
     if (end) return (base < end) ? end - base : 0;
     return (base < TC_MAX_LOCALS) ? TC_MAX_LOCALS - base : 0;
   }
+}
+
+// Element read `pat[k]` through a CONST-POOL ref: a string literal (or a #define string) handed to a char[] parameter of a
+// user function. tc_resolve_ref() refuses such refs by design (no heap array behind them), so OP_LOAD_REF_ARR read 0 for every
+// k on the device while strlen / sprintf("%s") (tc_ref_to_cstr) worked and the IDE simulator was right (Andreas, 10.11.2026,
+// `sucheText("unix_seconds")`). Reads are harmless: serve them from the pool, the terminating NUL is element len, anything
+// beyond reads 0. Writes through such a ref still fault (OP_STORE_REF_ARR). BOTH dispatch paths use this (switch + direct-threaded).
+static inline int32_t tc_const_ref_char(TcVM *vm, int32_t ref, int32_t k) {
+  uint16_t cidx = (uint16_t)((uint32_t)ref & 0x7FFF);
+  if (k < 0 || cidx >= vm->const_count || vm->constants[cidx].type != 1 || !vm->constants[cidx].str.ptr) return 0;
+  const char *cp = vm->constants[cidx].str.ptr;
+  int32_t clen = (int32_t)strlen(cp);
+  return (k < clen) ? (int32_t)(uint8_t)cp[k] : 0;
 }
 
 // Capacity in SLOTS — the arithmetic tc_ref_maxlen does for int32 arrays. Split
@@ -3210,6 +3266,101 @@ static volatile bool tc_udp_pause_req = false;
 #ifdef ESP32
 #include "WiFiClientSecureLightBearSSL.h"
 static BearSSL::WiFiClientSecure_light *tc_tls = nullptr;
+
+// Optional TLS client certificate for tlsConnect() (08.11.2026, Andreas): some servers (e.g. the HAN
+// interface of a smart meter gateway) authenticate the client by certificate instead of a password.
+// Loaded by the console command TinyCTlsCert <certfile> <keyfile> (TinyCTlsCert 0 = off) from two text files:
+//   certfile: the X.509 certificate (DER) as hex text (whitespace ignored)
+//   keyfile:  line 1 "P-256" or "P-384", line 2 the private EC scalar as hex (32 / 48 bytes),
+//             optional line 3 "RSA" if the certificate was signed by an RSA CA (default EC)
+// Only EC keys on P-256 / P-384 (what BearSSL can sign with here; no brainpool). The files are meant to be
+// *.secret, which the external file paths refuse; the firmware reads them directly. Key bytes never go to a log.
+#define TC_CLCERT_MAX 2048
+static uint8_t  tc_clcert_der[TC_CLCERT_MAX];
+static uint16_t tc_clcert_len = 0;
+static uint8_t  tc_clcert_key[48];
+static uint8_t  tc_clcert_klen = 0;
+static int      tc_clcert_curve = 0;          // BR_EC_secp256r1 / BR_EC_secp384r1, 0 = no client certificate
+static unsigned tc_clcert_issuer = BR_KEYTYPE_EC;
+static br_x509_certificate tc_clcert_chain[1];
+static br_ec_private_key   tc_clcert_sk;
+
+static void tc_clcert_clear(void) {
+  memset(tc_clcert_key, 0, sizeof(tc_clcert_key));
+  tc_clcert_klen = 0; tc_clcert_len = 0; tc_clcert_curve = 0; tc_clcert_issuer = BR_KEYTYPE_EC;
+}
+static int tc_hexval(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+// hex text -> bytes, whitespace skipped; returns byte count or -1 (bad char / odd count / too long)
+static int tc_hex_to_bin(const char *s, uint8_t *out, int maxOut) {
+  int n = 0, hi = -1;
+  for (; *s; s++) {
+    if (*s == ' ' || *s == '\r' || *s == '\n' || *s == '\t') continue;
+    int v = tc_hexval(*s);
+    if (v < 0) return -1;
+    if (hi < 0) { hi = v; } else { if (n >= maxOut) return -1; out[n++] = (uint8_t)((hi << 4) | v); hi = -1; }
+  }
+  return (hi < 0) ? n : -1;
+}
+// read a whole small text file (TinyC path rules: /sdfs/, /ffs/, default SD) into a fresh buffer
+static char *tc_clcert_readfile(const char *path, size_t maxlen) {
+#ifdef USE_UFILESYS
+  char fpath[128]; strlcpy(fpath, path, sizeof(fpath));
+  FS *fsp = tc_file_path(fpath);
+  if (!fsp) return nullptr;
+  File f = fsp->open(fpath, "r");
+  if (!f) return nullptr;
+  size_t sz = (size_t)f.size();
+  if (sz == 0 || sz > maxlen) { f.close(); return nullptr; }
+  char *buf = (char*)malloc(sz + 1);
+  if (!buf) { f.close(); return nullptr; }
+  size_t got = (size_t)f.read((uint8_t*)buf, sz);
+  buf[got] = 0;
+  f.close();
+  return buf;
+#else
+  (void)path; (void)maxlen; return nullptr;
+#endif
+}
+// load certificate + key; returns nullptr on success or a short error text (never key material)
+static const char *tc_clcert_load(const char *certfile, const char *keyfile) {
+  tc_clcert_clear();
+  char *c = tc_clcert_readfile(certfile, TC_CLCERT_MAX * 2 + 256);
+  if (!c) return "certificate file missing or too large";
+  int n = tc_hex_to_bin(c, tc_clcert_der, TC_CLCERT_MAX);
+  free(c);
+  if (n < 64 || tc_clcert_der[0] != 0x30) { tc_clcert_clear(); return "certificate is not DER hex"; }
+  tc_clcert_len = (uint16_t)n;
+  char *k = tc_clcert_readfile(keyfile, 512);
+  if (!k) { tc_clcert_clear(); return "key file missing"; }
+  char *l2 = strchr(k, '\n');
+  if (!l2) { memset(k, 0, strlen(k)); free(k); tc_clcert_clear(); return "key file needs 2 lines"; }
+  *l2++ = 0;
+  char *l3 = strchr(l2, '\n');
+  if (l3) { *l3++ = 0; }
+  int curve = 0, want = 0;
+  if (strstr_P(k, PSTR("P-256"))) { curve = BR_EC_secp256r1; want = 32; }
+  else if (strstr_P(k, PSTR("P-384"))) { curve = BR_EC_secp384r1; want = 48; }
+  int kn = curve ? tc_hex_to_bin(l2, tc_clcert_key, sizeof(tc_clcert_key)) : -1;
+  if (l3 && strstr_P(l3, PSTR("RSA"))) { tc_clcert_issuer = BR_KEYTYPE_RSA; }
+  memset(k, 0, strlen(k)); memset(l2, 0, strlen(l2));   // wipe the hex key text before freeing
+  free(k);
+  if (!curve) { tc_clcert_clear(); return "curve must be P-256 or P-384"; }
+  if (kn != want) { tc_clcert_clear(); return "key length does not match curve"; }
+  tc_clcert_klen = (uint8_t)kn;
+  tc_clcert_curve = curve;
+  tc_clcert_chain[0].data = tc_clcert_der;
+  tc_clcert_chain[0].data_len = tc_clcert_len;
+  tc_clcert_sk.curve = curve;
+  tc_clcert_sk.x = tc_clcert_key;
+  tc_clcert_sk.xlen = tc_clcert_klen;
+  return nullptr;
+}
+
 // RST-close the raw-TLS socket so its lwIP PCB frees NOW (no ~12 s TIME_WAIT). With only
 // CONFIG_LWIP_MAX_ACTIVE_TCP=16 PCBs, repeated TLS polls otherwise leak TIME_WAITs and can
 // exhaust the pool -> the whole net stack wedges (no ping/HTTP) until they age out. Mirrors
@@ -3336,9 +3487,17 @@ static inline void tc_udp_pause_sync(void) {
   Tinyc->udp.stop();
   Tinyc->udp_connected = false;
 }
+// Overridable in user_config_override.h (06.11.2026): a server that sends full 16 KB TLS
+// records and ignores max_fragment_length needs TC_TLS_RX_BUF 16709 (= BR_SSL_BUFSIZE_INPUT).
+#ifndef TC_TLS_RX_BUF
 #define TC_TLS_RX_BUF   8192      // BearSSL recv buffer (>= the server's TLS record)
+#endif
+#ifndef TC_TLS_TX_BUF
 #define TC_TLS_TX_BUF   1024
+#endif
+#ifndef TC_TLS_IDLE_MS
 #define TC_TLS_IDLE_MS  3000      // give up a read after this long with no byte
+#endif
 
 // base64url (RFC 4648, padding optional) → bytes. Normalizes -_ → +/ and re-pads,
 // then mbedtls_base64_decode. Used by rsaEncrypt() to decode the JWK pubkey (n,e).
@@ -4308,7 +4467,10 @@ static void tc_udp_init(void) {
   }
 }
 
-static void tc_udp_stop(void) {
+// stopping_slot = the slot being unloaded (nullptr = stop everything). The general-purpose port (udp(0, port)) belongs to the slot that opened
+// it: the stop of ANOTHER slot must not close it. It used to, and a program in slot 1 that was (re)loaded killed the UDP service of slot 0
+// (sml_eco_shelly.tc binds once and never rebinds) while HTTP kept working. #142, reproduced on an ESP32-C3 11.11.2026.
+static void tc_udp_stop(void *stopping_slot = nullptr) {
   if (!Tinyc) return;
   if (Tinyc->udp_connected) {
     Tinyc->udp.flush();
@@ -4318,12 +4480,13 @@ static void tc_udp_stop(void) {
   }
   tc_udp_free_arrays();
   Tinyc->udp_used = false;
-  // Stop general-purpose UDP port
-  if (Tinyc->udp_port_open) {
+  // Stop general-purpose UDP port -- but only when it is this slot's (or nobody's)
+  if (Tinyc->udp_port_open && !(stopping_slot && Tinyc->udp_port_owner && Tinyc->udp_port_owner != stopping_slot)) {
     Tinyc->udp_port.stop();
     Tinyc->udp_port_open = false;
     Tinyc->udp_port_num = 0;
     Tinyc->udp_port_mcast = IPAddress(0,0,0,0);
+    Tinyc->udp_port_owner = nullptr;
   }
   // Stop all outgoing TCP client slots
   for (uint8_t _s = 0; _s < TC_TCP_CLI_SLOTS; _s++) {
@@ -4958,7 +5121,7 @@ static TcVM *tc_alloc_worker_vm(TcSlot *s, int cb_idx) {
 
   TcVM *p = &s->vm;
   // --- ALIASED (shared / read-only) — never freed by tc_free_worker_vm ---
-  w->code = p->code; w->code_size = p->code_size; w->code_offset = p->code_offset;
+  w->code = p->code; w->bin = p->bin; w->code_size = p->code_size; w->code_offset = p->code_offset;
   w->constants = p->constants; w->const_count = p->const_count;
   w->const_capacity = p->const_capacity; w->const_data = p->const_data;
   w->const_data_size = p->const_data_size; w->const_data_used = p->const_data_used;
@@ -5122,8 +5285,13 @@ static void tc_serial_close(int h) {
   }
 }
 
-static void tc_serial_close_all(void) {
-  for (int i = 0; i < TC_MAX_SERIAL_PORTS; i++) tc_serial_close(i);
+// Closes the ports of the unloading slot only (the handles are one array for all slots). A port without a recorded owner is closed as before.
+static void tc_serial_close_all(void *unloading_slot = nullptr) {
+  for (int i = 0; i < TC_MAX_SERIAL_PORTS; i++) {
+    if (unloading_slot && tc_serial_owner[i] && tc_serial_owner[i] != unloading_slot) continue;
+    tc_serial_close(i);
+    tc_serial_owner[i] = nullptr;
+  }
 }
 
 static inline TasmotaSerial *tc_serial_get(int h) {
@@ -5939,10 +6107,19 @@ static uint32_t tc_ts_cmp(const char *ts) {
  * VM: GPIO pin safety check — halt VM on forbidden/in-use pins
 \*********************************************************************************************/
 
+// Classic ESP32: Tasmota paints GPIO16/17 red because WROVER/PICO modules use them for PSRAM/flash. On a WROOM-32 without PSRAM they are
+// ordinary pins (WAVE ROVER: AIN2 = IO17, encoder B = IO16), so they are free for a script when no PSRAM was found (11.11.2026).
+static bool tc_pin_red(int32_t pin) {
+#if defined(CONFIG_IDF_TARGET_ESP32) && !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(CONFIG_IDF_TARGET_ESP32S3)
+  if ((16 == pin || 17 == pin) && !FoundPSRAM()) return false;
+#endif
+  return RedPin(pin);
+}
+
 static bool tc_pin_forbidden(int32_t pin) {
   if (pin < 0 || pin >= MAX_GPIO_PIN) return true;
   if (FlashPin(pin)) return true;
-  if (RedPin(pin)) return true;
+  if (tc_pin_red(pin)) return true;
   // gpio_pin[] stores (function << 5) | index. Top 11 bits hold the GPIO
   // function id. GPIO_NONE (0) = pin is free; GPIO_USER (2047) = pin is
   // explicitly user-configurable in the module template — both must remain
@@ -5955,7 +6132,7 @@ static bool tc_pin_forbidden(int32_t pin) {
 #define TC_CHECK_PIN(vm, pin) \
   if (tc_pin_forbidden(pin)) { \
     AddLog(LOG_LEVEL_ERROR, PSTR("TCC: HALT — forbidden pin %d (flash:%d red:%d gpio_func:%d)"), \
-      (int)(pin), FlashPin(pin), RedPin(pin), \
+      (int)(pin), FlashPin(pin), tc_pin_red(pin), \
       (pin >= 0 && pin < MAX_GPIO_PIN) ? (TasmotaGlobal.gpio_pin[pin] >> 5) : -1); \
     (vm)->error = TC_ERR_FORBIDDEN_PIN; \
     (vm)->halted = true; \
@@ -7601,7 +7778,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       // Release pin from Tasmota GPIO management and set mode
       // gpio_init() is intentional override — still block flash/red pins
       b = TC_POP(vm); a = TC_POP(vm);  // pin, mode
-      if (a < 0 || a >= MAX_GPIO_PIN || FlashPin(a) || RedPin(a)) {
+      if (a < 0 || a >= MAX_GPIO_PIN || FlashPin(a) || tc_pin_red(a)) {
         AddLog(LOG_LEVEL_ERROR, PSTR("TCC: HALT — gpio_init forbidden pin %d"), (int)a);
         vm->error = TC_ERR_FORBIDDEN_PIN;
         vm->halted = true;
@@ -7835,6 +8012,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
 #endif
       tc_serial_ports[slot] = new TasmotaSerial(rxpin, txpin, HARDWARE_FALLBACK, 0, bufsize);
       if (tc_serial_ports[slot]) {
+        tc_serial_owner[slot] = (void *)tc_slot_of_vm(vm);
         if (tc_serial_ports[slot]->begin(baud, ConvertSerialConfig(config))) {
           if (tc_serial_ports[slot]->hardwareSerial()) {
             ClaimSerial();
@@ -10406,6 +10584,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
             if (Tinyc->udp_port.begin(port)) {
               Tinyc->udp_port_num = port;
               Tinyc->udp_port_open = true;
+              Tinyc->udp_port_owner = (void *)tc_slot_of_vm(vm);
               Tinyc->udp_port_last_rx = millis();  // reset watchdog
               if (!Tinyc->udp_port_timeout) {
                 Tinyc->udp_port_timeout = TC_UDP_TIMEOUT_SEC;
@@ -10626,6 +10805,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           if (ok) {
             Tinyc->udp_port_num = (uint16_t)port;
             Tinyc->udp_port_open = true;
+            Tinyc->udp_port_owner = (void *)tc_slot_of_vm(vm);
             Tinyc->udp_port_mcast = mcast;
             Tinyc->udp_port_last_rx = millis();
             if (!Tinyc->udp_port_timeout) {
@@ -12046,6 +12226,89 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       break;
     }
 
+    // ── ESP-NOW (USE_TINYC_ESPNOW, ESP32 family) ──────────────────────────────
+    // The protocol lives in the script; see xdrv_124_tinyc_espnow.h for the WiFi / channel rules.
+#if defined(ESP32) && defined(USE_TINYC_ESPNOW)
+    case SYS_ESPNOW_BEGIN: {             // espnowBegin(channel) -> 1/0
+      int32_t ch = TC_POP(vm);
+      TC_PUSH(vm, tc_en_begin((int)ch));
+      break;
+    }
+    case SYS_ESPNOW_KEY: {               // espnowKey("16 characters") -> 1/0
+      int32_t ref = TC_POP(vm);
+      char k[24];
+      tc_ref_to_cstr(vm, ref, k, sizeof(k));
+      TC_PUSH(vm, tc_en_set_key(k));
+      break;
+    }
+    case SYS_ESPNOW_PEER: {              // espnowPeer("AA:BB:CC:DD:EE:FF") -> 1/0
+      int32_t ref = TC_POP(vm);
+      char ms[32];
+      uint8_t mac[6];
+      tc_ref_to_cstr(vm, ref, ms, sizeof(ms));
+      TC_PUSH(vm, tc_en_parse_mac(ms, mac) ? tc_en_add_peer(mac) : 0);
+      break;
+    }
+    case SYS_ESPNOW_SEND: {              // espnowSend(mac, data, len) -> 1 delivered / 0
+      int32_t n    = TC_POP(vm);
+      int32_t dref = TC_POP(vm);
+      int32_t mref = TC_POP(vm);
+      char ms[32];
+      uint8_t mac[6];
+      tc_ref_to_cstr(vm, mref, ms, sizeof(ms));
+      if (n <= 0 || n > TC_ESPNOW_MAXLEN || !tc_en_parse_mac(ms, mac)) { TC_PUSH(vm, 0); break; }
+      TC_UBUF(tmp, TC_ESPNOW_MAXLEN);
+      int32_t got = 0;
+      if (tc_is_const_ref(dref)) {                     // espnowSend(mac, "TOGGLE", 6): a literal is read through the pool
+        char cs[TC_ESPNOW_MAXLEN + 1];
+        tc_ref_to_cstr(vm, dref, cs, sizeof(cs));
+        got = (int32_t)strlen(cs);
+        if (got > n) { got = n; }
+        memcpy(tmp, cs, got);
+      } else {
+        uint8_t *src = tc_ref_bytes(vm, dref, n, tmp, TC_ESPNOW_MAXLEN, &got);
+        if (!src) { got = 0; }
+        else if (src != tmp) { memcpy(tmp, src, got); }
+      }
+      TC_PUSH(vm, got > 0 ? tc_en_send(mac, tmp, (int)got, 100) : 0);
+      break;
+    }
+    case SYS_ESPNOW_AVAIL: {             // espnowAvailable() -> packets waiting
+      TC_PUSH(vm, tc_en_available());
+      break;
+    }
+    case SYS_ESPNOW_RECV: {              // espnowRecv(mac_out, data_out, max) -> len; mac_out gets "AA:BB:CC:DD:EE:FF"
+      int32_t mx   = TC_POP(vm);
+      int32_t dref = TC_POP(vm);
+      int32_t mref = TC_POP(vm);
+      TcEspNowPkt pk;
+      if (mx <= 0 || !tc_en_pop(&pk)) { TC_PUSH(vm, 0); break; }
+      char ms[20];
+      snprintf(ms, sizeof(ms), "%02X:%02X:%02X:%02X:%02X:%02X", pk.mac[0], pk.mac[1], pk.mac[2], pk.mac[3], pk.mac[4], pk.mac[5]);
+      tc_cstr_to_ref(vm, mref, ms);
+      int32_t n = pk.len;
+      if (n > mx) { n = mx; }
+      TC_PUSH(vm, tc_ref_put_bytes(vm, dref, pk.data, n));
+      break;
+    }
+    case SYS_ESPNOW_RSSI: {              // espnowRssi() -> RSSI (dBm) of the last packet read
+      TC_PUSH(vm, (int32_t)TcEn.last_rssi);
+      break;
+    }
+    case SYS_ESPNOW_END: {               // espnowEnd() -> 1
+      tc_en_end();
+      TC_PUSH(vm, 1);
+      break;
+    }
+#else
+    case SYS_ESPNOW_BEGIN: case SYS_ESPNOW_KEY: case SYS_ESPNOW_PEER:   // not built in: 1 argument, answer 0
+      TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_ESPNOW_SEND: case SYS_ESPNOW_RECV:                         // 3 arguments
+      TC_POP(vm); TC_POP(vm); TC_POP(vm); TC_PUSH(vm, 0); break;
+    case SYS_ESPNOW_AVAIL: case SYS_ESPNOW_RSSI: case SYS_ESPNOW_END:   // no arguments
+      TC_PUSH(vm, 0); break;
+#endif  // ESP32 && USE_TINYC_ESPNOW
+
     // ── Generic JSON parsing on an arbitrary script buffer (JsonParser-backed) ──
     // Unlike sensorGet (this device's own sensor JSON only), these parse ANY
     // char[] the script holds — e.g. an httpGet response from a remote device.
@@ -13338,13 +13601,33 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       const char *url = tc_get_const_str(vm, ci);
 #ifdef USE_WEBSERVER
       if (url && Tinyc && hn >= 1 && hn <= TC_MAX_WEB_HANDLERS) {
-        strlcpy(Tinyc->web_handler_url[hn - 1], url, sizeof(Tinyc->web_handler_url[0]));
-        if (hn > Tinyc->web_handler_count) Tinyc->web_handler_count = hn;
-        if (Webserver) {
-          Webserver->on(Tinyc->web_handler_url[hn - 1], TinyCWebOnHandlers[hn - 1]);
-          AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered"), hn, url);
+        // Which slot calls? Its program gets its own numbering, so two programs may both use webOn(1, ...).
+        uint8_t own_si = 0;
+        { TcSlot *own = tc_slot_of_vm(vm);
+          for (uint8_t si = 0; si < TC_MAX_VMS; si++) { if (Tinyc->slots[si] && own == Tinyc->slots[si]) { own_si = si; break; } } }
+        int e = -1;
+        for (int i = 0; i < TC_MAX_WEB_HANDLERS && e < 0; i++) {        // same program + number: re-registration
+          if (Tinyc->web_handler_url[i][0] && Tinyc->web_handler_slot[i] == own_si && Tinyc->web_handler_num[i] == hn) e = i;
+        }
+        for (int i = 0; i < TC_MAX_WEB_HANDLERS && e < 0; i++) {        // same URL: take it over
+          if (Tinyc->web_handler_url[i][0] && !strcmp(Tinyc->web_handler_url[i], url)) e = i;
+        }
+        for (int i = 0; i < TC_MAX_WEB_HANDLERS && e < 0; i++) {
+          if (!Tinyc->web_handler_url[i][0]) e = i;
+        }
+        if (e < 0) {
+          AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") dropped -- all %d web handlers are taken"), hn, url, TC_MAX_WEB_HANDLERS);
         } else {
-          AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") deferred"), hn, url);
+          strlcpy(Tinyc->web_handler_url[e], url, sizeof(Tinyc->web_handler_url[0]));
+          Tinyc->web_handler_slot[e] = own_si;
+          Tinyc->web_handler_num[e]  = (uint8_t)hn;
+          if (e + 1 > Tinyc->web_handler_count) Tinyc->web_handler_count = e + 1;
+          if (Webserver) {
+            Webserver->on(Tinyc->web_handler_url[e], TinyCWebOnHandlers[e]);
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") registered, slot %d"), hn, url, own_si);
+          } else {
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: webOn(%d, \"%s\") deferred, slot %d"), hn, url, own_si);
+          }
         }
       }
 #endif
@@ -16074,6 +16357,22 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t bclk_pin    = TC_POP(vm);
       int32_t mclk_pin    = TC_POP(vm);
 
+#ifdef USE_USB_HOST_AUDIO
+      if (tc_i2s_usb) { UsbHostAudioClose(); tc_i2s_usb = false; }
+      if (-2 == dout_pin) {                              // USB audio stick instead of the I2S peripheral
+        if (Tinyc->i2s_tx_handle) {
+          i2s_channel_disable(Tinyc->i2s_tx_handle);
+          i2s_del_channel(Tinyc->i2s_tx_handle);
+          Tinyc->i2s_tx_handle = nullptr;
+        }
+        int r = UsbHostAudioOpen(sample_rate);
+        tc_i2s_usb = (0 == r);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: USB audio %s (rate %d, code %d)"), tc_i2s_usb ? "started" : "failed", sample_rate, r);
+        TC_PUSH(vm, tc_i2s_usb ? 0 : -1);
+        break;
+      }
+#endif
+
       // Stop any previous I2S session
       if (Tinyc->i2s_tx_handle) {
         i2s_channel_disable(Tinyc->i2s_tx_handle);
@@ -16140,6 +16439,19 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t len     = TC_POP(vm);
       int32_t arr_ref = TC_POP(vm);
 
+#ifdef USE_USB_HOST_AUDIO
+      if (tc_i2s_usb) {                                  // same contract as below: mono int array in, count out, blocks while the buffer is full
+        int32_t *ua = tc_resolve_ref(vm, arr_ref);
+        int32_t um = tc_ref_maxlen(vm, arr_ref);
+        if (!ua || len <= 0) { TC_PUSH(vm, 0); break; }
+        if (len > um) len = um;
+        if (len > 512) len = 512;
+        int16_t ub[512];
+        for (int32_t i = 0; i < len; i++) { int32_t v = ua[i]; ub[i] = (int16_t)((v > 32767) ? 32767 : ((v < -32768) ? -32768 : v)); }
+        TC_PUSH(vm, UsbHostAudioWrite(ub, len));
+        break;
+      }
+#endif
       if (!Tinyc->i2s_tx_handle || !Tinyc->i2s_pcm_buf) {
         TC_PUSH(vm, -1);
         break;
@@ -16176,6 +16488,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
 
     case SYS_I2S_STOP: {
       // i2sStop() -> void
+#ifdef USE_USB_HOST_AUDIO
+      if (tc_i2s_usb) { UsbHostAudioClose(); tc_i2s_usb = false; break; }
+#endif
       if (Tinyc->i2s_tx_handle) {
         i2s_channel_disable(Tinyc->i2s_tx_handle);
         i2s_del_channel(Tinyc->i2s_tx_handle);
@@ -16201,6 +16516,21 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t bclk_pin    = TC_POP(vm);
       int32_t mclk_pin    = TC_POP(vm);
 
+#ifdef USE_USB_HOST_AUDIO
+      if (tc_mic_usb) { UsbHostMicClose(); tc_mic_usb = false; }
+      if (-2 == din_pin) {                               // the microphone of a USB audio stick
+        if (Tinyc->i2s_rx_handle) {
+          i2s_channel_disable(Tinyc->i2s_rx_handle);
+          i2s_del_channel(Tinyc->i2s_rx_handle);
+          Tinyc->i2s_rx_handle = nullptr;
+        }
+        int r = UsbHostMicOpen((sample_rate < 8000) ? 8000 : ((sample_rate > 48000) ? 48000 : sample_rate));
+        tc_mic_usb = (0 == r);
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: USB mic %s (rate %d, code %d)"), tc_mic_usb ? "started" : "failed", sample_rate, r);
+        TC_PUSH(vm, tc_mic_usb ? 0 : -1);
+        break;
+      }
+#endif
       if (Tinyc->i2s_rx_handle) {
         i2s_channel_disable(Tinyc->i2s_rx_handle);
         i2s_del_channel(Tinyc->i2s_rx_handle);
@@ -16247,6 +16577,20 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       // i2sMicRead(arr, max) -> count. Read up to max int16 mono samples into int[].
       int32_t maxn    = TC_POP(vm);
       int32_t arr_ref = TC_POP(vm);
+#ifdef USE_USB_HOST_AUDIO
+      if (tc_mic_usb) {
+        int32_t *ua = tc_resolve_ref(vm, arr_ref);
+        int32_t um  = tc_ref_maxlen(vm, arr_ref);
+        if (!ua || maxn <= 0) { TC_PUSH(vm, 0); break; }
+        if (maxn > um) maxn = um;
+        if (maxn > 256) maxn = 256;
+        int16_t ub[256];
+        int n = UsbHostMicRead(ub, maxn, 50);
+        for (int i = 0; i < n; i++) { ua[i] = ub[i]; }
+        TC_PUSH(vm, (n < 0) ? -1 : n);
+        break;
+      }
+#endif
       if (!Tinyc->i2s_rx_handle) { TC_PUSH(vm, -1); break; }
       int32_t *arr = tc_resolve_ref(vm, arr_ref);
       int32_t cap  = tc_ref_maxlen(vm, arr_ref);
@@ -16267,6 +16611,17 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     case SYS_I2S_MIC_LEVEL: {
       // i2sMicLevel() -> RMS amplitude 0..32767 over one ~256-sample block.
       // 0 = no data this call, -1 = no mic open.
+#ifdef USE_USB_HOST_AUDIO
+      if (tc_mic_usb) {
+        int16_t ub[256];
+        int n = UsbHostMicRead(ub, 256, 50);
+        if (n <= 0) { TC_PUSH(vm, (n < 0) ? -1 : 0); break; }
+        uint64_t sq = 0;
+        for (int i = 0; i < n; i++) { int32_t v = ub[i]; sq += (uint64_t)(v * v); }
+        TC_PUSH(vm, (int32_t)sqrtf((float)((double)sq / (double)n)));
+        break;
+      }
+#endif
       if (!Tinyc->i2s_rx_handle) { TC_PUSH(vm, -1); break; }
       int16_t tmp[256];
       size_t got = 0;
@@ -16283,6 +16638,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
 
     case SYS_I2S_MIC_STOP: {
       // i2sMicStop() -> void
+#ifdef USE_USB_HOST_AUDIO
+      if (tc_mic_usb) { UsbHostMicClose(); tc_mic_usb = false; break; }
+#endif
       if (Tinyc->i2s_rx_handle) {
         i2s_channel_disable(Tinyc->i2s_rx_handle);
         i2s_del_channel(Tinyc->i2s_rx_handle);
@@ -16409,6 +16767,11 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       }
       tc_tls->setTimeout(5000);
       tc_tls->setInsecure();                 // no cert pinning (like Scripter httpsget)
+      tc_tls->setRSAOnly(false);             // offer ECDSA too (tls_mini defaults to RSA only; HttpClientLight does the same).
+                                             // Without it a server with an ECDSA certificate (e.g. smart meter gateway) aborts at once.
+      if (tc_clcert_curve) {                 // optional client certificate (TinyCTlsCert), shown if the server asks
+        tc_tls->setClientECCert(tc_clcert_chain, &tc_clcert_sk, 0xFFFF, tc_clcert_issuer);
+      }
       if (!tc_tls->connect(host, (uint16_t)port)) {
         delete tc_tls; tc_tls = nullptr;
         // Release the multicast pause here too: a script that gets -1 from
@@ -16865,6 +17228,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           TC_PUSH(vm, -1);
         } else {
           WiFiClient *_oc = TC_TCP_OUT_CLIENT();
+          if (_oc->connected()) AddLog(LOG_LEVEL_INFO, PSTR("TCC: tcpConnect on client[%d] that is still connected -- the places are shared by ALL slots, two programs need different numbers"), vm->tcp_sel);
           // abort-close (SO_LINGER 0 -> RST) the previous socket so its lwIP PCB
           // frees IMMEDIATELY instead of lingering ~TIME_WAIT. A connect-heavy app
           // (the /24 fleet scanner = ~60 connects/sweep) otherwise slowly exhausts
@@ -16921,6 +17285,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
           TC_PUSH(vm, -1);
         } else {
           WiFiClient *_oc = TC_TCP_OUT_CLIENT();
+          if (_oc->connected()) AddLog(LOG_LEVEL_INFO, PSTR("TCC: tcpConnect on client[%d] that is still connected -- the places are shared by ALL slots, two programs need different numbers"), vm->tcp_sel);
 #ifdef ESP32
           { int _lf = _oc->fd(); if (_lf >= 0) { struct linger _lg; _lg.l_onoff = 1; _lg.l_linger = 0; setsockopt(_lf, SOL_SOCKET, SO_LINGER, &_lg, sizeof(_lg)); } }  // abort-close prior PCB (see SYS_TCP_CONNECT)
 #endif
@@ -19193,11 +19558,11 @@ static int32_t *tc_persist_slot(TcVM *vm, uint16_t idx, uint16_t *nslots) {
 // Compare a persist entry's compiled name (at name_off in vm->code, stored [len u8][bytes])
 // against a candidate. Returns true only on an exact match. Unnamed entries never match.
 static bool tc_persist_name_eq(TcVM *vm, uint16_t name_off, const uint8_t *other, uint8_t other_len) {
-  if (name_off == 0xFFFF || !vm->code) return false;
-  uint8_t nlen = TC_READ_BYTE(&vm->code[name_off]);
+  if (name_off == 0xFFFF || !vm->bin) return false;
+  uint8_t nlen = TC_READ_BYTE(&vm->bin[name_off]);
   if (nlen != other_len) return false;
   for (uint8_t k = 0; k < nlen; k++) {
-    if ((uint8_t)TC_READ_BYTE(&vm->code[name_off + 1 + k]) != other[k]) return false;
+    if ((uint8_t)TC_READ_BYTE(&vm->bin[name_off + 1 + k]) != other[k]) return false;
   }
   return true;
 }
@@ -19224,7 +19589,7 @@ static void tc_persist_save(TcVM *vm) {
   uint16_t total = named ? 4 : 8;
   for (uint8_t i = 0; i < vm->persist_count; i++) {
     if (named) {
-      uint8_t nlen = (vm->persist[i].name_off != 0xFFFF) ? TC_READ_BYTE(&vm->code[vm->persist[i].name_off]) : 0;
+      uint8_t nlen = (vm->persist[i].name_off != 0xFFFF) ? TC_READ_BYTE(&vm->bin[vm->persist[i].name_off]) : 0;
       total += 1 + nlen + 2 + vm->persist[i].count * 4;
     } else {
       total += 4 + vm->persist[i].count * 4;
@@ -19252,9 +19617,9 @@ static void tc_persist_save(TcVM *vm) {
     uint16_t cnt = vm->persist[i].count;
     if (named) {
       uint16_t noff = vm->persist[i].name_off;
-      uint8_t nlen = (noff != 0xFFFF) ? TC_READ_BYTE(&vm->code[noff]) : 0;
+      uint8_t nlen = (noff != 0xFFFF) ? TC_READ_BYTE(&vm->bin[noff]) : 0;
       buf[pos++] = nlen;
-      for (uint8_t k = 0; k < nlen; k++) buf[pos++] = (uint8_t)TC_READ_BYTE(&vm->code[noff + 1 + k]);
+      for (uint8_t k = 0; k < nlen; k++) buf[pos++] = (uint8_t)TC_READ_BYTE(&vm->bin[noff + 1 + k]);
       buf[pos++] = cnt & 0xFF; buf[pos++] = (cnt >> 8) & 0xFF;
     } else {
       buf[pos++] = idx & 0xFF; buf[pos++] = (idx >> 8) & 0xFF;
@@ -19548,7 +19913,10 @@ static inline void tc_global_write_with_watch(TcVM *vm, uint16_t gidx,
  * VM: Load binary
 \*********************************************************************************************/
 
-static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
+// 03.11.2026 (Andreas): size is uint32_t. With uint16_t a .tcb above 65535 B (allowed: TC_MAX_PROGRAM 128 KB) wrapped
+// around (69963 -> 4427) and was refused as "Invalid binary". The header and tables still sit in the first 64 KB; the code
+// section is addressed from its own start (code_offset 0), so pc and all jump targets stay 16-bit (code itself <= 64 KB).
+static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint32_t size) {
   // All binary[] reads use TC_READ_BYTE() for flash-safe access
   #define B(i) TC_READ_BYTE(&binary[i])
 
@@ -19616,7 +19984,6 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
   uint16_t globals_table_size = (version >= 5 && size >= 20) ? ((B(18) << 8) | B(19)) : 0;
 
   if (size < header_size) return TC_ERR_BAD_BINARY;
-
   uint16_t const_end = header_size + const_pool_size;
 
   // Pre-scan constant pool to count entries and measure const_data bytes needed
@@ -19879,8 +20246,14 @@ static int tc_vm_load(TcVM *vm, const uint8_t *binary, uint16_t size) {
 
   #undef B
 
-  vm->code = binary;
-  vm->code_offset = globals_table_end;
+  if (size - globals_table_end > 0xFFFF) {                          // the code section itself must stay 16-bit addressable
+    AddLog(LOG_LEVEL_ERROR, PSTR("TCC: code section %u B is over 65535 B (the whole file may be up to %d B) - split the program over two slots"),
+           (unsigned)(size - globals_table_end), (int)TC_MAX_PROGRAM);
+    return TC_ERR_BAD_BINARY;
+  }
+  vm->bin = binary;
+  vm->code = binary + globals_table_end;   // 03.11.2026: pc counts from the code start (jump targets are code-relative)
+  vm->code_offset = 0;
   vm->code_size = size - globals_table_end;
   vm->pc = vm->code_offset + entry_point;
   vm->sp = 0;
@@ -20741,6 +21114,7 @@ static int tc_vm_step(TcVM *vm) {
       a = TC_POP(vm);  // index
       if ((uint32_t)idx >= TC_MAX_LOCALS) return TC_ERR_BOUNDS;
       int32_t ref = vm->frames[vm->fp].locals[idx];
+      if (tc_is_const_ref(ref)) { TC_PUSH(vm, tc_const_ref_char(vm, ref, a)); break; }   // literal / #define string passed to a char[] param
       int32_t *buf = tc_resolve_ref(vm, ref);
       int32_t maxLen = buf ? tc_ref_maxlen(vm, ref) : 0;
       // Out-of-bounds READ through a char[] ref-param is a common parser hiccup
@@ -21612,6 +21986,7 @@ static int tc_vm_run_slice_ex(TcVM *vm, uint32_t max_instr, uint32_t budget_ms,
     if ((uint32_t)_idx >= TC_MAX_LOCALS) { _err = TC_ERR_BOUNDS; goto _vm_exit; }
     if (!vm->frames[vm->fp].locals) { _err = TC_ERR_FRAME_INVALID; goto _vm_exit; }
     int32_t _ref = vm->frames[vm->fp].locals[_idx];
+    if (tc_is_const_ref(_ref)) { TC_IPUSH(tc_const_ref_char(vm, _ref, _a)); NEXT(); }   // literal / #define string passed to a char[] param
     vm->sp = _sp; vm->pc = _pc;                   // tc_resolve_ref may inspect vm state
     int32_t *_buf = tc_resolve_ref(vm, _ref);
     int32_t _maxlen = _buf ? tc_ref_maxlen(vm, _ref) : 0;
@@ -22356,12 +22731,12 @@ static void TinyCStopVM(TcSlot *s) {
       }
     }
     if (!udp_still_needed) {
-      tc_udp_stop();
+      tc_udp_stop((void *)s);
     }
   }
   tc_tcp_server_stop_if_unused((void *)s);
   tc_spi_cleanup();
-  tc_serial_close_all();
+  tc_serial_close_all((void *)s);
   tc_img_store_free();
   // Clear mini-scripter state — otherwise the >F/>S bytecode from the previous
   // .tcb keeps firing on EverySecond/Every100ms ticks and (e.g.) re-emits the
