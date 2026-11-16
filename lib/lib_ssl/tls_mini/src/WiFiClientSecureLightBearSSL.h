@@ -108,6 +108,16 @@ class WiFiClientSecure_light : public WiFiClient {
     // Sets the requested buffer size for transmit and receive
     void setBufferSizes(int recv, int xmit);
 
+    // Optional non-blocking send (ESP32 only). 0 = unchanged behaviour (NetworkClient::write, which waits up to
+    // 10 x 1 s for a writable socket). >0 = TLS records go out with send(MSG_DONTWAIT); if the socket does not take
+    // a single byte for this many ms, the write gives up (-1). The wait restarts whenever bytes went out.
+    // The wait counts across calls (write, flush, available) and runs out only ONCE: after that every call
+    // returns -1 at once until the connection is freed. available() never waits for the socket.
+    void setSendWaitMs(uint32_t ms) { _sendWaitMs = ms; }
+    bool sendStuck() const { return _sendStuck; }
+    // Upper limit for one TLS engine run (handshake, flush, read), default 10000 ms. Set before connect().
+    void setLoopTimeout(uint32_t ms) { _loopTimeout = ms; }
+
     // Returns whether MFLN negotiation for the above buffer sizes succeeded (after connection)
     int getMFLNStatus() {
       return connected() && br_ssl_engine_get_mfln_negotiated(_eng);
@@ -142,8 +152,20 @@ class WiFiClientSecure_light : public WiFiClient {
       _domain = domain;
     }
 
+    // Nur die ZWEI von SHIP 9.1 definierten Cipher-Suites anbieten (0xC023 CBC = Pflicht,
+    // dann 0xC02B GCM = optional). Ohne diesen Schalter bleibt es bei der vollen Liste, die
+    // zusaetzlich 0xC02F (ECDHE_RSA) fuehrt — kein SHIP-Cipher, aber noetig fuer HTTPS/MQTT
+    // zu RSA-Servern. Wirkt PRO VERBINDUNG, andere Dienste bleiben unberuehrt.
+    // Vor connect() setzen.
+    void setShipCiphers(bool on) {
+      _ship_ciphers = on;
+    }
+
   private:
     uint32_t _loopTimeout=10000;
+    uint32_t _sendWaitMs=0;      // 0 = blocking NetworkClient::write (default), see setSendWaitMs()
+    uint32_t _sendBlockedAt=0;   // setSendWaitMs: since when the socket takes nothing (0 = not blocked), across calls
+    bool _sendStuck=false;       // setSendWaitMs: wait ran out once -> every further call fails at once
     void _clear();
     bool _ctx_present;
     std::shared_ptr<br_ssl_client_context> _sc;
@@ -161,6 +183,7 @@ class WiFiClientSecure_light : public WiFiClient {
     bool _fingerprint_any;            // accept all fingerprints
     bool _insecure;                   // force fingerprint
     bool _rsa_only;                   // restrict to RSA only key exchange (no ECDSA - enabled to force RSA fingerprints)
+    bool _ship_ciphers = false;       // nur die 2 SHIP-9.1-Suites anbieten (s. setShipCiphers)
     const uint8_t *_fingerprint1;          // fingerprint1 to be checked against
     const uint8_t *_fingerprint2;          // fingerprint2 to be checked against
     uint8_t _recv_fingerprint[20];   // fingerprint received
@@ -193,6 +216,20 @@ class WiFiClientSecure_light : public WiFiClient {
     size_t        _alpn_num;
 
 };
+
+#if defined(USE_EEBUS_GUARD) || defined(USE_EEBUS_STEUVE) || defined(USE_EEBUS_HEMS)
+// EEBUS/SHIP: oeffentlicher EC-Schluessel (unkomprimierter Punkt, 65 Byte) aus dem Zertifikat der Gegenstelle beim
+// TLS-Aufbau DIESES Clients (client = der WiFiClientSecure_light, mit dem connect() lief); *len = 0, wenn keiner da
+// war. Direkt nach connect() lesen. Je Client getrennt (24.10.2026). Bewusst KEIN Klassenfeld: der Header wird auch
+// ohne tasmota_options.h eingebunden (HttpClientLight), das Klassen-Layout muss ueberall gleich sein.
+const uint8_t *ShipPeerPubKey(const void *client, size_t *len);
+#endif
+
+// 11.11.2026 (Andreas, SMGW reader): first certificate of the peer on the LAST TLS connect through the unverified
+// path (setInsecure): validity von/bis (UTC, "JJJJ-MM-TT hh:mm:ss"), subject CN, serial (hex, decimal if <= 8 bytes)
+// and the server name used. Empty strings if none. Read right after connect(); the next connect overwrites it.
+void TlsPeerCertInfo(const char **von, const char **bis, const char **fuer, const char **snr_hex,
+                     const char **snr_dez, const char **host);
 
 #define ERR_OOM             -1000
 #define ERR_CANT_RESOLVE_IP -1001
