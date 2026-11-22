@@ -273,7 +273,9 @@ static FS *tc_file_path(char *path) {
   #define TC_OUTPUT_SIZE     128     // output buffer for MQTT (was 512)
 #endif
 
-#define TC_MAX_FILE_HANDLES  4      // max simultaneously open files
+#ifndef TC_MAX_FILE_HANDLES
+#define TC_MAX_FILE_HANDLES  4      // max simultaneously open files, ALL slots together; -D / user_config_override.h can raise it (xdrv_50 then raises the SD pool too)
+#endif
 // Outgoing TCP client slots (selected via tcpSelect). Bumped 4 → 8 in v1.5.1
 // after a Modbus-TCP user (5+ Wechselrichter / BMU / Smart-Meter modules
 // in parallel) ran out at 4. Each slot costs ~80 B in the Tinyc struct
@@ -390,7 +392,7 @@ extern uint32_t Touch_Status(int32_t sel);   // xdrv_55_touch: 0=pressed,1=x,2=y
 // (and to its ABI table) -- the release text is taken from there. Keep these comments short.
 // The IDE banner takes TC_RELEASE automatically (idesrc/bundle.py fills
 // __TC_RELEASE__ in index.html) -- rebundle the IDE after a bump.
-#define TC_RELEASE         "1.6.80"     // release notes: tasmota/tinyc/CHANGELOG.md
+#define TC_RELEASE         "1.6.81"     // release notes: tasmota/tinyc/CHANGELOG.md
 
 // Default malloc() PSRAM limit on every PSRAM build (TinyCPsram). The framework
 // bakes CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL = 4096 into its heap: every malloc()
@@ -3393,6 +3395,93 @@ static void tc_pcb_census(uint8_t *active, uint8_t *tw) {
   struct tc_pcb_census_t s;
   tcpip_api_call(tc_pcb_census_run, &s.ncall);
   *active = s.active; *tw = s.tw;
+}
+// httpGet diagnostic (Andreas, HEMS on an ESP32-P4, 17.11.2026): 33 % of the polls failed with -1 after 1 ms, against 24 different devices, with heap and
+// network fine. Nothing leaves the device when connect() fails that fast, so the suspects are "no free socket" (CONFIG_LWIP_MAX_SOCKETS=16, EMFILE),
+// the PCB pool, or network_down. On a failure under 20 ms this counts how many sockets socket() still hands out (they are closed again at once, an
+// unconnected socket leaves no TIME_WAIT) and logs it with the PCB census. At most one line per 3 s; the number of fast failures since boot is in it.
+#define TC_HTTP_DIAG_FAST_MS   20
+#define TC_HTTP_DIAG_PROBE_MAX 40
+// Who holds the sockets? (Andreas, 18.11.2026: free=0 on every fast failure, 7 active TCP PCBs, the other ~9 of 16 sockets unaccounted for.) Opens NOTHING: walks the
+// socket numbers lwIP hands out (FD_SETSIZE - CONFIG_LWIP_MAX_SOCKETS .. FD_SETSIZE - 1, the same formula as LWIP_SOCKET_OFFSET in lwipopts.h) and asks each one for
+// its type (SO_TYPE; EBADF = not open), whether it listens (SO_ACCEPTCONN), its local port (getsockname) and its peer (getpeername; only connected sockets have one).
+// One log line "TCC: sockets in use: fd48 TCP L:80 listen, fd53 TCP L:49152 R:192.168.188.20:80, fd55 UDP L:5353" (split in several lines when long), at most once per 30 s.
+static void tc_sock_list(void) {
+  static uint32_t last_list = 0;
+  uint32_t now = millis();
+  if (last_list != 0 && (now - last_list) < 30000) { return; }
+  last_list = now;
+  char line[420];
+  line[0] = 0;
+  size_t used = 0;
+  int found = 0;
+  int first = FD_SETSIZE - CONFIG_LWIP_MAX_SOCKETS;
+  for (int fd = first; fd < FD_SETSIZE; fd++) {
+    int type = 0;
+    socklen_t tl = sizeof(type);
+    if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) != 0) { continue; }       // not an open socket
+    found++;
+    int accepting = 0;
+    socklen_t al = sizeof(accepting);
+    if (SOCK_STREAM != type || getsockopt(fd, SOL_SOCKET, SO_ACCEPTCONN, &accepting, &al) != 0) { accepting = 0; }
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    int lport = -1;
+    if (getsockname(fd, (struct sockaddr *)&ss, &sl) == 0) {
+      lport = (AF_INET6 == ss.ss_family) ? ntohs(((struct sockaddr_in6 *)&ss)->sin6_port) : ntohs(((struct sockaddr_in *)&ss)->sin_port);
+    }
+    char rem[56];
+    rem[0] = 0;
+    sl = sizeof(ss);
+    if (getpeername(fd, (struct sockaddr *)&ss, &sl) == 0) {
+      char ip[40];
+      ip[0] = 0;
+      if (AF_INET6 == ss.ss_family) {
+        inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&ss)->sin6_addr, ip, sizeof(ip));
+        snprintf(rem, sizeof(rem), " R:[%s]:%u", ip, (unsigned)ntohs(((struct sockaddr_in6 *)&ss)->sin6_port));
+      } else {
+        inet_ntop(AF_INET, &((struct sockaddr_in *)&ss)->sin_addr, ip, sizeof(ip));
+        snprintf(rem, sizeof(rem), " R:%s:%u", ip, (unsigned)ntohs(((struct sockaddr_in *)&ss)->sin_port));
+      }
+    }
+    char one[120];
+    int n = snprintf(one, sizeof(one), "%sfd%d %s L:%d%s%s", used ? ", " : "", fd,
+                     (SOCK_STREAM == type) ? "TCP" : ((SOCK_DGRAM == type) ? "UDP" : "RAW"), lport, accepting ? " listen" : "", rem);
+    if (n < 0) { continue; }
+    if (used + (size_t)n >= sizeof(line) - 1) {                                    // line is full: write it out and start the next one
+      AddLog(LOG_LEVEL_INFO, PSTR("TCC: sockets in use: %s"), line);
+      line[0] = 0; used = 0;
+      n = snprintf(one, sizeof(one), "fd%d %s L:%d%s%s", fd, (SOCK_STREAM == type) ? "TCP" : ((SOCK_DGRAM == type) ? "UDP" : "RAW"), lport, accepting ? " listen" : "", rem);
+    }
+    memcpy(line + used, one, (size_t)n + 1);
+    used += (size_t)n;
+  }
+  if (used) { AddLog(LOG_LEVEL_INFO, PSTR("TCC: sockets in use: %s"), line); }
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: sockets in use: %d of %d (fd %d..%d)"), found, (int)CONFIG_LWIP_MAX_SOCKETS, first, FD_SETSIZE - 1);
+}
+static void tc_http_fail_diag(int httpCode, uint32_t ms, const char *url) {
+  static uint32_t n_fast = 0;
+  static uint32_t last_log = 0;
+  if (ms >= TC_HTTP_DIAG_FAST_MS) { return; }
+  n_fast++;
+  uint32_t now = millis();
+  if (last_log != 0 && (now - last_log) < 3000) { return; }
+  last_log = now;
+  int fds[TC_HTTP_DIAG_PROBE_MAX];
+  int n = 0;
+  int err = 0;
+  while (n < TC_HTTP_DIAG_PROBE_MAX) {
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s < 0) { err = errno; break; }
+    fds[n++] = s;
+  }
+  for (int i = 0; i < n; i++) { close(fds[i]); }
+  uint8_t a = 0, tw = 0;
+  tc_pcb_census(&a, &tw);
+  if (0 == n) { tc_sock_list(); }                    // the pool is full: show who holds the sockets (the probe above opened nothing in that case)
+  AddLog(LOG_LEVEL_INFO, PSTR("TCC: httpGet fast fail #%u rc=%d after %u ms, sockets still free=%d%s errno=%d, PCB active=%u time_wait=%u, network_down=%d, %s"),
+         (unsigned)n_fast, httpCode, (unsigned)ms, n, (n >= TC_HTTP_DIAG_PROBE_MAX) ? "+" : "", err, a, tw,
+         TasmotaGlobal.global_state.network_down ? 1 : 0, url);
 }
 // RAII guard for the Powerwall path (ESP_SSLClient), which has many early-exit stop()s:
 // set the pause flag on entry, auto-clear on ANY return so a missed clear can't strand
@@ -7601,6 +7690,21 @@ static inline uint16_t tc_widget_id(int32_t gref) {
     }
   }
   return gidx;
+}
+
+// Slot of a widget by the VM that is executing the syscall (20.11.2026). tc_current_slot above is ONE global pointer that every
+// slot's VM task sets and clears: while the main page renders slot 1's WebCall in loopTask, a busy TaskLoop of slot 0 (a camera
+// script) overwrites it with slot 0 or nullptr, the id loses its slot bits, and the page's buttons and sliders then write into
+// slot 0's variables (seen on .97: arm script in slot 1 could not be switched on, its sliders did not stay). The VM pointer of
+// the running syscall cannot be changed by another task, so it is used first; tc_current_slot stays as the fallback.
+static inline uint16_t tc_widget_id(const TcVM *vm, int32_t gref) {
+  uint16_t gidx = (uint16_t)(((uint32_t)gref) & 0x0FFF);
+  if (Tinyc && vm) {
+    for (uint8_t i = 0; i < TC_MAX_VMS; i++) {
+      if (Tinyc->slots[i] && (const TcVM *)&Tinyc->slots[i]->vm == vm) { return ((uint16_t)i << 12) | gidx; }
+    }
+  }
+  return tc_widget_id(gref);
 }
 
 // ESP8266: tc_syscall is a 10k-line switch where ~57 cases carry a char[256]/[128]
@@ -12496,7 +12600,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
         bool _on_vm_task = (_hs && _hs->vm_mutex && xSemaphoreGetMutexHolder(_hs->vm_mutex) == xTaskGetCurrentTaskHandle());   // OWNER test, not task test -- see TC_FTP_UNLOCK
         if (_on_vm_task && _hs->vm_mutex) xSemaphoreGive(_hs->vm_mutex);
 #endif
+        uint32_t _t_get = millis();
         int httpCode = http.GET();
+        uint32_t _get_ms = millis() - _t_get;
         if (httpCode > 0 && lbuf) {
           int32_t gsize = http.getSize();          // -1 = chunked / unknown
           WiFiClient *st = http.getStreamPtr();
@@ -12564,6 +12670,9 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
 #endif
         http.end();
         bool transport_err = (httpCode <= 0);
+#ifdef ESP32
+        if (transport_err) { tc_http_fail_diag(httpCode, _get_ms, url); }
+#endif
         // Name the TLS buffer when nothing reached the wire: a failed 16 kB
         // allocation and an unreachable host look identical from here (both
         // return <= 0 within ~20 ms), and telling them apart cost Hans a long
@@ -12990,7 +13099,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     case SYS_WEB_BUTTON: {
       int32_t ci = TC_POP(vm);   // label const idx
       int32_t gref = TC_POP(vm); // variable ref
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       const char *label = tc_get_const_str(vm, ci);
@@ -13017,7 +13126,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     case SYS_WEB_TOGGLE: {
       int32_t ci = TC_POP(vm);   // label const idx
       int32_t gref = TC_POP(vm); // variable ref
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       const char *label = tc_get_const_str(vm, ci);
@@ -13049,7 +13158,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t vmax = TC_POP(vm);
       int32_t vmin = TC_POP(vm);
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       const char *label = tc_get_const_str(vm, ci);
@@ -13064,13 +13173,13 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     // ── Dynamic-HTML enablers: var index + runtime-label widgets ──
     case SYS_VAR_IDX: {            // varIdx(var) -> slot-encoded widget id (for hand-built tcbtn/seva HTML)
       int32_t gref = TC_POP(vm);
-      TC_PUSH(vm, (int32_t)tc_widget_id(gref));
+      TC_PUSH(vm, (int32_t)tc_widget_id(vm, gref));
       break;
     }
     case SYS_WEB_BUTTON_V: {       // webButtonV(var, labelbuf) — like webButton, runtime label
       int32_t lref = TC_POP(vm);   // label ref (runtime char[])
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       char label[80];
@@ -13096,7 +13205,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t vmax = TC_POP(vm);
       int32_t vmin = TC_POP(vm);
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       char label[64];
@@ -13128,7 +13237,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     case SYS_WEB_CHECKBOX: {
       int32_t ci = TC_POP(vm);
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       const char *label = tc_get_const_str(vm, ci);
@@ -13159,7 +13268,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t ci = TC_POP(vm);      // label const idx
       int32_t maxlen = TC_POP(vm);  // max char length
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       TC_BUF(tbuf, 128);
       tc_ref_to_cstr(vm, gref, tbuf, sizeof(tbuf));
       const char *label = tc_get_const_str(vm, ci);
@@ -13177,7 +13286,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t vmax = TC_POP(vm);
       int32_t vmin = TC_POP(vm);
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       const char *label = tc_get_const_str(vm, ci);
@@ -13194,7 +13303,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t oi = TC_POP(vm);   // options const idx ("opt1|opt2|opt3" or "@getfreepins")
       int32_t li = TC_POP(vm);   // label const idx
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       const char *label = tc_get_const_str(vm, li);
@@ -13413,7 +13522,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
       int32_t ji   = TC_POP(vm);   // json_url const idx
       int32_t li   = TC_POP(vm);   // label const idx
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;
       const char *label    = tc_get_const_str(vm, li);
@@ -13489,7 +13598,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     case SYS_WEB_RADIO: {
       int32_t ci = TC_POP(vm);   // options const idx ("opt1|opt2|opt3")
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;  // 0-based selected index
       const char *opts = tc_get_const_str(vm, ci);
@@ -13514,7 +13623,7 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
     case SYS_WEB_TIME: {
       int32_t ci = TC_POP(vm);
       int32_t gref = TC_POP(vm);
-      uint16_t idx = tc_widget_id(gref);
+      uint16_t idx = tc_widget_id(vm, gref);
       int32_t *p = tc_resolve_ref(vm, gref);
       int32_t val = p ? *p : 0;  // HHMM format
       const char *label = tc_get_const_str(vm, ci);
@@ -14860,6 +14969,16 @@ static int tc_syscall_impl(TcVM *vm, uint16_t id) {
         config.pin_sccb_sda  = -1;          // tell esp_camera to NOT install its own I2C driver
         config.pin_sccb_scl  = -1;
         AddLog(LOG_LEVEL_INFO, PSTR("TCC: sharing I2C bus 2 for SCCB"));
+      } else if (TasmotaGlobal.i2c_enabled[0] && pins[3] >= 0 && pins[4] >= 0 &&
+                 pins[3] == Pin(GPIO_I2C_SDA, 0) && pins[4] == Pin(GPIO_I2C_SCL, 0)) {
+        // Tasmota already runs I2C bus 1 (Wire, port 0) on the very pins the camera uses for SCCB
+        // (e.g. Waveshare S3-CAM: expander, codec and sensor share GPIO8/7). Without this, esp_camera
+        // installs its own driver on port 0 and removes it again on deinit: the Tasmota bus is dead
+        // afterwards (I2CScan "Error 5").
+        config.sccb_i2c_port = 0;
+        config.pin_sccb_sda  = -1;
+        config.pin_sccb_scl  = -1;
+        AddLog(LOG_LEVEL_INFO, PSTR("TCC: sharing I2C bus 1 for SCCB"));
       }
 
       config.pin_d7       = pins[5];
