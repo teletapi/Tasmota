@@ -4991,13 +4991,26 @@ static void HandleTinyCApi(void) {
       return;
     }
     String body = Webserver->arg(F("plain"));
+    // 25.11.2026 (discussion #145, thc08): a request body that did not arrive (big POST on a device with little free heap: the String
+    // for it cannot be allocated) gave an EMPTY `plain`; the file was then opened with "w" and cut to 0 bytes, and the answer said ok.
+    // An empty body now leaves the file alone and says so; &empty=1 allows writing an empty file on purpose.
+    if (body.length() == 0 && !Webserver->hasArg(F("empty"))) {
+      WSSendJSON_P(400, PSTR("{\"ok\":false,\"error\":\"empty body, file not changed (not enough free heap for the request?)\"}"));
+      return;
+    }
     File f = ufsp->open(fpath.c_str(), "w");
     if (!f) {
       WSSendJSON_P(500, PSTR("{\"ok\":false,\"error\":\"write failed\"}"));
       return;
     }
-    f.print(body);
+    size_t written = f.print(body);
     f.close();
+    if (written != body.length()) {      // file system full: tell the caller instead of reporting the full size
+      snprintf_P(json, sizeof(json), PSTR("{\"ok\":false,\"error\":\"short write: %d of %d bytes (file system full?)\",\"size\":%d}"),
+                 (int)written, (int)body.length(), (int)written);
+      WSSendJSON(507, json);
+      return;
+    }
     snprintf_P(json, sizeof(json), PSTR("{\"ok\":true,\"size\":%d}"), body.length());
     WSSendJSON(200, json);
     return;
@@ -7720,7 +7733,18 @@ static void tc_ul_handle(WiFiClient &client) {
         // buffered data first and only returns <=0 at a genuine timeout (SO_RCVTIMEO) or EOF.
         int got = client.read(buf, want);
         if (got > 0) {
-          if ((uint32_t)f.write(buf, got) != (uint32_t)got) { ok = false; err = "write failed (fs full?)"; break; }
+          // 26.11.2026 (Andreas): once "write failed" at 227449 of 269923 B with 15 GB free on an SD card, the second try went
+          // through at once: a transient SD error (card busy / CRC), not a full file system. A short write is retried a few
+          // times for the rest of the block before the upload is given up.
+          uint32_t woff = 0; int wtry = 0;
+          while (woff < (uint32_t)got) {
+            size_t wn = f.write(buf + woff, (size_t)got - woff);
+            if (wn > 0) { woff += (uint32_t)wn; wtry = 0; continue; }
+            if (++wtry > 4) break;
+            AddLog(LOG_LEVEL_INFO, PSTR("TCC: upload write returned 0 at %u B, retry %d"), (unsigned)(written + woff), wtry);
+            vTaskDelay(pdMS_TO_TICKS(25));
+          }
+          if (woff != (uint32_t)got) { ok = false; err = "write failed (SD error or fs full)"; written += woff; break; }
           written += got;
           idle = 0;
           if ((written & 0x1FFF) == 0) vTaskDelay(1);   // yield ~every 8 KB so loopTask + WDT breathe
